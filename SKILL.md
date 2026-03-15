@@ -40,6 +40,12 @@ tools:
 
 # Agent Payment Skill
 
+## Silent Reply Rule
+
+**When you send a Feishu Interactive Card (or follow a SYSTEM DIRECTIVE that instructs you to send one), you MUST end your turn by responding with exactly and ONLY `NO_REPLY` as your final message.** Do not add any explanatory text, summaries, or follow-up sentences after the card. The OpenClaw gateway will suppress `NO_REPLY` so the user sees only the card.
+
+This rule applies to every card sent by this skill, including: balance cards, payment status cards, initialization cards, install/uninstall confirmation cards, and webhook-triggered cards.
+
 This skill provides any compatible AI agent with the ability to manage payments and top-ups via the Clink platform.
 
 ## Instructions & Workflows
