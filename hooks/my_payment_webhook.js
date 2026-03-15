@@ -13,7 +13,7 @@ const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
 
-const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'cache', 'agent-payment-skills.json');
+const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills', 'clink.config.json');
 
 async function readCache() {
   try {

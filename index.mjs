@@ -61,7 +61,7 @@ async function updatePaymentEnv(updates) {
 // ------------------------------------------------------------------
 // PAYMENT METHODS CACHE HELPERS
 // ------------------------------------------------------------------
-const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'cache', 'agent-payment-skills.json');
+const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills', 'clink.config.json');
 
 async function readPaymentMethodsCache() {
   try {
