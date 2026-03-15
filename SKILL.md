@@ -108,8 +108,14 @@ When the user asks to install this skill, the agent MUST follow this strict work
    - Inject `{"match": {"path": "hooks/clink/payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
    - Call `install_system_hooks` with `target_id` set to the current chat's open_id (group chat ID or user ID). The tool will schedule a three-stage background script: sleep 3s → restart gateway → sleep 10s → send notification to `target_id` once the gateway is back up.
 
-4. **Final Confirmation**:
-   The tool will return immediately with a SYSTEM DIRECTIVE to send an install success card. Follow the card spec in the directive. The gateway will send the restart-complete notification automatically — no further action needed from the agent.
+4. **Final Confirmation before Restart**:
+   The `install_system_hooks` tool will return a SYSTEM DIRECTIVE. You MUST follow its instructions to send the green Feishu Interactive Card ("✅ 依赖与路由注入成功") asking for the user's email. After sending it, reply `NO_REPLY` to end your turn. The gateway will restart automatically.
+
+5. **Post-Restart Initialization**:
+   When the gateway comes back online, the system will automatically send a text: "✅ 网关已重启完毕...".
+   Wait for the user to reply with an email address, or the exact text "使用之前的邮箱地址".
+   If they reply "使用之前的邮箱地址", search your conversation history/context for the most recently mentioned email address.
+   Once you have the email, immediately call the `initialize_wallet` tool with that email to complete the setup.
 
 ### 4. Uninstall (Text-Based Workflow)
 
