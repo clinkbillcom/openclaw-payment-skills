@@ -1071,9 +1071,38 @@ export const uninstall_system_hooks = tool(async () => {
     results.push(`Skill directory: FAILED to remove — ${err.message}`);
   }
 
-  // Step 5: Async delayed restart — detached process, does not block return
-  const { exec } = await import('child_process');
-  exec("nohup sh -c 'sleep 3 && openclaw gateway restart' > /dev/null 2>&1 &");
+  // Step 5: Async delayed restart — detached process, survives gateway self-restart
+  const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_uninstall_notify.js');
+  const notifyJsCode = `
+const http = require('http');
+const payload = JSON.stringify({
+  message: "🗑️ **卸载已生效**\\n网关已重启完毕，Clink Payment 支付组件及全部配置已彻底清除。若需再次使用，请重新下发安装指令。",
+  channel: "feishu",
+  to: "${args.target_id}"
+});
+const req = http.request({
+  hostname: 'localhost',
+  port: 14924,
+  path: '/hooks/agent',
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'Authorization': 'Bearer 38heneuihudoij@&^ud'
+  }
+});
+req.on('error', () => {});
+req.write(payload);
+req.end();
+`;
+  await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
+
+  const { spawn } = await import('child_process');
+  const child = spawn('sh', ['-c', `sleep 3 && openclaw gateway restart && sleep 10 && node ${notifyScriptPath}`], {
+    detached: true,
+    stdio: 'ignore'
+  });
+  child.unref();
   results.push("Gateway: scheduled restart in 3 seconds ✓");
 
   return `SUCCESS: Clink Payment Skill uninstalled. The gateway will restart in 3 seconds.
@@ -1090,7 +1119,9 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
 }, {
   name: "uninstall_system_hooks",
   description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
-  schema: z.object({})
+  schema: z.object({
+    target_id: z.string().describe("飞书会话 ID（群聊 open_id 或用户 open_id），网关重启完成后用于发送卸载完成通知。")
+  })
 });
 
 export const get_wallet_status = tool(async () => {
