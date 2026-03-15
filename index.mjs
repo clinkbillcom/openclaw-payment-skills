@@ -176,8 +176,8 @@ Next steps you MUST follow:
    - Key-Value Rows:
      - 绑定支付方式: "<card info> ✓" (Green)
      - 规则状态: "已生效" (Green)
-   - Description: "你现在可以部署自动充值任务。风控规则可选，可随时通过 get_risk_rules_link 查看和配置。"`;
-  } catch (err) {
+   - Description: "你现在可以部署自动充值任务。风控规则可选，可随时通过 get_risk_rules_link 查看和配置。"
+   - After sending this card, reply NO_REPLY and nothing else.`;  } catch (err) {
     return `Failed to initialize wallet: ${err.message}`;
   }
 }, {
@@ -292,7 +292,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 风控规则: "未查看" (Orange)
 - Description: "风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。"
 - Button 1 (Primary): "查看风控规则" (action: url redirect to ${riskUrl})
-- Button 2 (ghost): "跳过"`;
+- Button 2 (ghost): "跳过"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   } catch (err) {
     return `Failed to get risk rules link: ${err.message}`;
   }
@@ -314,7 +316,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
 - Description: "绑定支付方式后，Clink 将代您自动完成 Token 充值。"
 - Button 1 (Primary): "绑定支付方式" (action: url redirect to ${setupUrl})
-- Button 2 (ghost): "稍后再说"`;
+- Button 2 (ghost): "稍后再说"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   } catch (err) {
     return `Failed to get payment method setup link: ${err.message}`;
   }
@@ -339,6 +343,8 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "查看已绑定的支付方式，切换默认卡，或添加新的支付方式。"
 - Button 1 (Primary): "管理支付方式" (action: url redirect to ${modifyUrl})
 - Button 2 (ghost): "不用了"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.
 
 Current Payment Methods: ${JSON.stringify(methods)}`;
   } catch (err) {
@@ -474,6 +480,8 @@ YOU MUST send a Feishu Interactive Card to the user with the following details:
 - Template / Style: "✅ 支付方式已更新" (Green theme)
 - Status: "已更新 ✓" (Green)
 - Note: Tell the user that the new payment method will be used for future auto-recharges.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.
 
 Raw Data: ${data}`;
   } catch (err) {
@@ -622,7 +630,7 @@ The bank requires secondary confirmation. YOU MUST pause the current task and se
 - Button 1 (Primary): "前往完成 3DS 验证" (action: url redirect to ${redirectUrl})
 - Button 2 (ghost): "取消充值"
 
-DO NOT continue until the webhook confirms order.succeeded or order.failed.`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. DO NOT continue until the webhook confirms order.succeeded or order.failed.`;
     }
 
     return `Payment execution request submitted successfully.
@@ -646,7 +654,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 拦截原因: "Clink 账户邮箱不存在，无法完成身份校验"
 - Description: "请确认 Clink 账户邮箱设置正确后重新发起充值。"
 - Button 1 (ghost): "查看账户设置"
-- Button 2 (ghost): "联系支持"`;
+- Button 2 (ghost): "联系支持"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     if (err.message.includes("CUSTOMER_VERIFY_FAILED") || err.message.includes("邮箱") && err.message.includes("验证")) {
@@ -659,7 +669,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 拦截原因: "邮箱不匹配，存在账户归属风险"
 - Description: "为保障资金安全，充值账户邮箱必须与商户账户邮箱完全一致。请前往商户控制台确认账户邮箱后重新发起充值。"
 - Button 1 (red): "查看商户邮箱设置"
-- Button 2 (ghost): "联系支持"`;
+- Button 2 (ghost): "联系支持"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     // --- Merchant not found ---
@@ -671,7 +683,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 商户 ID: "${args.merchant_id}"
   - 失败原因: "商户不存在" (Red)
 - Description: "请检查商户 ID 是否正确。如果持续出现此问题，请联系 Clink 支持。"
-- Button 1 (ghost): "联系支持"`;
+- Button 1 (ghost): "联系支持"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     // --- Duplicate order in processing ---
@@ -686,7 +700,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "当前有一笔充值订单正在处理中，请等待完成后再发起新的充值请求。"
 - No action buttons needed.
 
-DO NOT retry immediately. Wait for the previous order to complete (via webhook callback).`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the previous order to complete (via webhook callback).`;
     }
 
     // --- Amount / currency invalid ---
@@ -698,7 +712,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 请求金额: "${amt}"
   - 失败原因: "金额或币种不正确" (Red)
 - Description: "请检查充值金额和币种是否正确后重试。"
-- No action buttons needed.`;
+- No action buttons needed.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     // --- Session errors ---
@@ -723,7 +739,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 商户 ID: "${args.merchant_id}"
   - 失败原因: "商户信息与充值会话不一致" (Red)
 - Description: "充值请求中的商户与原始会话中记录的商户不一致，请重新发起充值。"
-- No action buttons needed.`;
+- No action buttons needed.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     // --- API Key errors ---
@@ -737,7 +755,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "Clink 认证失败，可能是 API Key 已过期或无效。请尝试重新初始化钱包（initialize_wallet）。"
 - Button 1 (red): "重新初始化"
 
-Consider running initialize_wallet again to refresh the API key.`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     // --- Timestamp errors ---
@@ -770,9 +788,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Button 2 (ghost): "修改风控规则" (action: call get_risk_rules_link)
 - Button 3 (ghost): "暂停任务"
 
-If the user chooses "继续充值", you MUST automatically retry clink_pay with the same merchant_id, amount, and currency.
-If the user chooses "修改风控规则", call get_risk_rules_link and after rules are updated, retry clink_pay.
-After successful charge, add a note: "建议事后调整风控规则以免影响后续任务。"`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the user to click a button. If the user chooses "继续充值", retry clink_pay with the same parameters. If "修改风控规则", call get_risk_rules_link first.`;
     }
 
     // --- Card declined (Scene 7) ---
@@ -793,12 +809,12 @@ Card 2:
 - Template / Style: "⚠️ 请更换支付方式以继续充值" (Red theme, header h-danger)
 - Key-Value Rows:
   - 建议操作: "更换银行卡或其他支付方式"
-  - 备注: "更换后 Clink 将自动重新发起充值"
+  - 备注: "更换后如需继续充值请告知"
 - Description: "当前卡片被银行拒绝，可能原因：卡片余额不足、已过期或账单地址不符。"
 - Button 1 (red): "前往更换支付方式" (action: call get_payment_method_modify_link to open the payment method switch page)
 - Button 2 (ghost): "暂不处理"
 
-After the user switches their payment method, you MUST automatically retry clink_pay with the same merchant_id, amount, and currency.`;
+After sending both cards, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the user to switch their payment method and explicitly ask to retry before calling clink_pay again.`;
     }
 
     // --- Remote service failure ---
@@ -826,7 +842,9 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 状态: "失败" (Red)
 - Description: "充值过程中出现异常，请联系支持获取帮助。"
 - Button 1 (red): "联系支持"
-- Button 2 (ghost): "查看充值记录"`;
+- Button 2 (ghost): "查看充值记录"
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   }
 }, {
   name: "clink_pay",
