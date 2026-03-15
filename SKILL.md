@@ -105,7 +105,7 @@ When the user asks to install this skill, the agent MUST follow this strict work
    ONLY AFTER receiving the text approval, call the `install_system_hooks` tool (or execute manually). The sequence MUST be:
    - Run `npm install` inside the skill directory (`~/.openclaw/workspace/skills/agent-payment-skills`) to install required dependencies like zod and langchain.
    - Copy `hooks/my_payment_webhook.js` into `~/.openclaw/hooks/transforms/`.
-   - Inject `{"match": {"path": "my_payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
+   - Inject `{"match": {"path": "hooks/clink/payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
    - Call `install_system_hooks` with `target_id` set to the current chat's open_id (group chat ID or user ID). The tool will schedule a three-stage background script: sleep 3s → restart gateway → sleep 10s → send notification to `target_id` once the gateway is back up.
 
 4. **Final Confirmation**:
@@ -124,7 +124,7 @@ When the user asks to uninstall this skill, the agent MUST follow the same stric
 3. **Execute Uninstall**:
    ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool (no parameters needed). This tool will:
    - Remove `my_payment_webhook.js` from `~/.openclaw/hooks/transforms/`.
-   - Remove the `my_payment` route mapping from `openclaw.json` `hooks.mappings`.
+   - Remove the `hooks/clink/payment` route mapping from `openclaw.json` `hooks.mappings`.
    - Remove Clink skill config (`skills.entries["agent-payment-skills"]`) from `openclaw.json`.
    - Remove the skill directory.
    - Schedule an async gateway restart (3-second delay, non-blocking).
