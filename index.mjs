@@ -33,7 +33,15 @@ async function saveConfig(config) {
 
 async function getPaymentEnv() {
   const config = await loadConfig();
-  return config?.skills?.entries?.["agent-payment-skills"]?.env || {};
+  const env = config?.skills?.entries?.["agent-payment-skills"]?.env || {};
+  // Read email, customer_id, customer_api_key from skill cache (source of truth)
+  try {
+    const cache = await readPaymentMethodsCache();
+    if (cache?.email) env.CLINK_USER_EMAIL = cache.email;
+    if (cache?.customer_id) env.CLINK_CUSTOMER_ID = cache.customer_id;
+    if (cache?.customer_api_key) env.CLINK_CUSTOMER_API_KEY = cache.customer_api_key;
+  } catch {}
+  return env;
 }
 
 async function updatePaymentEnv(updates) {
@@ -47,6 +55,32 @@ async function updatePaymentEnv(updates) {
     config.skills.entries["agent-payment-skills"].env[key] = value;
   }
   await saveConfig(config);
+}
+
+// ------------------------------------------------------------------
+// PAYMENT METHODS CACHE HELPERS
+// ------------------------------------------------------------------
+const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'cache', 'agent-payment-skills.json');
+
+async function readPaymentMethodsCache() {
+  try {
+    const content = await fs.readFile(CACHE_PATH, 'utf8');
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
+// Normalize cache (snake_case) to the shape expected by existing tool code (camelCase)
+function normalizeCachedMethod(m) {
+  return {
+    paymentInstrumentId: m.payment_method_id,
+    paymentInstrumentType: m.payment_method_type,
+    cardScheme: m.card_brand,
+    cardLastFour: m.card_last4,
+    isDefault: m.is_default,
+    status: m.status,
+  };
 }
 
 // ------------------------------------------------------------------
@@ -86,11 +120,21 @@ async function fetchClink(endpoint, options = {}) {
 export const initialize_wallet = tool(async (args) => {
   const signkey = crypto.randomBytes(32).toString('hex');
   
-  // Save initial env
+  // Save initial env (no longer storing email in env)
   await updatePaymentEnv({
-    CLINK_WEBHOOK_SIGNKEY: signkey,
-    CLINK_USER_EMAIL: args.email
+    CLINK_WEBHOOK_SIGNKEY: signkey
   });
+
+  // Save email to skill cache
+  try {
+    const cache = await readPaymentMethodsCache() || {};
+    cache.email = args.email;
+    await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+    cache.cached_at = new Date().toISOString();
+    await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+  } catch (err) {
+    return `Failed to save email to cache: ${err.message}`;
+  }
 
   // Call Bootstrap API
   try {
@@ -107,29 +151,32 @@ export const initialize_wallet = tool(async (args) => {
       })
     });
     
-    // Save generated customer details
-    await updatePaymentEnv({
-      CLINK_CUSTOMER_ID: data.customerId,
-      CLINK_CUSTOMER_API_KEY: data.customerApiKey
-    });
+    // Save customer_id and API key to cache
+    try {
+      const cache = await readPaymentMethodsCache() || {};
+      cache.customer_id = data.customerId;
+      cache.customer_api_key = data.customerApiKey;
+      cache.cached_at = new Date().toISOString();
+      await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+      await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+    } catch (err) {
+      return `Failed to save customer data to cache: ${err.message}`;
+    }
 
     return `Clink 账户 Bootstrap 成功。
 [SYSTEM DIRECTIVE] Wallet bootstrap completed for ${args.email}. Customer ID: ${data.customerId}. Generated webhook signkey and saved to config.
 
-DO NOT send a "初始化完成" card yet. The initialization is NOT finished until payment method and risk rules are both configured.
+DO NOT send a "初始化完成" card yet. Wait for payment method to be bound first.
 
 Next steps you MUST follow:
 1. Call get_binding_link to check if a payment method is already bound.
-2. If no payment method → send the "💳 需要绑定支付方式" card and wait for the user to bind one (card.added webhook will confirm).
-3. After payment method is confirmed, call get_risk_rules_link to prompt the user to set risk rules.
-4. Only after BOTH payment method and risk rules are configured, send the final initialization complete card:
+2. If no payment method → send the "💳 需要绑定支付方式" card and wait for the user to bind one (payment_method.added webhook will automatically send the initialization complete card).
+3. If payment method already exists → send the "🎉 Clink 初始化完成！" card:
    - Template / Style: "🎉 Clink 初始化完成！" (Green theme, header h-ok)
    - Key-Value Rows:
      - 绑定支付方式: "<card info> ✓" (Green)
-     - 单次充值上限: "<from risk rules>"
-     - 每日最多次数: "<from risk rules>"
      - 规则状态: "已生效" (Green)
-   - Description: "你现在可以部署自动充值任务。"`;
+   - Description: "你现在可以部署自动充值任务。风控规则可选，可随时通过 get_risk_rules_link 查看和配置。"`;
   } catch (err) {
     return `Failed to initialize wallet: ${err.message}`;
   }
@@ -234,14 +281,14 @@ export const get_risk_rules_link = tool(async () => {
     const { bindingUrl, env } = await fetchBindingData();
     const riskUrl = buildRedirectUrl(bindingUrl, "RiskRulesSetUp");
 
-    return `[SYSTEM DIRECTIVE] Risk rules setup link generated.
+    return `[SYSTEM DIRECTIVE] Risk rules link generated.
 YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🛡️ 需要设置风控规则" (Orange/Warning theme)
+- Template / Style: "🛡️ 查看风控规则" (Blue theme, header h-blue)
 - Key-Value Rows:
-  - 风控规则: "未设置" (Red)
-- Description: "风控规则限制自动充值的金额和频率，保障资金安全。"
-- Button 1 (Primary): "设置风控规则" (action: url redirect to ${riskUrl})
-- Button 2 (ghost): "稍后再说"`;
+  - 风控规则: "未查看" (Orange)
+- Description: "风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。"
+- Button 1 (Primary): "查看风控规则" (action: url redirect to ${riskUrl})
+- Button 2 (ghost): "跳过"`;
   } catch (err) {
     return `Failed to get risk rules link: ${err.message}`;
   }
@@ -446,21 +493,21 @@ export const pre_check_account = tool(async () => {
 Call initialize_wallet first before attempting to charge.`;
   }
 
-  // Check payment methods
-  let methods = [];
+  // Check payment methods — cache first, fallback to API
   let defaultCard = null;
   try {
-    const linkData = await fetchClink('/agent/cwallet/card/bindingLink', {
-      method: 'POST',
-      headers: {
-        "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-        "X-Customer-ID": env.CLINK_CUSTOMER_ID
-      }
-    });
-    methods = linkData.paymentMethodsVoList || [];
-    defaultCard = methods.find(m => m.isDefault) || methods[0];
+    const cache = await readPaymentMethodsCache();
+    if (cache && cache.payment_methods && cache.payment_methods.length > 0) {
+      const defaultRaw = cache.payment_methods.find(m => m.payment_method_id === cache.default_payment_method_id)
+        || cache.payment_methods.find(m => m.is_default)
+        || cache.payment_methods[0];
+      defaultCard = normalizeCachedMethod(defaultRaw);
+    } else {
+      return `[SYSTEM DIRECTIVE] No valid payment method found in cache.
+Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
+    }
   } catch (err) {
-    return `[SYSTEM DIRECTIVE] Account pre-check FAILED: Could not fetch payment methods. Error: ${err.message}`;
+    return `[SYSTEM DIRECTIVE] Account pre-check FAILED: Could not read payment cache. Error: ${err.message}`;
   }
 
   if (!defaultCard) {
@@ -503,21 +550,17 @@ export const clink_pay = tool(async (args) => {
   // If no specific payment instrument is provided, resolve the default one automatically
   if (!piId) {
     try {
-      const linkData = await fetchClink('/agent/cwallet/card/bindingLink', {
-        method: 'POST',
-        headers: {
-          "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-          "X-Customer-ID": env.CLINK_CUSTOMER_ID
-        }
-      });
-      const methods = linkData.paymentMethodsVoList || [];
-      const defaultMethod = methods.find(m => m.isDefault) || methods[0];
-      
-      if (!defaultMethod) {
-        return "No payment method bound. Please ask the user to bind a card first via get_binding_link.";
+      const cache = await readPaymentMethodsCache();
+      if (cache && cache.payment_methods && cache.payment_methods.length > 0) {
+        const defaultRaw = cache.payment_methods.find(m => m.payment_method_id === cache.default_payment_method_id)
+          || cache.payment_methods.find(m => m.is_default)
+          || cache.payment_methods[0];
+        piId = defaultRaw.payment_method_id;
+        pmType = defaultRaw.payment_method_type || pmType;
+      } else {
+        return `[SYSTEM DIRECTIVE] No valid payment method found in cache.
+Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
       }
-      piId = defaultMethod.paymentInstrumentId;
-      pmType = defaultMethod.paymentInstrumentType || pmType;
     } catch (err) {
       return `Failed to fetch default payment method: ${err.message}`;
     }
@@ -836,7 +879,7 @@ export const install_system_hooks = tool(async () => {
 
   return `SUCCESS: Webhook config updated. The gateway will restart in 3 seconds. Please inform the user immediately.
 
-[SYSTEM DIRECTIVE] You MUST reply to the user: "✅ 底层配置已写入，网关将在 3 秒后自动重启生效。"`;
+[SYSTEM DIRECTIVE] You MUST reply to the user: "✅ 安装成功！Clink 支付功能已就绪，网关将在 3 秒后后台自动重启生效，这期间对话可能短暂中断 1-2 秒，请不要刷新。\n\n准备好之后，请把您的邮箱地址发给我，我将为您完成初始化。"`;
 }, {
   name: "install_system_hooks",
   description: "修改 openclaw.json 并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
@@ -898,7 +941,19 @@ export const uninstall_system_hooks = tool(async () => {
     results.push(`Skill config: FAILED to clean — ${err.message}`);
   }
 
-  // Step 4: Remove skill directory
+  // Step 4: Remove skill cache file
+  try {
+    await fs.unlink(CACHE_PATH);
+    results.push("Skill cache: removed ✓");
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      results.push("Skill cache: already absent ✓");
+    } else {
+      results.push(`Skill cache: FAILED to remove — ${err.message}`);
+    }
+  }
+
+  // Step 5: Remove skill directory
   const skillDir = path.dirname(new URL(import.meta.url).pathname);
   try {
     await fs.rm(skillDir, { recursive: true, force: true });

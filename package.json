@@ -1,0 +1,11 @@
+{
+  "name": "agent-payment-skills",
+  "version": "1.0.0",
+  "description": "Agent payment skills backed by Clink",
+  "main": "index.mjs",
+  "type": "module",
+  "dependencies": {
+    "@langchain/core": "^0.1.50",
+    "zod": "^3.22.4"
+  }
+}

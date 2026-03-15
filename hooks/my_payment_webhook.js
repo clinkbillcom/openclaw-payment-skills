@@ -3,12 +3,34 @@
 // Placed in ~/.openclaw/hooks/transforms/ at install time.
 //
 // Handles four callback types:
-//   1. card.added        — user finished binding a card on Clink hosted page
-//   2. order.created     — charge order created (intermediate)
-//   3. order.succeeded   — payment + recharge succeeded
-//   4. order.failed      — payment or recharge failed
+//   1. payment_method.added        — user finished binding a card on Clink hosted page
+//   2. payment_method.defaultChange — user changed their default payment method
+//   3. order.created     — charge order created (intermediate)
+//   4. order.succeeded   — payment + recharge succeeded
+//   5. order.failed      — payment or recharge failed
 
-export default function transform(payload) {
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+
+const CACHE_PATH = path.join(os.homedir(), '.openclaw', 'cache', 'agent-payment-skills.json');
+
+async function readCache() {
+  try {
+    const content = await fs.readFile(CACHE_PATH, 'utf8');
+    return JSON.parse(content);
+  } catch {
+    return { payment_methods: [], default_payment_method_id: null, cached_at: null };
+  }
+}
+
+async function writeCache(cache) {
+  await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+  cache.cached_at = new Date().toISOString();
+  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+}
+
+export default async function transform(payload) {
   const { type, data } = payload || {};
 
   if (!type || !data) {
@@ -18,32 +40,87 @@ export default function transform(payload) {
   switch (type) {
 
     // ─── Card binding completed ───
-    case "card.added": {
+    case "payment_method.added": {
       const card = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
       const email = data.customer_email || "N/A";
+
+      // Update cache
+      try {
+        const cache = await readCache();
+        const existing = cache.payment_methods.findIndex(m => m.payment_method_id === data.payment_method_id);
+        if (existing >= 0) {
+          cache.payment_methods[existing] = data;
+        } else {
+          cache.payment_methods.push(data);
+        }
+        if (data.is_default) {
+          cache.payment_methods.forEach(m => { m.is_default = m.payment_method_id === data.payment_method_id; });
+          cache.default_payment_method_id = data.payment_method_id;
+        }
+        if (!cache.initialized) cache.initialized = true;
+        await writeCache(cache);
+      } catch {}
 
       return {
         action: "agent",
         name: "Clink",
         message: `[Clink Webhook] 绑卡成功回调。
 
-事件: card.added
+事件: payment_method.added
 客户邮箱: ${email}
 客户 ID: ${data.customer_id || "N/A"}
 支付方式 ID: ${data.payment_method_id || "N/A"}
 卡片: ${card}
 状态: ${data.status || "active"}
 
-[SYSTEM DIRECTIVE] The user has successfully bound a new payment method.
-YOU MUST immediately send a Feishu Interactive Card to the user:
+[SYSTEM DIRECTIVE] The user has successfully bound a new payment method. Initialization is now complete.
+YOU MUST send TWO Feishu Interactive Cards in order:
+
+Card 1:
 - Template / Style: "✅ 支付方式绑定成功" (Green theme, header h-ok)
 - Key-Value Rows:
   - 绑定支付方式: "${card}" (Green)
   - 邮箱: "${email}"
-- Description: "继续检测风控规则…"
-- No action buttons needed.
 
-After sending the card, check if risk rules are configured. If not, call get_risk_rules_link to prompt the user to set them up.`
+Card 2 (initialization complete):
+- Template / Style: "🎉 Clink 初始化完成！" (Green theme, header h-ok)
+- Key-Value Rows:
+  - 绑定支付方式: "${card} ✓" (Green)
+  - 规则状态: "已生效" (Green)
+- Description: "你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。"
+- No action buttons needed.`
+      };
+    }
+
+    // ─── Default payment method changed ───
+    case "payment_method.defaultChange": {
+      const card = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
+
+      // Update cache
+      try {
+        const cache = await readCache();
+        const existing = cache.payment_methods.findIndex(m => m.payment_method_id === data.payment_method_id);
+        if (existing >= 0) {
+          cache.payment_methods[existing] = data;
+        } else {
+          cache.payment_methods.push(data);
+        }
+        cache.payment_methods.forEach(m => { m.is_default = m.payment_method_id === data.payment_method_id; });
+        cache.default_payment_method_id = data.payment_method_id;
+        await writeCache(cache);
+      } catch {}
+
+      return {
+        action: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 默认支付方式已变更。
+
+事件: payment_method.defaultChange
+客户 ID: ${data.customer_id || "N/A"}
+新默认卡: ${card}
+支付方式 ID: ${data.payment_method_id || "N/A"}
+
+[SYSTEM DIRECTIVE] The user's default payment method has changed. Update any displayed card info accordingly.`
       };
     }
 
@@ -135,8 +212,42 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 失败原因: "${failureReason}" (Red)
   - 订单参考号: "${data.orderId || 'N/A'}"
 - Description: "${isCharged ? '您的银行卡已成功扣款，但商户账户未收到充值。请携带以上订单号联系商户客服处理。' : '银行卡扣款失败，请检查卡片状态或更换支付方式后重试。'}"
-- Button 1 (red): "${isCharged ? '联系商户支持' : '更换支付方式'}"
+- Button 1 (red, ${isCharged ? 'non-interactive label' : 'action: call get_payment_method_modify_link to open payment method switch page'}): "${isCharged ? '联系商户支持' : '更换支付方式'}"
 - Button 2 (ghost): "查看充值记录"`
+      };
+    }
+
+    // ─── Risk rules updated ───
+    case "risk_rule.updated": {
+      try {
+        const cache = await readCache();
+        cache.risk_rules = data;
+        await writeCache(cache);
+      } catch {}
+
+      return {
+        action: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 风控规则已更新。
+
+事件: risk_rule.updated
+单次充值上限: ${data.singleRechargeLimit ?? "N/A"}
+每日总额上限: ${data.dailyTotalLimit ?? "N/A"}
+每日最大次数: ${data.dailyMaxCount ?? "N/A"}
+充值间隔: ${data.rechargeInterval ?? "N/A"}
+手动审批阈值: ${data.manualApprovalThreshold ?? "N/A"}
+更新时间: ${data.updatedAt ?? "N/A"}
+
+[SYSTEM DIRECTIVE] Risk rules have been updated and saved to local cache.
+YOU MUST immediately send a Feishu Interactive Card to the user:
+- Template / Style: "🛡️ 风控规则已生效" (Green theme, header h-ok)
+- Key-Value Rows:
+  - 单次上限: "${data.singleRechargeLimit ?? 'N/A'}"
+  - 每日总额: "${data.dailyTotalLimit ?? 'N/A'}"
+  - 每日次数: "${data.dailyMaxCount ?? 'N/A'} 次"
+  - 充值间隔: "${data.rechargeInterval ?? 'N/A'}"
+- Description: "风控规则已同步生效，后续充值将按此规则执行。"
+- No action buttons needed.`
       };
     }
 

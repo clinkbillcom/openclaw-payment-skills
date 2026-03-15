@@ -49,13 +49,10 @@ When a user installs or uses this skill for the first time:
 1. **Request Email:** Prompt the user to input their email address.
 2. **Initialize Wallet:** Call `initialize_wallet` with the user's email. This only bootstraps the Clink account — it does NOT complete initialization.
 3. **Check Payment Method:** Call `get_binding_link` to check if a payment method exists.
-   - If none → the user gets a card with a link to bind one. **Wait for the `card.added` webhook callback** before proceeding.
+   - If none → the user gets a card with a link to bind one. **Wait for the `payment_method.added` webhook callback** before proceeding.
    - If exists → skip to step 4.
-4. **Configure Risk Rules:** Call `get_risk_rules_link` to prompt the user to set risk rules. Since the risk rules page does NOT send a webhook callback, ask the user to confirm when they are done.
-5. **Send Initialization Complete Card:** Only after BOTH payment method and risk rules are confirmed, send the final "🎉 Clink 初始化完成！" card showing:
-   - Bound payment method ✓
-   - Risk rule settings
-   - Status: 已生效
+4. **View Risk Rules (Optional):** Call `get_risk_rules_link` to let the user view and optionally configure risk rules. This step is NOT required — initialization is complete once a payment method is bound. Risk rules can be configured at any time.
+5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or `payment_method.added` webhook received), send the "🎉 Clink 初始化完成！" card. Do NOT wait for risk rules.
 
 ### 2. Execute Payment (Direct or Auto Top-Up)
 When the user requests a recharge or another skill triggers an auto top-up:
@@ -67,7 +64,7 @@ When the user requests a recharge or another skill triggers an auto top-up:
    - `order.failed` → Send "❌ 充值失败" card with order reference for support.
    - `flag3DS=1` (synchronous) → Send "🔐 3DS 验证" card with link, wait for webhook.
 4. **Handle Failures:**
-   - Card declined → Send switch payment method card. After user switches, **automatically retry** `clink_pay`.
+   - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
    - Email mismatch → Show the security block card. Do NOT retry.
    - Risk rule triggered → Show options (override / modify rules / pause).
 
@@ -91,13 +88,14 @@ When the user asks to install this skill, the agent MUST follow this strict work
    Pause execution. **Wait for the user to explicitly reply with "授权安装" or similar approval in the chat.**
 
 3. **Execute High-Risk Operations**:
-   ONLY AFTER receiving the text approval, call the `install_system_hooks` tool (no parameters needed). This tool will:
+   ONLY AFTER receiving the text approval, call the `install_system_hooks` tool (or execute manually). The sequence MUST be:
+   - Run `npm install` inside the skill directory (`~/.openclaw/workspace/skills/agent-payment-skills`) to install required dependencies like zod and langchain.
    - Copy `hooks/my_payment_webhook.js` into `~/.openclaw/hooks/transforms/`.
    - Inject `{"match": {"path": "my_payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
    - Schedule an async gateway restart (3-second delay, non-blocking).
 
 4. **Final Confirmation**:
-   The tool will return immediately. You MUST reply to the user stating: "✅ 底层配置已写入，网关将在 3 秒后自动重启生效。"
+   The tool will return immediately. You MUST reply to the user stating: "✅ 安装成功！Clink 支付功能已就绪，网关将在 3 秒后后台自动重启生效，这期间对话可能短暂中断 1-2 秒，请不要刷新。\n\n准备好之后，请把您的邮箱地址发给我，我将为您完成初始化。"
 
 ### 4. Uninstall (Text-Based Workflow)
 
