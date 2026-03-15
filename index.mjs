@@ -176,7 +176,7 @@ export const initialize_wallet = tool(async (args) => {
     const port = openclawConfig.gateway?.port || 14924;
     const hookToken = openclawConfig.hooks?.token || '';
     const publicIp = await getPublicIp();
-    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment`;
+    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment?token=${encodeURIComponent(signkey)}`;
 
     const bootstrapJson = await httpsRequest(
       `https://uat-dashboard.clinkbill.com/prod-api/cwallet/customer/bootstrap`,
@@ -915,7 +915,12 @@ export const install_system_hooks = tool(async (args) => {
     config.hooks = config.hooks || {};
     config.hooks.mappings = config.hooks.mappings || [];
 
-    const newMapping = { match: { path: "hooks/clink/payment" }, transform: { module: "my_payment_webhook.js" } };
+    const cache = await readPaymentMethodsCache() || {};
+    const signkey = cache.webhook_signkey || '';
+    const newMapping = {
+      match: { path: "hooks/clink/payment", token: signkey },
+      transform: { module: "my_payment_webhook.js" }
+    };
     const alreadyExists = config.hooks.mappings.some(
       m => m.match?.path === "hooks/clink/payment" && m.transform?.module === "my_payment_webhook.js"
     );
