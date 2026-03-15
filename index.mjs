@@ -988,11 +988,17 @@ sendNotification().catch(console.error);
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn } = await import('child_process');
-  const child = spawn('sh', ['-c', `sleep 3 && openclaw gateway restart && sleep 10 && node ${notifyScriptPath}`], {
-    detached: true,
-    stdio: 'ignore'
+
+  // Two independent detached processes — notify always fires regardless of restart outcome.
+  const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
+    detached: true, stdio: 'ignore'
   });
-  child.unref();
+  restartChild.unref();
+
+  const notifyChild = spawn('sh', ['-c', `sleep 15 && node ${notifyScriptPath}`], {
+    detached: true, stdio: 'ignore'
+  });
+  notifyChild.unref();
 
   const emailInstruction = userEmail
     ? `收到【✅ 网关重启完成】的卡片后，请在下方直接回复您的新绑定邮箱。如果您想继续使用之前的邮箱绑定，请一键复制卡片下方的口令发送。`
@@ -1152,12 +1158,18 @@ req.end();
 `;
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
-  const { spawn } = await import('child_process');
-  const child = spawn('sh', ['-c', `sleep 3 && openclaw gateway restart && sleep 10 && node ${notifyScriptPath}`], {
-    detached: true,
-    stdio: 'ignore'
+  const { spawn: spawnUninstall } = await import('child_process');
+
+  // Two independent detached processes — notify always fires regardless of restart outcome.
+  const restartChild = spawnUninstall('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
+    detached: true, stdio: 'ignore'
   });
-  child.unref();
+  restartChild.unref();
+
+  const notifyChild = spawnUninstall('sh', ['-c', `sleep 15 && node ${notifyScriptPath}`], {
+    detached: true, stdio: 'ignore'
+  });
+  notifyChild.unref();
   results.push("Gateway: scheduled restart in 3 seconds ✓");
 
   return `SUCCESS: Clink Payment Skill uninstalled. The gateway will restart in 3 seconds.
