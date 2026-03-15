@@ -198,7 +198,7 @@ export const initialize_wallet = tool(async (args) => {
     try {
       const cache = await readPaymentMethodsCache() || {};
       cache.customer_id = data.customerId;
-      cache.customer_api_key = data.customerApiKey;
+      cache.customer_api_key = data.customerAPIKey;
       cache.cached_at = new Date().toISOString();
       await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
       await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
