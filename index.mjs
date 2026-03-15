@@ -915,8 +915,7 @@ export const install_system_hooks = tool(async (args) => {
     config.hooks = config.hooks || {};
     config.hooks.mappings = config.hooks.mappings || [];
 
-    const cache = await readPaymentMethodsCache() || {};
-    const signkey = cache.webhook_signkey || '';
+    const signkey = config.hooks?.token || '';
     const newMapping = {
       match: { path: "hooks/clink/payment", token: signkey },
       transform: { module: "my_payment_webhook.js" }
