@@ -902,7 +902,7 @@ export const install_system_hooks = tool(async () => {
 sleep 3 &&
 openclaw gateway restart &&
 sleep 10 &&
-openclaw message send --target "${args.target_id}" "${successMsg}"
+openclaw message send --target "${args.target_id}" --message "${successMsg}"
 ' > /dev/null 2>&1 &`;
   exec(restartScript);
 
