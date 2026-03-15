@@ -897,7 +897,9 @@ openclaw message send --target "${args.target_id}" "${successMsg}"
   - 网关状态: "将在 3 秒后自动重启" (Orange)
   - 初始化状态: "待完成" (Grey)
 - Description: "网关重启期间对话可能短暂中断 1-2 秒，请不要刷新。网关重启完成后系统将自动发送通知，届时请将您的邮箱地址发给我完成初始化。"
-- No action buttons needed.`;
+- No action buttons needed.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text, markdown, or explanation.`;
 }, {
   name: "install_system_hooks",
   description: "修改 openclaw.json 并在后台延迟 3 秒重启网关，重启完成后自动向指定会话发送通知。必须在用户输入文字授权后才能调用。",
@@ -989,10 +991,15 @@ export const uninstall_system_hooks = tool(async () => {
 
   return `SUCCESS: Clink Payment Skill uninstalled. The gateway will restart in 3 seconds.
 
-[SYSTEM DIRECTIVE] You MUST reply to the user: "🗑️ Clink Payment Skill 已卸载，网关将在 3 秒后自动重启生效。"
+[SYSTEM DIRECTIVE] You MUST immediately send a Feishu Interactive Card to the user:
+- Template / Style: "🗑️ Clink Payment Skill 已卸载" (Grey theme, header h-grey)
+- Key-Value Rows:
+${results.map(r => `  - ${r}`).join("\n")}
+  - 网关状态: "将在 3 秒后自动重启" (Orange)
+- Description: "Clink 支付功能已完全移除。如需重新安装，请告知我。"
+- No action buttons needed.
 
-Summary:
-${results.join("\n")}`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text, markdown, or explanation.`;
 }, {
   name: "uninstall_system_hooks",
   description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
