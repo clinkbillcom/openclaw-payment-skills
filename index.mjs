@@ -34,12 +34,13 @@ async function saveConfig(config) {
 async function getPaymentEnv() {
   const config = await loadConfig();
   const env = config?.skills?.entries?.["agent-payment-skills"]?.env || {};
-  // Read email, customer_id, customer_api_key from skill cache (source of truth)
+  // Read all Clink-specific fields from skill cache (source of truth)
   try {
     const cache = await readPaymentMethodsCache();
     if (cache?.email) env.CLINK_USER_EMAIL = cache.email;
     if (cache?.customer_id) env.CLINK_CUSTOMER_ID = cache.customer_id;
     if (cache?.customer_api_key) env.CLINK_CUSTOMER_API_KEY = cache.customer_api_key;
+    if (cache?.webhook_signkey) env.CLINK_WEBHOOK_SIGNKEY = cache.webhook_signkey;
   } catch {}
   return env;
 }
@@ -119,21 +120,17 @@ async function fetchClink(endpoint, options = {}) {
 
 export const initialize_wallet = tool(async (args) => {
   const signkey = crypto.randomBytes(32).toString('hex');
-  
-  // Save initial env (no longer storing email in env)
-  await updatePaymentEnv({
-    CLINK_WEBHOOK_SIGNKEY: signkey
-  });
 
-  // Save email to skill cache
+  // Save signkey to skill cache (not openclaw.json env)
   try {
     const cache = await readPaymentMethodsCache() || {};
+    cache.webhook_signkey = signkey;
     cache.email = args.email;
     await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
     cache.cached_at = new Date().toISOString();
     await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
   } catch (err) {
-    return `Failed to save email to cache: ${err.message}`;
+    return `Failed to save to cache: ${err.message}`;
   }
 
   // Call Bootstrap API
