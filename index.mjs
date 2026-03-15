@@ -154,7 +154,7 @@ export const initialize_wallet = tool(async (args) => {
     const port = openclawConfig.gateway?.port || 14924;
     const hookToken = openclawConfig.hooks?.token || '';
     const publicIp = await getPublicIp();
-    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment${hookToken ? `?token=${hookToken}` : ''}`;
+    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment${hookToken ? `?token=${encodeURIComponent(hookToken)}` : ''}`;
 
     const bootstrapResp = await fetch(`https://uat-dashboard.clinkbill.com/prod-api/cwallet/customer/bootstrap`, {
       headers: { 'Content-Type': 'application/json' },
