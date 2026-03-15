@@ -249,6 +249,8 @@ YOU MUST immediately send a Feishu Interactive Card to the user with the followi
 - Action Button 1: "绑定支付方式" (Primary, action: url redirect to ${setupUrl})
 - Action Button 2: "稍后再说" (Default)
 
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.
+
 Extracted Binding Token for future use: ${bindingToken}`;
     } else {
       const defaultCard = methods.find(m => m.isDefault) || methods[0];
@@ -263,6 +265,8 @@ YOU MUST immediately send a Feishu Interactive Card to the user with the followi
   - 绑定时间: "已绑定"
 - Description: "已有有效支付方式，无需重新绑卡。继续检测风控规则…"
 - No action buttons needed (this is an informational card during initialization).
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.
 
 Current Payment Methods: ${JSON.stringify(methods)}
 Extracted Binding Token for future use: ${bindingToken}`;
