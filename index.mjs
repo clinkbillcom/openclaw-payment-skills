@@ -988,6 +988,7 @@ sendNotification().catch(console.error);
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn } = await import('child_process');
+  const nodeBin = process.execPath; // full path to node, avoids PATH issues in detached shell
 
   // Two independent detached processes — notify always fires regardless of restart outcome.
   const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
@@ -995,7 +996,7 @@ sendNotification().catch(console.error);
   });
   restartChild.unref();
 
-  const notifyChild = spawn('sh', ['-c', `sleep 15 && node ${notifyScriptPath}`], {
+  const notifyChild = spawn('sh', ['-c', `sleep 15 && ${nodeBin} ${notifyScriptPath}`], {
     detached: true, stdio: 'ignore'
   });
   notifyChild.unref();
@@ -1159,6 +1160,7 @@ req.end();
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn: spawnUninstall } = await import('child_process');
+  const nodeBinUninstall = process.execPath;
 
   // Two independent detached processes — notify always fires regardless of restart outcome.
   const restartChild = spawnUninstall('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
@@ -1166,7 +1168,7 @@ req.end();
   });
   restartChild.unref();
 
-  const notifyChild = spawnUninstall('sh', ['-c', `sleep 15 && node ${notifyScriptPath}`], {
+  const notifyChild = spawnUninstall('sh', ['-c', `sleep 15 && ${nodeBinUninstall} ${notifyScriptPath}`], {
     detached: true, stdio: 'ignore'
   });
   notifyChild.unref();
