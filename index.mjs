@@ -915,6 +915,12 @@ export const install_system_hooks = tool(async (args) => {
     config.hooks = config.hooks || {};
     config.hooks.mappings = config.hooks.mappings || [];
 
+    let changed = false;
+    if (!config.hooks.enabled) {
+      config.hooks.enabled = true;
+      changed = true;
+    }
+
     const signkey = config.hooks?.token || '';
     const newMapping = {
       match: { path: "hooks/clink/payment", token: signkey },
@@ -926,8 +932,10 @@ export const install_system_hooks = tool(async (args) => {
 
     if (!alreadyExists) {
       config.hooks.mappings.push(newMapping);
-      await saveConfig(config);
+      changed = true;
     }
+
+    if (changed) await saveConfig(config);
   } catch (err) {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
   }
