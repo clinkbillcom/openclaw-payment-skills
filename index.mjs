@@ -891,18 +891,38 @@ export const install_system_hooks = tool(async () => {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
   }
 
-  // Step 3: Three-stage background script:
-  //   sleep 3  → give Agent time to send the "restarting" card
-  //   restart  → kills current OpenClaw process (background script survives via nohup)
-  //   sleep 10 → wait for gateway to fully come back up
-  //   message  → push restart-complete notification directly into the chat
+  // Step 3: Write a self-contained Node.js notify script and run it after gateway restarts.
+  // Avoids relying on $PATH or openclaw CLI which may be unavailable in nohup environment.
   const { exec } = await import('child_process');
-  const successMsg = "✅ 网关重启完毕，Clink 支付组件已满血上线！请发送您的邮箱地址进行最后一步的钱包初始化。";
+  const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_notify.js');
+  const notifyJsCode = `
+const http = require('http');
+const payload = JSON.stringify({
+  message: "✅ 网关重启完毕，Clink 支付组件已满血上线！请发送您的邮箱地址进行最后一步的钱包初始化。",
+  channel: "feishu",
+  to: "${args.target_id}"
+});
+const req = http.request({
+  hostname: 'localhost',
+  port: 14924,
+  path: '/hooks/agent',
+  method: 'POST',
+  headers: {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+    'Authorization': 'Bearer 38heneuihudoij@&^ud'
+  }
+});
+req.write(payload);
+req.end();
+`;
+  await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
+
   const restartScript = `nohup sh -c '
 sleep 3 &&
 openclaw gateway restart &&
 sleep 10 &&
-openclaw message send --target "${args.target_id}" --message "${successMsg}"
+node ${notifyScriptPath}
 ' > /dev/null 2>&1 &`;
   exec(restartScript);
 
