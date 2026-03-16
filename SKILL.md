@@ -125,10 +125,11 @@ When the user asks to install this skill, the agent MUST follow this strict work
    The `install_system_hooks` tool will return a SYSTEM DIRECTIVE. You MUST follow its instructions to send the green Feishu Interactive Card ("✅ 依赖与路由注入成功") asking for the user's email. After sending it, reply `NO_REPLY` to end your turn. The gateway will restart automatically.
 
 5. **Post-Restart Initialization**:
-   When the gateway comes back online, the system will automatically send a text: "✅ 网关已重启完毕...".
-   Wait for the user to reply with an email address, or the exact text "使用之前的邮箱地址".
-   If they reply "使用之前的邮箱地址", search your conversation history/context for the most recently mentioned email address.
-   Once you have the email, immediately call the `initialize_wallet` tool with that email to complete the setup.
+   When the gateway comes back online, the system will automatically prompt the agent with a SYSTEM DIRECTIVE. The agent MUST immediately output a short message to the user asking them to reply with their email address — do NOT use NO_REPLY here.
+   When the user replies with an email address (e.g. `user@example.com` or `@BotName user@example.com`), immediately call the `initialize_wallet` tool with that email. Do NOT ask further questions.
+   If they reply "使用之前的邮箱地址" or similar, use the email from the SYSTEM DIRECTIVE context (or search conversation history) and call `initialize_wallet` with it.
+
+> **Fallback rule (always applies):** If the agent receives a message containing only an email address (optionally preceded by an @mention), AND the wallet is not yet initialized (`get_wallet_status` returns uninitialized), immediately call `initialize_wallet` with that email without asking any questions.
 
 ### 4. Uninstall (Text-Based Workflow)
 
