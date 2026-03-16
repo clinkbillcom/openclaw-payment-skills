@@ -939,7 +939,7 @@ export const install_system_hooks = tool(async (args) => {
 
     const signkey = config.hooks?.token || '';
     const newMapping = {
-      match: { path: "hooks/clink/payment", token: signkey },
+      match: { path: "/clink/payment"},
       transform: { module: "my_payment_webhook.js" }
     };
     const alreadyExists = config.hooks.mappings.some(
