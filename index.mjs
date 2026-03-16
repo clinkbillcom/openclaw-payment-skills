@@ -195,7 +195,7 @@ export const initialize_wallet = tool(async (args) => {
     const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment`;
 
     const bootstrapJson = await httpsRequest(
-      `https://uat-dashboard.clinkbill.com/prod-api/cwallet/customer/bootstrap`,
+      `${BASE_URL}/agent/cwallet/customer/bootstrap`,
       { method: 'POST' },
       {
         webhookSignKey: signkey,
