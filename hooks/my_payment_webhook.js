@@ -2,12 +2,13 @@
 // OpenClaw webhook transform for Clink payment callbacks.
 // Placed in ~/.openclaw/hooks/transforms/ at install time.
 //
-// Handles four callback types:
+// Handles:
 //   1. payment_method.added        — user finished binding a card on Clink hosted page
 //   2. payment_method.defaultChange — user changed their default payment method
 //   3. order.created     — charge order created (intermediate)
-//   4. order.succeeded   — payment + recharge succeeded
+//   4. order.succeeded   — payment succeeded (may carry agent_ prefix)
 //   5. order.failed      — payment or recharge failed
+//   6. risk_rule.updated — risk rules changed
 
 const fs = require('fs/promises');
 const os = require('os');
@@ -37,7 +38,10 @@ module.exports = async function(ctx) {
     return { kind: "wake", text: "[Clink Webhook] Received unknown payload with no type or data." };
   }
 
-  switch (type) {
+  // Normalize event type: strip leading "agent_" prefix (e.g. agent_order.succeeded → order.succeeded)
+  const normalizedType = type.startsWith('agent_') ? type.slice('agent_'.length) : type;
+
+  switch (normalizedType) {
 
     // ─── Card binding completed ───
     case "payment_method.added": {
@@ -127,27 +131,33 @@ Card 2 (initialization complete):
     // ─── Order created (intermediate state) ───
     case "order.created": {
       const amt = formatAmount(data);
+      const orderId = data.order_id || data.orderId || "N/A";
+      const customerId = data.customer_id || data.customerId || "N/A";
+      const sessionId = data.session_id || data.sessionId || "无";
       return {
         kind: "agent",
         name: "Clink",
         message: `[Clink Webhook] 充值订单已创建。
 
 事件: order.created
-订单 ID: ${data.orderId || "N/A"}
+订单 ID: ${orderId}
 金额: ${amt}
 状态: ${data.status || "pending"}
-客户 ID: ${data.customerId || "N/A"}
-Session ID: ${data.sessionId || "无"}
+客户 ID: ${customerId}
+Session ID: ${sessionId}
 
 [SYSTEM DIRECTIVE] A charge order has been created and is processing.
 DO NOT send a final success/failure card yet. Wait for order.succeeded or order.failed webhook.`
       };
     }
 
-    // ─── Payment succeeded (card charged, recharge not yet confirmed) ───
+    // ─── Payment succeeded ───
     case "order.succeeded": {
       const amt = formatAmount(data);
       const card = formatCard(data);
+      const orderId = data.order_id || data.orderId || "N/A";
+      const customerId = data.customer_id || data.customerId || "N/A";
+      const sessionId = data.session_id || data.sessionId || "无";
 
       return {
         kind: "agent",
@@ -155,11 +165,11 @@ DO NOT send a final success/failure card yet. Wait for order.succeeded or order.
         message: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
 
 事件: order.succeeded
-订单 ID: ${data.orderId || "N/A"}
+订单 ID: ${orderId}
 金额: ${amt}
 支付方式: ${card}
-客户 ID: ${data.customerId || "N/A"}
-Session ID: ${data.sessionId || "无"}
+客户 ID: ${customerId}
+Session ID: ${sessionId}
 
 [SYSTEM DIRECTIVE] Payment (card charge) succeeded, but merchant recharge is NOT yet confirmed.
 YOU MUST do the following in order:
@@ -171,11 +181,11 @@ Step 1: Send a Feishu Interactive Card to the user:
   - 扣款方式: "${card}"
 - Description: "已完成扣款，正在等待商户确认到账…"
 
-Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${data.orderId || ""}" to the merchant's recharge status check.
+Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
 
 Step 3: Based on the merchant confirmation result:
   - If credited/success: send "✅ 充值成功" card with the recharge details and resume any paused upstream task.
-  - If failed or timeout: send "❌ 充值失败" card with order reference number "${data.orderId || ""}" for user to contact merchant support.
+  - If failed or timeout: send "❌ 充值失败" card with order reference number "${orderId}" for user to contact merchant support.
 
 DO NOT send a "充值成功" card until the merchant confirms the recharge is credited.`
       };
@@ -185,9 +195,12 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
     case "order.failed": {
       const amt = formatAmount(data);
       const card = formatCard(data);
+      const orderId = data.order_id || data.orderId || "N/A";
+      const customerId = data.customer_id || data.customerId || "N/A";
+      const sessionId = data.session_id || data.sessionId || "无";
       const status = data.status || "failed";
-      const failureReason = data.failureReason || data.failure_reason || data.declineReason || data.decline_reason || "支付处理异常";
-      const isCharged = status === "charged" || status === "paid" || data.chargeStatus === "succeeded";
+      const failureReason = data.failure_reason || data.failureReason || data.decline_reason || data.declineReason || "支付处理异常";
+      const isCharged = status === "charged" || status === "paid" || data.charge_status === "succeeded" || data.chargeStatus === "succeeded";
 
       return {
         kind: "agent",
@@ -195,13 +208,13 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
         message: `[Clink Webhook] 充值失败回调。
 
 事件: order.failed
-订单 ID: ${data.orderId || "N/A"}
+订单 ID: ${orderId}
 金额: ${amt}
 支付方式: ${card}
 状态: ${status}
 失败原因: ${failureReason}
-客户 ID: ${data.customerId || "N/A"}
-Session ID: ${data.sessionId || "无"}
+客户 ID: ${customerId}
+Session ID: ${sessionId}
 
 [SYSTEM DIRECTIVE] Payment or recharge failed.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -210,7 +223,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 支付状态: "${isCharged ? `已扣款 ${amt}` : '扣款失败'}" (${isCharged ? 'Green' : 'Red'})
   - 充值状态: "失败" (Red)
   - 失败原因: "${failureReason}" (Red)
-  - 订单参考号: "${data.orderId || 'N/A'}"
+  - 订单参考号: "${orderId}"
 - Description: "${isCharged ? '您的银行卡已成功扣款，但商户账户未收到充值。请携带以上订单号联系商户客服处理。' : '银行卡扣款失败，请检查卡片状态或更换支付方式后重试。'}"
 - Button 1 (red, ${isCharged ? 'non-interactive label' : 'action: call get_payment_method_modify_link to open payment method switch page'}): "${isCharged ? '联系商户支持' : '更换支付方式'}"
 - Button 2 (ghost): "查看充值记录"`
@@ -265,17 +278,19 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 // ─── Helpers ───
 
 function formatAmount(data) {
-  const symbol = data.paymentCurrency === "USD" ? "$" : (data.paymentCurrency || "");
-  const amount = data.amountTotal ?? data.amountSubtotal ?? "N/A";
-  return `${symbol}${amount}`;
+  // Support both snake_case and camelCase field names
+  const currency = data.currency || data.paymentCurrency || "";
+  const symbol = currency === "USD" ? "$" : currency;
+  const amount = data.amount ?? data.amountTotal ?? data.amountSubtotal ?? "N/A";
+  return amount === "N/A" ? "N/A" : `${symbol}${amount}`;
 }
 
 function formatCard(data) {
-  // Try top-level card_brand/card_last4 first (same format as card.added)
+  // Top-level snake_case (payment_method.added style)
   if (data.card_brand || data.card_last4) {
     return `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
   }
-  // Fall back to nested paymentMethod object
+  // Nested paymentMethod object (legacy)
   if (data.paymentMethod) {
     const pm = data.paymentMethod;
     if (pm.card_brand || pm.card_last4 || pm.cardBrand || pm.cardLastFour) {
