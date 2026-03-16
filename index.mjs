@@ -155,9 +155,15 @@ function getPublicIp() {
 // ------------------------------------------------------------------
 
 export const initialize_wallet = tool(async (args) => {
-  // Use openclaw.json hooks.token as webhookSignKey so it matches the hook mapping token
+  // Use openclaw.json hooks.token as webhookSignKey; generate and persist one if absent
   const openclawConfig = await loadConfig();
-  const signkey = openclawConfig.hooks?.token || crypto.randomBytes(32).toString('hex');
+  let signkey = openclawConfig.hooks?.token || '';
+  if (!signkey) {
+    signkey = crypto.randomBytes(32).toString('hex');
+    openclawConfig.hooks = openclawConfig.hooks || {};
+    openclawConfig.hooks.token = signkey;
+    await saveConfig(openclawConfig);
+  }
 
   // Save signkey to skill cache (not openclaw.json env)
   try {
