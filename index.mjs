@@ -943,7 +943,7 @@ export const install_system_hooks = tool(async (args) => {
       transform: { module: "my_payment_webhook.js" }
     };
     const alreadyExists = config.hooks.mappings.some(
-      m => m.match?.path === "hooks/clink/payment" && m.transform?.module === "my_payment_webhook.js"
+      m => m.match?.path === "/clink/payment" && m.transform?.module === "my_payment_webhook.js"
     );
 
     if (!alreadyExists) {
