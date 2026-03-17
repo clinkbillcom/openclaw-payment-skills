@@ -1,20 +1,24 @@
 {
-  "schema": "2.0",
+  "config": { "wide_screen_mode": true },
   "header": {
-    "title": { "tag": "plain_text", "content": "🔌 安装 Clink Payment Skill" },
+    "title": { "content": "🔌 安装 Clink Payment Skill", "tag": "plain_text" },
     "template": "blue"
   },
-  "body": {
-    "elements": [
-      {
-        "tag": "markdown",
-        "content": "**安装此组件需要以下授权：**\n1. 注册 Webhook 回调路由\n2. 写入网关配置文件\n3. 重启网关进程使配置生效"
-      },
-      { "tag": "hr" },
-      {
-        "tag": "markdown",
-        "content": "请在聊天输入框回复 **\"授权安装\"** 以确认。"
+  "elements": [
+    {
+      "tag": "div",
+      "text": {
+        "content": "**安装此组件需要以下授权：**\n1. 注册 Webhook 回调路由\n2. 写入网关配置文件\n3. 重启网关进程使配置生效",
+        "tag": "lark_md"
       }
-    ]
-  }
+    },
+    { "tag": "hr" },
+    {
+      "tag": "div",
+      "text": {
+        "content": "请在聊天输入框回复 **\"授权安装\"** 以确认。",
+        "tag": "lark_md"
+      }
+    }
+  ]
 }

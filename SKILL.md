@@ -1,6 +1,6 @@
 ---
 name: agent-payment-skills
-description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. SILENT REPLY MANDATE: Whenever you send a Feishu Interactive Card, your ONLY output after the card MUST be the single token NO_REPLY. DO NOT output any other text, markdown, or explanation."
+description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Cards are sent via exec using the built-in scripts/send-feishu-card.mjs script (no external skill dependency). SILENT REPLY MANDATE: Whenever you send a Feishu Interactive Card, your ONLY output after the card MUST be the single token NO_REPLY. DO NOT output any other text, markdown, or explanation."
 version: "1.0.0"
 permissions:
   - network
@@ -131,7 +131,9 @@ When the user asks to view or manage their payment methods:
 When the user asks to install this skill, the agent MUST follow this strict workflow:
 
 1. **Send Authorization Card**:
-   Call the `feishu-interactive-cards` skill to send `cards/auth_request.json`. Do NOT execute system modifications yet. After sending the card, reply `NO_REPLY` and nothing else — do NOT add any explanatory text.
+   - **Feishu channel:** Run: `node {SKILL_DIR}/scripts/send-feishu-card.mjs {SKILL_DIR}/cards/auth_request.json --chat-id {current_feishu_chat_id}`
+   - **Non-Feishu channel:** Send plain text: "安装此组件需要以下授权：\n1. 注册 Webhook 回调路由\n2. 写入网关配置文件\n3. 重启网关进程\n\n请回复 \"授权安装\" 以确认。"
+   - Do NOT execute system modifications yet. After sending the card, reply `NO_REPLY` and nothing else — do NOT add any explanatory text.
 
 2. **Wait for Text Approval**:
    Pause execution. **Wait for the user to explicitly reply with "授权安装" or similar approval in the chat.**
@@ -154,7 +156,9 @@ When the user asks to install this skill, the agent MUST follow this strict work
 When the user asks to uninstall this skill, the agent MUST follow the same strict workflow:
 
 1. **Send Uninstall Authorization Card**:
-   Call the `feishu-interactive-cards` skill to send `cards/uninstall_request.json`. Do NOT execute any destructive operations yet. After sending the card, reply `NO_REPLY` and nothing else — do NOT add any explanatory text.
+   - **Feishu channel:** Run: `node {SKILL_DIR}/scripts/send-feishu-card.mjs {SKILL_DIR}/cards/uninstall_request.json --chat-id {current_feishu_chat_id}`
+   - **Non-Feishu channel:** Send plain text: "⚠️ 卸载将执行以下不可逆操作：删除 Webhook 拦截器、清除配置、删除目录、重启网关。\n\n请回复 \"确认卸载\" 以确认。"
+   - Do NOT execute any destructive operations yet. After sending the card, reply `NO_REPLY` and nothing else — do NOT add any explanatory text.
 
 2. **Wait for Text Approval**:
    Pause execution. **Wait for the user to explicitly reply with "确认卸载" or similar approval in the chat.**
