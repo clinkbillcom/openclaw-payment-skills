@@ -911,7 +911,7 @@ async function handle_uninstall_system_hooks(args) {
     if (config.hooks?.mappings) {
       const before = config.hooks.mappings.length;
       config.hooks.mappings = config.hooks.mappings.filter(
-        m => !(m.match?.path === "hooks/clink/payment" && m.transform?.module === "my_payment_webhook.js")
+        m => !(m.match?.path === "/clink/payment" && m.transform?.module === "my_payment_webhook.js")
       );
       if (config.hooks.mappings.length < before) {
         await saveConfig(config);
