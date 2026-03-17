@@ -496,7 +496,7 @@ Call initialize_wallet first before attempting to charge.`;
     }
   } catch (err) {
     await logError('pre_check_account', err);
-    return `[SYSTEM DIRECTIVE] Account pre-check FAILED: Could not read payment cache. Error: ${err.message}`;
+    return `[SYSTEM DIRECTIVE] Account pre-check FAILED: Could not resolve payment method. Error: ${err.message}`;
   }
 
   if (!defaultCard) {
@@ -553,8 +553,16 @@ async function handle_clink_pay(args) {
         piId = defaultRaw.payment_method_id;
         pmType = defaultRaw.payment_method_type || pmType;
       } else {
-        return `[SYSTEM DIRECTIVE] No valid payment method found in cache.
+        // Cache empty — fall back to live Clink API (e.g. after reinstall)
+        const { methods } = await fetchBindingData();
+        if (methods.length > 0) {
+          const live = methods.find(m => m.isDefault) || methods[0];
+          piId = live.paymentInstrumentId;
+          pmType = live.paymentInstrumentType || pmType;
+        } else {
+          return `[SYSTEM DIRECTIVE] No valid payment method found.
 Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
+        }
       }
     } catch (err) {
       await logError('clink_pay/fetchPaymentMethod', err);
