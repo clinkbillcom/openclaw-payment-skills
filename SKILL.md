@@ -127,14 +127,14 @@ When a user asks to top up / recharge any of the following merchants, you MUST a
 
 | Merchant | How to get merchant_id | How to confirm recharge |
 |---|---|---|
-| **ModelMax** | Call `modelmax-media.get_merchant_id` | Call `modelmax-media.check_recharge_status` with order_id |
+| **ModelMax** | Call `modelmax-media.get_payment_config` | Call `modelmax-media.check_recharge_status` with order_id |
 
 **Routing rule**: Any user request like "给 ModelMax 充值", "recharge ModelMax", "top up my ModelMax account", or a 402 response from any supported merchant skill, MUST trigger the following flow:
 1. Call `pre_check_account`
 2. **Always call** the merchant's tool to obtain `merchant_id` (see table above). Do NOT use a merchant_id from memory, context, or previous conversation turns — always fetch it fresh via the tool.
 3. Call `clink_pay` with the merchant_id and amount:
    - If the user explicitly specified an amount, use that amount.
-   - **If triggered automatically (402 / low-balance): use the `default_recharge_amount` and `currency` returned by the merchant's `get_merchant_id` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
+   - **If triggered automatically (402 / low-balance): use the `default_recharge_amount` and `currency` returned by the merchant's `get_payment_config` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
 4. After `agent_order.succeeded` webhook is received AND merchant recharge is confirmed (via `check_recharge_status`): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
 
 ## Instructions & Workflows
