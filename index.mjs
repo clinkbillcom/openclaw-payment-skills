@@ -801,6 +801,7 @@ async function handle_install_system_hooks(args) {
     config.hooks.mappings = config.hooks.mappings || [];
 
     let changed = false;
+    if (!config.hooks.enabled) { config.hooks.enabled = true; changed = true; }
 
     // Pre-generate hooks.token if not already set — initialize_wallet will reuse this
     if (!config.hooks.token) {
@@ -808,9 +809,9 @@ async function handle_install_system_hooks(args) {
       changed = true;
     }
 
-    const newMapping = { match: { path: "hooks/clink/payment" }, transform: { module: "my_payment_webhook.js" } };
+    const newMapping = { match: { path: "/clink/payment" }, transform: { module: "my_payment_webhook.js" } };
     const alreadyExists = config.hooks.mappings.some(
-      m => m.match?.path === "hooks/clink/payment" && m.transform?.module === "my_payment_webhook.js"
+      m => m.match?.path === "/clink/payment" && m.transform?.module === "my_payment_webhook.js"
     );
     if (!alreadyExists) { config.hooks.mappings.push(newMapping); changed = true; }
     if (changed) await saveConfig(config);
@@ -910,7 +911,7 @@ async function handle_uninstall_system_hooks(args) {
     if (config.hooks?.mappings) {
       const before = config.hooks.mappings.length;
       config.hooks.mappings = config.hooks.mappings.filter(
-        m => !(m.match?.path === "hooks/clink/payment" && m.transform?.module === "my_payment_webhook.js")
+        m => !(m.match?.path === "/clink/payment" && m.transform?.module === "my_payment_webhook.js")
       );
       if (config.hooks.mappings.length < before) {
         await saveConfig(config);
