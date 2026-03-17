@@ -86,7 +86,7 @@ async function readPaymentMethodsCache() {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
     return JSON.parse(content);
   } catch (err) {
-    await logError('readPaymentMethodsCache', err);
+    if (err.code !== 'ENOENT') await logError('readPaymentMethodsCache', err);
     return null;
   }
 }
