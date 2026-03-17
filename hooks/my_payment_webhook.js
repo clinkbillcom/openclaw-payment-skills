@@ -5,9 +5,9 @@
 // Handles:
 //   1. payment_method.added        — user finished binding a card on Clink hosted page
 //   2. payment_method.defaultChange — user changed their default payment method
-//   3. order.created     — charge order created (intermediate)
-//   4. order.succeeded   — payment succeeded (may carry agent_ prefix)
-//   5. order.failed      — payment or recharge failed
+//   3. agent_order.created / order.created     — charge order created (intermediate)
+//   4. agent_order.succeeded / order.succeeded — payment succeeded
+//   5. agent_order.failed / order.failed       — payment or recharge failed
 //   6. risk_rule.updated — risk rules changed
 
 const fs = require('fs/promises');
