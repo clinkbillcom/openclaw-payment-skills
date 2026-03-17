@@ -487,8 +487,12 @@ Call initialize_wallet first before attempting to charge.`;
         || cache.payment_methods[0];
       defaultCard = normalizeCachedMethod(defaultRaw);
     } else {
-      return `[SYSTEM DIRECTIVE] No valid payment method found in cache.
-Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
+      // Cache empty — fall back to live Clink API (e.g. after reinstall)
+      const { methods } = await fetchBindingData();
+      if (methods.length > 0) {
+        const live = methods.find(m => m.isDefault) || methods[0];
+        defaultCard = live; // already camelCase: cardScheme, cardLastFour
+      }
     }
   } catch (err) {
     await logError('pre_check_account', err);
