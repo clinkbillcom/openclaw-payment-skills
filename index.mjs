@@ -1,5 +1,6 @@
-import { tool } from "@langchain/core/tools";
-import { z } from "zod";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
@@ -35,7 +36,6 @@ async function saveConfig(config) {
 async function getPaymentEnv() {
   const config = await loadConfig();
   const env = config?.skills?.entries?.["agent-payment-skills"]?.env || {};
-  // Read all Clink-specific fields from skill cache (source of truth)
   try {
     const cache = await readPaymentMethodsCache();
     if (cache?.email) env.CLINK_USER_EMAIL = cache.email;
@@ -52,7 +52,6 @@ async function updatePaymentEnv(updates) {
   config.skills.entries = config.skills.entries || {};
   config.skills.entries["agent-payment-skills"] = config.skills.entries["agent-payment-skills"] || {};
   config.skills.entries["agent-payment-skills"].env = config.skills.entries["agent-payment-skills"].env || {};
-  
   for (const [key, value] of Object.entries(updates)) {
     config.skills.entries["agent-payment-skills"].env[key] = value;
   }
@@ -73,7 +72,6 @@ async function readPaymentMethodsCache() {
   }
 }
 
-// Normalize cache (snake_case) to the shape expected by existing tool code (camelCase)
 function normalizeCachedMethod(m) {
   return {
     paymentInstrumentId: m.payment_method_id,
@@ -89,17 +87,6 @@ function normalizeCachedMethod(m) {
 // API HELPERS
 // ------------------------------------------------------------------
 const BASE_URL = "https://uat-api.clinkbill.com";
-
-// Supported merchant registry
-// Each entry describes how to obtain the merchant_id and confirm recharge via agent tool calls.
-const SUPPORTED_MERCHANTS = [
-  {
-    name: "ModelMax",
-    description: "AI media generation platform (images & videos)",
-    get_merchant_id_tool: "modelmax-media.get_merchant_id",
-    check_recharge_tool: "modelmax-media.check_recharge_status"
-  }
-];
 
 class ClinkApiError extends Error {
   constructor(code, msg, raw) {
@@ -148,9 +135,6 @@ async function fetchClink(endpoint, options = {}) {
   return data.data;
 }
 
-// ------------------------------------------------------------------
-// PUBLIC IP HELPER
-// ------------------------------------------------------------------
 function getPublicIp() {
   return new Promise((resolve) => {
     https.get('https://api.ipify.org', (res) => {
@@ -160,88 +144,6 @@ function getPublicIp() {
     }).on('error', () => resolve('127.0.0.1'));
   });
 }
-
-// ------------------------------------------------------------------
-// PHASE 1 TOOLS
-// ------------------------------------------------------------------
-
-export const initialize_wallet = tool(async (args) => {
-  // Use openclaw.json hooks.token as webhookSignKey; generate and persist one if absent
-  const openclawConfig = await loadConfig();
-  let signkey = openclawConfig.hooks?.token || '';
-  if (!signkey) {
-    signkey = crypto.randomBytes(32).toString('hex');
-    openclawConfig.hooks = openclawConfig.hooks || {};
-    openclawConfig.hooks.token = signkey;
-    await saveConfig(openclawConfig);
-  }
-
-  // Save signkey to skill cache (not openclaw.json env)
-  try {
-    const cache = await readPaymentMethodsCache() || {};
-    cache.webhook_signkey = signkey;
-    cache.email = args.email;
-    await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-    cache.cached_at = new Date().toISOString();
-    await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
-  } catch (err) {
-    return `Failed to save to cache: ${err.message}`;
-  }
-
-  // Call Bootstrap API
-  try {
-    const port = openclawConfig.gateway?.port || 14924;
-    const publicIp = await getPublicIp();
-    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment`;
-
-    const bootstrapJson = await httpsRequest(
-      `${BASE_URL}/agent/cwallet/customer/bootstrap`,
-      { method: 'POST' },
-      {
-        webhookSignKey: signkey,
-        callbackUrl: realCallbackUrl,
-        source: "agent",
-        email: args.email,
-        name: args.name || "Agent User"
-      }
-    );
-    if (bootstrapJson.code !== 200) {
-      throw new ClinkApiError(bootstrapJson.code, bootstrapJson.msg, bootstrapJson);
-    }
-    const data = bootstrapJson.data;
-    
-    // Save customer_id and API key to cache
-    try {
-      const cache = await readPaymentMethodsCache() || {};
-      cache.customer_id = data.customerId;
-      cache.customer_api_key = data.customerAPIKey;
-      cache.cached_at = new Date().toISOString();
-      await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-      await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
-    } catch (err) {
-      return `Failed to save customer data to cache: ${err.message}`;
-    }
-
-    return `Clink 账户 Bootstrap 成功。
-[SYSTEM DIRECTIVE]
-Wallet bootstrap completed for ${args.email}. Customer ID: ${data.customerId}. Generated webhook signkey and saved to config.
-
-You MUST NOT output ANY text to the user yet.
-You MUST IMMEDIATELY call the "get_binding_link" tool to check for existing payment methods.
-
-After calling "get_binding_link", its return payload will give you the exact card specification to send.
-You MUST send that Feishu Interactive Card.
-After sending the card, your turn MUST end with EXACTLY AND ONLY the token NO_REPLY. DO NOT OUTPUT A SINGLE WORD of markdown text before or after the card.`;  } catch (err) {
-    return `Failed to initialize wallet: ${err.message}`;
-  }
-}, {
-  name: "initialize_wallet",
-  description: "Run once per user. Generates signature key, requests email, calls Clink bootstrap API, and sets up webhook.",
-  schema: z.object({
-    email: z.string(),
-    name: z.string().optional()
-  })
-});
 
 // ------------------------------------------------------------------
 // BINDING LINK HELPER
@@ -267,12 +169,7 @@ async function fetchBindingData() {
     bindingToken = bindingUrl.split("#")[1];
   }
 
-  return {
-    bindingUrl,
-    bindingToken,
-    methods: data.paymentMethodsVoList || [],
-    env
-  };
+  return { bindingUrl, bindingToken, methods: data.paymentMethodsVoList || [], env };
 }
 
 function buildRedirectUrl(bindingUrl, redirectPath) {
@@ -281,10 +178,86 @@ function buildRedirectUrl(bindingUrl, redirectPath) {
 }
 
 // ------------------------------------------------------------------
-// PHASE 1 TOOLS — BINDING & MANAGEMENT
+// TOOL IMPLEMENTATIONS
 // ------------------------------------------------------------------
 
-export const get_binding_link = tool(async () => {
+async function handle_initialize_wallet(args) {
+  const openclawConfig = await loadConfig();
+  let signkey = openclawConfig.hooks?.token || '';
+  if (!signkey) {
+    signkey = crypto.randomBytes(32).toString('hex');
+    openclawConfig.hooks = openclawConfig.hooks || {};
+    openclawConfig.hooks.token = signkey;
+    await saveConfig(openclawConfig);
+  }
+
+  try {
+    const cache = await readPaymentMethodsCache() || {};
+    cache.webhook_signkey = signkey;
+    cache.email = args.email;
+    await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+    cache.cached_at = new Date().toISOString();
+    await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+  } catch (err) {
+    return `Failed to save to cache: ${err.message}`;
+  }
+
+  try {
+    const port = openclawConfig.gateway?.port || 14924;
+    const publicIp = await getPublicIp();
+    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment`;
+
+    const bootstrapJson = await httpsRequest(
+      `${BASE_URL}/agent/cwallet/customer/bootstrap`,
+      { method: 'POST' },
+      {
+        webhookSignKey: signkey,
+        callbackUrl: realCallbackUrl,
+        source: "agent",
+        email: args.email,
+        name: args.name || "Agent User"
+      }
+    );
+    if (bootstrapJson.code !== 200) {
+      throw new ClinkApiError(bootstrapJson.code, bootstrapJson.msg, bootstrapJson);
+    }
+    const data = bootstrapJson.data;
+
+    try {
+      const cache = await readPaymentMethodsCache() || {};
+      cache.customer_id = data.customerId;
+      cache.customer_api_key = data.customerAPIKey;
+      cache.cached_at = new Date().toISOString();
+      await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+      await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+    } catch (err) {
+      return `Failed to save customer data to cache: ${err.message}`;
+    }
+
+    return `Clink 账户 Bootstrap 成功。
+[SYSTEM DIRECTIVE]
+Wallet bootstrap completed for ${args.email}. Customer ID: ${data.customerId}. Generated webhook signkey and saved to config.
+
+You MUST NOT output ANY text to the user yet.
+You MUST IMMEDIATELY call the "get_binding_link" tool to check for existing payment methods.
+
+After calling "get_binding_link", its return payload will give you the exact card specification to send.
+You MUST send that Feishu Interactive Card.
+After sending the card, your turn MUST end with EXACTLY AND ONLY the token NO_REPLY. DO NOT OUTPUT A SINGLE WORD of markdown text before or after the card.`;
+  } catch (err) {
+    return `Failed to initialize wallet: ${err.message}`;
+  }
+}
+
+async function handle_get_wallet_status() {
+  const env = await getPaymentEnv();
+  if (!env.CLINK_CUSTOMER_ID) {
+    return "Wallet not initialized.";
+  }
+  return `Wallet Status:\nCustomer ID: ${env.CLINK_CUSTOMER_ID}\nEmail: ${env.CLINK_USER_EMAIL}\nHas API Key: ${!!env.CLINK_CUSTOMER_API_KEY}`;
+}
+
+async function handle_get_binding_link() {
   try {
     const { bindingUrl, bindingToken, methods, env } = await fetchBindingData();
 
@@ -324,13 +297,9 @@ Extracted Binding Token for future use: ${bindingToken}`;
   } catch (err) {
     return `Failed to get binding link: ${err.message}`;
   }
-}, {
-  name: "get_binding_link",
-  description: "Generates a URL for the user to bind a new payment method (e.g., credit card) and returns currently bound methods.",
-  schema: z.object({})
-});
+}
 
-export const get_risk_rules_link = tool(async () => {
+async function handle_get_risk_rules_link() {
   try {
     const { bindingUrl, env } = await fetchBindingData();
     const riskUrl = buildRedirectUrl(bindingUrl, "RiskRulesSetUp");
@@ -346,13 +315,9 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
   } catch (err) {
     return `Failed to get risk rules link: ${err.message}`;
   }
-}, {
-  name: "get_risk_rules_link",
-  description: "Generates a URL for the user to configure recharge risk rules (per-charge limit, daily limit, frequency, etc.).",
-  schema: z.object({})
-});
+}
 
-export const get_payment_method_setup_link = tool(async () => {
+async function handle_get_payment_method_setup_link() {
   try {
     const { bindingUrl, env } = await fetchBindingData();
     const setupUrl = buildRedirectUrl(bindingUrl, "PaymentMethodSetUp");
@@ -368,13 +333,9 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
   } catch (err) {
     return `Failed to get payment method setup link: ${err.message}`;
   }
-}, {
-  name: "get_payment_method_setup_link",
-  description: "Generates a URL for the user to add a new payment method (credit card, PayPal, etc.).",
-  schema: z.object({})
-});
+}
 
-export const get_payment_method_modify_link = tool(async () => {
+async function handle_get_payment_method_modify_link() {
   try {
     const { bindingUrl, methods } = await fetchBindingData();
     const modifyUrl = buildRedirectUrl(bindingUrl, "PaymentMethodModify");
@@ -394,43 +355,28 @@ Current Payment Methods: ${JSON.stringify(methods)}`;
   } catch (err) {
     return `Failed to get payment method modify link: ${err.message}`;
   }
-}, {
-  name: "get_payment_method_modify_link",
-  description: "Generates a URL for the user to manage, switch, or modify existing payment methods.",
-  schema: z.object({})
-});
+}
 
-export const list_payment_methods = tool(async (args) => {
+async function handle_list_payment_methods(args) {
   if (!args.bindingToken) {
     return "Requires bindingToken (usually obtained from binding link or session).";
   }
-
   try {
     const data = await fetchClink('/a/cwallet/card/info', {
       method: 'GET',
-      headers: {
-        "Authorization": `Bearer ${args.bindingToken}`
-      }
+      headers: { "Authorization": `Bearer ${args.bindingToken}` }
     });
     return `Payment Methods for ${data.email}:\n${JSON.stringify(data.paymentMethods, null, 2)}`;
   } catch (err) {
     return `Failed to list payment methods: ${err.message}`;
   }
-}, {
-  name: "list_payment_methods",
-  description: "List all payment methods bound to the user's wallet. Requires a valid binding token.",
-  schema: z.object({
-    bindingToken: z.string().describe("The JWT token obtained from the binding link flow")
-  })
-});
+}
 
-export const get_payment_method_detail = tool(async (args) => {
+async function handle_get_payment_method_detail(args) {
   try {
     const data = await fetchClink(`/a/cwallet/card/detail?paymentInstrumentId=${args.paymentInstrumentId}`, {
       method: 'GET',
-      headers: {
-        "Authorization": `Bearer ${args.bindingToken}`
-      }
+      headers: { "Authorization": `Bearer ${args.bindingToken}` }
     });
     return `[SYSTEM DIRECTIVE] Payment Method Detail Retrieved.
 YOU MUST send a Feishu Interactive Card to the user with the following details:
@@ -442,82 +388,40 @@ Raw Data: ${JSON.stringify(data)}`;
   } catch (err) {
     return `Failed to get payment method detail: ${err.message}`;
   }
-}, {
-  name: "get_payment_method_detail",
-  description: "Get detailed information about a specific payment method.",
-  schema: z.object({
-    bindingToken: z.string(),
-    paymentInstrumentId: z.string()
-  })
-});
+}
 
-export const update_payment_method = tool(async (args) => {
+async function handle_update_payment_method(args) {
   try {
     const data = await fetchClink('/a/cwallet/card/update', {
       method: 'PUT',
-      headers: {
-        "Authorization": `Bearer ${args.bindingToken}`
-      },
-      body: JSON.stringify({
-        paymentInstrumentId: args.paymentInstrumentId,
-        billingAddressJson: args.billingAddressJson
-      })
+      headers: { "Authorization": `Bearer ${args.bindingToken}` },
+      body: JSON.stringify({ paymentInstrumentId: args.paymentInstrumentId, billingAddressJson: args.billingAddressJson })
     });
     return `Payment method updated successfully: ${data}`;
   } catch (err) {
     return `Failed to update payment method: ${err.message}`;
   }
-}, {
-  name: "update_payment_method",
-  description: "Update the billing address of a specific payment method.",
-  schema: z.object({
-    bindingToken: z.string(),
-    paymentInstrumentId: z.string(),
-    billingAddressJson: z.object({
-      country: z.string().optional(),
-      city: z.string().optional(),
-      line1: z.string().optional(),
-      line2: z.string().optional(),
-      postalCode: z.string().optional(),
-      region: z.string().optional()
-    })
-  })
-});
+}
 
-export const delete_payment_method = tool(async (args) => {
+async function handle_delete_payment_method(args) {
   try {
     const data = await fetchClink('/a/cwallet/card/delete', {
       method: 'DELETE',
-      headers: {
-        "Authorization": `Bearer ${args.bindingToken}`
-      },
-      body: JSON.stringify({
-        paymentInstrumentId: args.paymentInstrumentId
-      })
+      headers: { "Authorization": `Bearer ${args.bindingToken}` },
+      body: JSON.stringify({ paymentInstrumentId: args.paymentInstrumentId })
     });
     return `Payment method deleted successfully: ${data}`;
   } catch (err) {
     return `Failed to delete payment method: ${err.message}`;
   }
-}, {
-  name: "delete_payment_method",
-  description: "Delete a specific payment method from the wallet.",
-  schema: z.object({
-    bindingToken: z.string(),
-    paymentInstrumentId: z.string()
-  })
-});
+}
 
-export const set_default_payment_method = tool(async (args) => {
+async function handle_set_default_payment_method(args) {
   try {
     const data = await fetchClink('/a/cwallet/card/setDefault', {
       method: 'PUT',
-      headers: {
-        "Authorization": `Bearer ${args.bindingToken}`
-      },
-      body: JSON.stringify({
-        paymentInstrumentId: args.paymentInstrumentId
-      })
+      headers: { "Authorization": `Bearer ${args.bindingToken}` },
+      body: JSON.stringify({ paymentInstrumentId: args.paymentInstrumentId })
     });
     return `[SYSTEM DIRECTIVE] Payment method set as default successfully.
 YOU MUST send a Feishu Interactive Card to the user with the following details:
@@ -531,25 +435,16 @@ Raw Data: ${data}`;
   } catch (err) {
     return `Failed to set default payment method: ${err.message}`;
   }
-}, {
-  name: "set_default_payment_method",
-  description: "Set a specific payment method as the default for future transactions.",
-  schema: z.object({
-    bindingToken: z.string(),
-    paymentInstrumentId: z.string()
-  })
-});
+}
 
-export const pre_check_account = tool(async () => {
+async function handle_pre_check_account() {
   const env = await getPaymentEnv();
 
-  // Check wallet initialized
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return `[SYSTEM DIRECTIVE] Account pre-check FAILED: Wallet not initialized.
 Call initialize_wallet first before attempting to charge.`;
   }
 
-  // Check payment methods — cache first, fallback to API
   let defaultCard = null;
   try {
     const cache = await readPaymentMethodsCache();
@@ -588,13 +483,9 @@ Account is ready. You may now proceed to call clink_pay.
 
 Payment Method: ${JSON.stringify(defaultCard)}
 Email: ${email}`;
-}, {
-  name: "pre_check_account",
-  description: "Run before clink_pay to verify account readiness (wallet initialized, payment method bound, email set). Displays an account check status card to the user.",
-  schema: z.object({})
-});
+}
 
-export const clink_pay = tool(async (args) => {
+async function handle_clink_pay(args) {
   const env = await getPaymentEnv();
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return "Wallet not initialized. Please run initialize_wallet first.";
@@ -603,7 +494,6 @@ export const clink_pay = tool(async (args) => {
   let piId = args.paymentInstrumentId;
   let pmType = args.paymentMethodType || "CARD";
 
-  // If no specific payment instrument is provided, resolve the default one automatically
   if (!piId) {
     try {
       const cache = await readPaymentMethodsCache();
@@ -623,19 +513,12 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
   }
 
   const timestamp = Date.now().toString();
-  const chargeBody = {
-    paymentInstrumentId: piId,
-    paymentMethodType: pmType
-  };
+  const chargeBody = { paymentInstrumentId: piId, paymentMethodType: pmType };
 
   if (args.sessionId) {
-    // Session mode: amount/currency come from session, merchantId optional (validated against session if provided)
     chargeBody.sessionId = args.sessionId;
-    if (args.merchant_id) {
-      chargeBody.merchantId = args.merchant_id;
-    }
+    if (args.merchant_id) chargeBody.merchantId = args.merchant_id;
   } else {
-    // Direct mode: all fields required
     chargeBody.merchantId = args.merchant_id;
     chargeBody.customAmount = args.amount;
     chargeBody.paymentCurrency = args.currency || "USD";
@@ -644,10 +527,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
   try {
     const data = await fetchClink('/agent/order/charge', {
       method: 'POST',
-      headers: {
-        "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-        "X-Timestamp": timestamp
-      },
+      headers: { "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY, "X-Timestamp": timestamp },
       body: JSON.stringify(chargeBody)
     });
 
@@ -703,7 +583,6 @@ DO NOT output any other text. DO NOT send a success/failure card — wait for th
     const currency = args.currency || "USD";
     const amt = `${args.amount} ${currency}`;
 
-    // --- Scene 4: Email mismatch / verification failed ---
     if (code === 90101203 || err.message.includes("CUSTOMER_EMAIL_NOT_FOUND")) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Customer email not found.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -719,7 +598,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    if (err.message.includes("CUSTOMER_VERIFY_FAILED") || err.message.includes("邮箱") && err.message.includes("验证")) {
+    if (err.message.includes("CUSTOMER_VERIFY_FAILED") || (err.message.includes("邮箱") && err.message.includes("验证"))) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Email verification failed (Scene 4 - email mismatch).
 YOU MUST immediately send a Feishu Interactive Card to the user:
 - Template / Style: "🚫 充值被拦截：邮箱不一致" (Red theme, header h-danger)
@@ -734,7 +613,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    // --- Merchant not found ---
     if (code === 90101216 || err.message.includes("MERCHANT_NOT_FOUND")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Merchant not found.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -748,7 +626,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    // --- Duplicate order in processing ---
     if (code === 90101212 || err.message.includes("ORDER_HAS_ONE_IN_PROCESSING") || err.message.includes("处理中")) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Another order is still processing.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -763,7 +640,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the previous order to complete (via webhook callback).`;
     }
 
-    // --- Amount / currency invalid ---
     if (code === 90101206 || err.message.includes("ORDER_AMOUNT") || err.message.includes("CURRENCY_INCORRECT") || err.message.includes("金额")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Invalid amount or currency.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -777,7 +653,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    // --- Session errors ---
     if (code === 90101219 || code === 90101220 || err.message.includes("SESSION_NOT_FOUND") || err.message.includes("SESSION_EXPIRED")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Charge session expired or not found.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -804,7 +679,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    // --- API Key errors ---
     if (code === 401 || code === 80102221 || code === 80102222 || code === 80102223) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Authentication error.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -818,7 +692,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
-    // --- Timestamp errors ---
     if (code === 80102212 || code === 80102213 || code === 80102203) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Timestamp validation error.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -831,7 +704,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 This is likely a clock sync issue. Retry immediately with a fresh timestamp.`;
     }
 
-    // --- Risk rule triggered (Scene 8) ---
     if (err.message.includes("RISK") || err.message.includes("风控") || err.message.includes("LIMIT") || err.message.includes("FREQUENCY") || err.message.includes("COOLDOWN")) {
       const ruleName = err.raw?.data?.ruleName || err.raw?.data?.rule_name || "风控规则";
       const ruleDetail = err.raw?.data?.ruleDetail || err.raw?.data?.rule_detail || err.message;
@@ -851,7 +723,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the user to click a button. If the user chooses "继续充值", retry clink_pay with the same parameters. If "修改风控规则", call get_risk_rules_link first.`;
     }
 
-    // --- Card declined (Scene 7) ---
     if (code === 90101200 || err.message.includes("DECLINE") || err.message.includes("拒绝")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Card Declined (Scene 7).
 YOU MUST immediately send TWO Feishu Interactive Cards to the user:
@@ -877,7 +748,6 @@ Card 2:
 After sending both cards, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text. Wait for the user to switch their payment method and explicitly ask to retry before calling clink_pay again.`;
     }
 
-    // --- Remote service failure ---
     if (code === 90101201) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Remote service error.
 YOU MUST immediately send a Feishu Interactive Card to the user:
@@ -891,7 +761,6 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 You may retry after a short delay.`;
     }
 
-    // --- Fallback: unknown error ---
     return `[SYSTEM DIRECTIVE] Payment Failed: Unexpected error.
 YOU MUST immediately send a Feishu Interactive Card to the user:
 - Template / Style: "❌ 充值失败：建议联系商户支持" (Red theme, header h-danger)
@@ -906,36 +775,19 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   }
-}, {
-  name: "clink_pay",
-  description: "Execute a payment via Clink. Supports two modes — direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant, amount/currency pre-validated). Used by other skills for auto top-up. IMPORTANT: merchant_id MUST always be obtained by calling the merchant's tool (e.g. modelmax-media.get_merchant_id) immediately before invoking clink_pay. Never reuse a merchant_id from memory or conversation history.",
-  schema: z.object({
-    merchant_id: z.string().optional().describe("Merchant ID to recharge. Required in direct mode — MUST be fetched fresh via the merchant's tool (e.g. modelmax-media.get_merchant_id) each time, never taken from memory or context. Optional in session mode (validated against session if provided)."),
-    amount: z.number().describe("Recharge amount. Required in direct mode; in session mode the session amount is used but this is still needed for display."),
-    currency: z.string().optional().describe("Currency code, e.g. USD. Defaults to USD. In session mode, session currency is used."),
-    sessionId: z.string().optional().describe("Charge session ID created by the merchant. When provided, uses session mode (amount/currency from session)."),
-    paymentInstrumentId: z.string().optional(),
-    paymentMethodType: z.string().optional()
-  })
-});
+}
 
-// ------------------------------------------------------------------
-// INSTALLATION TOOL — Text-Based Authorization Workflow
-// ------------------------------------------------------------------
-
-export const install_system_hooks = tool(async (args) => {
+async function handle_install_system_hooks(args) {
   const skillDir = path.dirname(new URL(import.meta.url).pathname);
   const hooksSource = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
   const hooksTarget = path.join(os.homedir(), '.openclaw', 'hooks', 'transforms', 'my_payment_webhook.js');
 
-  // 读取可能存在的老邮箱
   let userEmail = "";
   try {
     const cache = await readPaymentMethodsCache();
     userEmail = cache?.email || "";
   } catch {}
 
-  // Step 1: Copy webhook transform file
   try {
     await fs.mkdir(path.dirname(hooksTarget), { recursive: true });
     await fs.copyFile(hooksSource, hooksTarget);
@@ -943,39 +795,24 @@ export const install_system_hooks = tool(async (args) => {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 1 (copy webhook file): ${err.message}`;
   }
 
-  // Step 2: Inject hook mapping into openclaw.json
   try {
     const config = await loadConfig();
     config.hooks = config.hooks || {};
     config.hooks.mappings = config.hooks.mappings || [];
 
     let changed = false;
-    if (!config.hooks.enabled) {
-      config.hooks.enabled = true;
-      changed = true;
-    }
+    if (!config.hooks.enabled) { config.hooks.enabled = true; changed = true; }
 
-    const signkey = config.hooks?.token || '';
-    const newMapping = {
-      match: { path: "/clink/payment"},
-      transform: { module: "my_payment_webhook.js" }
-    };
+    const newMapping = { match: { path: "/clink/payment" }, transform: { module: "my_payment_webhook.js" } };
     const alreadyExists = config.hooks.mappings.some(
       m => m.match?.path === "/clink/payment" && m.transform?.module === "my_payment_webhook.js"
     );
-
-    if (!alreadyExists) {
-      config.hooks.mappings.push(newMapping);
-      changed = true;
-    }
-
+    if (!alreadyExists) { config.hooks.mappings.push(newMapping); changed = true; }
     if (changed) await saveConfig(config);
   } catch (err) {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
   }
 
-  // Step 3: Write a self-contained Node.js notify script and run it after gateway restarts.
-  // Dynamically reads port and token from openclaw.json at runtime — no hardcoded values.
   const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_notify.js');
   const notifyJsCode = `
 const fs = require('fs');
@@ -983,7 +820,6 @@ const http = require('http');
 const path = require('path');
 const os = require('os');
 
-// 动态读取 OpenClaw 全局配置
 const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 let gatewayPort = 14924;
 let webhookToken = '';
@@ -991,82 +827,45 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   gatewayPort = config.gateway?.port || 14924;
   webhookToken = config.hooks?.token || '';
-} catch (err) {
-  console.error('Failed to read openclaw.json:', err.message);
-}
+} catch (err) { console.error('Failed to read openclaw.json:', err.message); }
 
-// 防御性读取缓存邮箱：先问路，再开门
 const cachePath = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills', 'clink.config.json');
 let userEmail = '';
 if (fs.existsSync(cachePath)) {
   try {
     const cache = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
     userEmail = cache.email || '';
-  } catch (err) {
-    console.error('Failed to read skill cache:', err.message);
-  }
+  } catch (err) { console.error('Failed to read skill cache:', err.message); }
 }
 
-// 根据有没有邮箱，动态拼接用户可见消息
 let userMessage = '✅ **网关重启完毕，Clink 支付组件已满血上线！**\\n\\n🔐 **最后一步：钱包初始化**\\n请在下方输入框直接回复您的邮箱地址进行绑定。';
 if (userEmail) {
   userMessage = '✅ **网关重启完毕，Clink 支付组件已满血上线！**\\n\\n🔐 **最后一步：钱包初始化**\\n请在下方输入框直接回复您的新邮箱地址，或**一键复制**下方口令继续使用之前的邮箱：\\n\\n\`\`\`text\\n使用之前的邮箱：' + userEmail + '\\n\`\`\`';
 }
 
-// Agent 上下文注入消息：让 agent 主动向用户输出一句提示，建立对话上下文
-const emailHint = userEmail
-  ? '用户之前绑定的邮箱是 ' + userEmail + '。请告知用户：可直接回复该邮箱，或输入新邮箱。收到邮箱后立即调用 initialize_wallet，无需询问其他问题。'
-  : '钱包尚未初始化。收到用户邮箱后立即调用 initialize_wallet，不要询问其他问题。';
-const agentContext = '[SYSTEM DIRECTIVE] Clink Payment Skill 安装完成，网关已重启就绪。' +
-  emailHint +
-  ' 你必须立即向用户输出一条简短提示（禁止使用 NO_REPLY），告知用户：现在直接回复邮箱地址即可完成初始化。提示末尾必须另起一行写上标记：[CLINK_INIT_PENDING]';
-
 function post(payload) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
-    const headers = {
-      'Content-Type': 'application/json',
-      'Content-Length': Buffer.byteLength(body)
-    };
-    if (webhookToken) {
-      headers['Authorization'] = 'Bearer ' + webhookToken;
-    }
-    const req = http.request({
-      hostname: 'localhost',
-      port: gatewayPort,
-      path: '/hooks/agent',
-      method: 'POST',
-      headers
-    }, resolve);
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) };
+    if (webhookToken) headers['Authorization'] = 'Bearer ' + webhookToken;
+    const req = http.request({ hostname: 'localhost', port: gatewayPort, path: '/hooks/agent', method: 'POST', headers }, resolve);
     req.on('error', reject);
     req.write(body);
     req.end();
   });
 }
 
-async function sendNotification() {
-  // 只发一条 deliver 消息直接给用户看，不再发第二条 agentContext 唤醒消息
-  // （agentContext 会与用户的邮箱回复产生竞争，导致第一条邮箱被忽略）
-  // SKILL.md 的 fallback rule 会在用户发送邮箱时无条件触发 initialize_wallet
-  await post({ message: userMessage, channel: "feishu", to: "${args.target_id}", deliver: true });
-}
-
-sendNotification().catch(console.error);
+post({ message: userMessage, channel: "feishu", to: "${args.target_id}", deliver: true }).catch(console.error);
 `;
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn } = await import('child_process');
-  const nodeBin = process.execPath; // full path to node, avoids PATH issues in detached shell
+  const nodeBin = process.execPath;
 
-  // Two independent detached processes — notify always fires regardless of restart outcome.
-  const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
-    detached: true, stdio: 'ignore'
-  });
+  const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], { detached: true, stdio: 'ignore' });
   restartChild.unref();
 
-  const notifyChild = spawn('sh', ['-c', `sleep 15 && ${nodeBin} ${notifyScriptPath}`], {
-    detached: true, stdio: 'ignore'
-  });
+  const notifyChild = spawn('sh', ['-c', `sleep 15 && ${nodeBin} ${notifyScriptPath}`], { detached: true, stdio: 'ignore' });
   notifyChild.unref();
 
   const emailInstruction = userEmail
@@ -1088,35 +887,19 @@ sendNotification().catch(console.error);
 - Description: "网关将在 3 秒后自动重启。\\n${emailInstruction}"${emailCodeBlock}
 
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text, markdown, or explanation.`;
-}, {
-  name: "install_system_hooks",
-  description: "修改 openclaw.json 并在后台延迟 3 秒重启网关，重启完成后自动向指定会话发送通知。必须在用户输入文字授权后才能调用。",
-  schema: z.object({
-    target_id: z.string().describe("飞书会话 ID（群聊 open_id 或用户 open_id），网关重启完成后用于发送通知消息。")
-  })
-});
+}
 
-// ------------------------------------------------------------------
-// UNINSTALL TOOL — Clean removal with async delayed restart
-// ------------------------------------------------------------------
-
-export const uninstall_system_hooks = tool(async () => {
+async function handle_uninstall_system_hooks(args) {
   const results = [];
 
-  // Step 1: Remove webhook transform file
   const hooksTarget = path.join(os.homedir(), '.openclaw', 'hooks', 'transforms', 'my_payment_webhook.js');
   try {
     await fs.unlink(hooksTarget);
     results.push("Webhook transform: removed ✓");
   } catch (err) {
-    if (err.code === 'ENOENT') {
-      results.push("Webhook transform: already absent ✓");
-    } else {
-      results.push(`Webhook transform: FAILED to remove — ${err.message}`);
-    }
+    results.push(err.code === 'ENOENT' ? "Webhook transform: already absent ✓" : `Webhook transform: FAILED to remove — ${err.message}`);
   }
 
-  // Step 2: Remove hook mapping from openclaw.json
   try {
     const config = await loadConfig();
     if (config.hooks?.mappings) {
@@ -1137,7 +920,6 @@ export const uninstall_system_hooks = tool(async () => {
     results.push(`Route mapping: FAILED to clean config — ${err.message}`);
   }
 
-  // Step 3: Remove skill env config from openclaw.json
   try {
     const config = await loadConfig();
     if (config.skills?.entries?.["agent-payment-skills"]) {
@@ -1151,26 +933,17 @@ export const uninstall_system_hooks = tool(async () => {
     results.push(`Skill config: FAILED to clean — ${err.message}`);
   }
 
-  // Step 4: Remove skill cache file and stale notify scripts
   try {
     await fs.unlink(CACHE_PATH);
     results.push("Skill cache: removed ✓");
   } catch (err) {
-    if (err.code === 'ENOENT') {
-      results.push("Skill cache: already absent ✓");
-    } else {
-      results.push(`Skill cache: FAILED to remove — ${err.message}`);
-    }
+    results.push(err.code === 'ENOENT' ? "Skill cache: already absent ✓" : `Skill cache: FAILED to remove — ${err.message}`);
   }
 
-  // Remove stale cached notify scripts so next install always generates fresh versions
   for (const script of ['clink_notify.js', 'clink_uninstall_notify.js']) {
-    try {
-      await fs.unlink(path.join(os.homedir(), '.openclaw', 'cache', script));
-    } catch {}
+    try { await fs.unlink(path.join(os.homedir(), '.openclaw', 'cache', script)); } catch {}
   }
 
-  // Step 5: Remove skill directory
   const skillDir = path.dirname(new URL(import.meta.url).pathname);
   try {
     await fs.rm(skillDir, { recursive: true, force: true });
@@ -1179,7 +952,6 @@ export const uninstall_system_hooks = tool(async () => {
     results.push(`Skill directory: FAILED to remove — ${err.message}`);
   }
 
-  // Step 5: Async delayed restart — detached process, survives gateway self-restart
   const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_uninstall_notify.js');
   const notifyJsCode = `
 const fs = require('fs');
@@ -1187,7 +959,6 @@ const http = require('http');
 const path = require('path');
 const os = require('os');
 
-// 动态读取 OpenClaw 全局配置
 const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
 let gatewayPort = 14924;
 let webhookToken = '';
@@ -1195,9 +966,7 @@ try {
   const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
   gatewayPort = config.gateway?.port || 14924;
   webhookToken = config.hooks?.token || '';
-} catch (err) {
-  console.error('Failed to read openclaw.json:', err.message);
-}
+} catch (err) { console.error('Failed to read openclaw.json:', err.message); }
 
 const payload = JSON.stringify({
   message: "🗑️ **卸载已生效**\\n网关已重启完毕，Clink Payment 支付组件及全部配置已彻底清除。若需再次使用，请重新下发安装指令。",
@@ -1206,39 +975,22 @@ const payload = JSON.stringify({
   deliver: true
 });
 
-const headers = {
-  'Content-Type': 'application/json',
-  'Content-Length': Buffer.byteLength(payload)
-};
-if (webhookToken) {
-  headers['Authorization'] = 'Bearer ' + webhookToken;
-}
+const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
+if (webhookToken) headers['Authorization'] = 'Bearer ' + webhookToken;
 
-const req = http.request({
-  hostname: 'localhost',
-  port: gatewayPort,
-  path: '/hooks/agent',
-  method: 'POST',
-  headers
-});
+const req = http.request({ hostname: 'localhost', port: gatewayPort, path: '/hooks/agent', method: 'POST', headers });
 req.on('error', () => {});
 req.write(payload);
 req.end();
 `;
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
-  const { spawn: spawnUninstall } = await import('child_process');
-  const nodeBinUninstall = process.execPath;
+  const { spawn } = await import('child_process');
+  const nodeBin = process.execPath;
 
-  // Two independent detached processes — notify always fires regardless of restart outcome.
-  const restartChild = spawnUninstall('sh', ['-c', 'sleep 3 && openclaw gateway restart'], {
-    detached: true, stdio: 'ignore'
-  });
+  const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], { detached: true, stdio: 'ignore' });
   restartChild.unref();
-
-  const notifyChild = spawnUninstall('sh', ['-c', `sleep 15 && ${nodeBinUninstall} ${notifyScriptPath}`], {
-    detached: true, stdio: 'ignore'
-  });
+  const notifyChild = spawn('sh', ['-c', `sleep 15 && ${nodeBin} ${notifyScriptPath}`], { detached: true, stdio: 'ignore' });
   notifyChild.unref();
   results.push("Gateway: scheduled restart in 3 seconds ✓");
 
@@ -1253,40 +1005,143 @@ ${results.map(r => `  - ${r}`).join("\n")}
 - No action buttons needed.
 
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text, markdown, or explanation.`;
-}, {
-  name: "uninstall_system_hooks",
-  description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
-  schema: z.object({
-    target_id: z.string().describe("飞书会话 ID（群聊 open_id 或用户 open_id），网关重启完成后用于发送卸载完成通知。")
-  })
-});
+}
 
-export const get_wallet_status = tool(async () => {
-  const env = await getPaymentEnv();
-  if (!env.CLINK_CUSTOMER_ID) {
-    return "Wallet not initialized.";
+// ------------------------------------------------------------------
+// MCP SERVER
+// ------------------------------------------------------------------
+const server = new Server(
+  { name: "agent-payment-skills", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: "initialize_wallet",
+      description: "Run once per user. Generates signature key, calls Clink bootstrap API, and sets up webhook.",
+      inputSchema: { type: "object", properties: { email: { type: "string" }, name: { type: "string" } }, required: ["email"] }
+    },
+    {
+      name: "get_wallet_status",
+      description: "Check the local configuration status of the wallet (e.g., if it is initialized).",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "get_binding_link",
+      description: "Generates a URL for the user to bind a new payment method and returns currently bound methods.",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "get_risk_rules_link",
+      description: "Generates a URL for the user to configure recharge risk rules (per-charge limit, daily limit, frequency, etc.).",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "get_payment_method_setup_link",
+      description: "Generates a URL for the user to add a new payment method (credit card, PayPal, etc.).",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "get_payment_method_modify_link",
+      description: "Generates a URL for the user to manage, switch, or modify existing payment methods.",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "list_payment_methods",
+      description: "List all payment methods bound to the user's wallet. Requires a valid binding token.",
+      inputSchema: { type: "object", properties: { bindingToken: { type: "string", description: "JWT token from the binding link flow" } }, required: ["bindingToken"] }
+    },
+    {
+      name: "get_payment_method_detail",
+      description: "Get detailed information about a specific payment method.",
+      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
+    },
+    {
+      name: "update_payment_method",
+      description: "Update the billing address of a specific payment method.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          bindingToken: { type: "string" },
+          paymentInstrumentId: { type: "string" },
+          billingAddressJson: { type: "object", properties: { country: { type: "string" }, city: { type: "string" }, line1: { type: "string" }, line2: { type: "string" }, postalCode: { type: "string" }, region: { type: "string" } } }
+        },
+        required: ["bindingToken", "paymentInstrumentId", "billingAddressJson"]
+      }
+    },
+    {
+      name: "delete_payment_method",
+      description: "Delete a specific payment method from the wallet.",
+      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
+    },
+    {
+      name: "set_default_payment_method",
+      description: "Set a specific payment method as the default for future transactions.",
+      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
+    },
+    {
+      name: "pre_check_account",
+      description: "Run before clink_pay to verify account readiness (wallet initialized, payment method bound). Displays a check status card.",
+      inputSchema: { type: "object", properties: {} }
+    },
+    {
+      name: "clink_pay",
+      description: "Execute a payment via Clink. Direct mode: merchant_id + amount + currency. Session mode: sessionId from merchant. merchant_id MUST be fetched fresh each time via the merchant's tool, never reused from memory.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          merchant_id: { type: "string", description: "Merchant ID — fetch fresh via merchant tool each time, never from memory" },
+          amount: { type: "number", description: "Recharge amount" },
+          currency: { type: "string", description: "Currency code, e.g. USD (default)" },
+          sessionId: { type: "string", description: "Charge session ID from merchant (session mode)" },
+          paymentInstrumentId: { type: "string" },
+          paymentMethodType: { type: "string" }
+        },
+        required: ["amount"]
+      }
+    },
+    {
+      name: "install_system_hooks",
+      description: "修改 openclaw.json 并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
+      inputSchema: { type: "object", properties: { target_id: { type: "string", description: "飞书会话 ID，网关重启后用于发送通知" } }, required: ["target_id"] }
+    },
+    {
+      name: "uninstall_system_hooks",
+      description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
+      inputSchema: { type: "object", properties: { target_id: { type: "string", description: "飞书会话 ID，卸载完成后用于发送通知" } }, required: ["target_id"] }
+    }
+  ]
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const { name, arguments: args = {} } = request.params;
+  try {
+    let result;
+    switch (name) {
+      case "initialize_wallet":             result = await handle_initialize_wallet(args); break;
+      case "get_wallet_status":             result = await handle_get_wallet_status(); break;
+      case "get_binding_link":              result = await handle_get_binding_link(); break;
+      case "get_risk_rules_link":           result = await handle_get_risk_rules_link(); break;
+      case "get_payment_method_setup_link": result = await handle_get_payment_method_setup_link(); break;
+      case "get_payment_method_modify_link":result = await handle_get_payment_method_modify_link(); break;
+      case "list_payment_methods":          result = await handle_list_payment_methods(args); break;
+      case "get_payment_method_detail":     result = await handle_get_payment_method_detail(args); break;
+      case "update_payment_method":         result = await handle_update_payment_method(args); break;
+      case "delete_payment_method":         result = await handle_delete_payment_method(args); break;
+      case "set_default_payment_method":    result = await handle_set_default_payment_method(args); break;
+      case "pre_check_account":             result = await handle_pre_check_account(); break;
+      case "clink_pay":                     result = await handle_clink_pay(args); break;
+      case "install_system_hooks":          result = await handle_install_system_hooks(args); break;
+      case "uninstall_system_hooks":        result = await handle_uninstall_system_hooks(args); break;
+      default: throw new Error(`Unknown tool: ${name}`);
+    }
+    return { content: [{ type: "text", text: result }] };
+  } catch (error) {
+    return { content: [{ type: "text", text: `Error executing ${name}: ${error.message}` }] };
   }
-  return `Wallet Status:\nCustomer ID: ${env.CLINK_CUSTOMER_ID}\nEmail: ${env.CLINK_USER_EMAIL}\nHas API Key: ${!!env.CLINK_CUSTOMER_API_KEY}`;
-}, {
-  name: "get_wallet_status",
-  description: "Check the local configuration status of the wallet (e.g., if it is initialized).",
-  schema: z.object({})
 });
 
-export const agent_payment_skills = [
-  initialize_wallet,
-  get_wallet_status,
-  pre_check_account,
-  get_binding_link,
-  get_risk_rules_link,
-  get_payment_method_setup_link,
-  get_payment_method_modify_link,
-  list_payment_methods,
-  get_payment_method_detail,
-  update_payment_method,
-  delete_payment_method,
-  set_default_payment_method,
-  clink_pay,
-  install_system_hooks,
-  uninstall_system_hooks
-];
+const transport = new StdioServerTransport();
+await server.connect(transport);
+console.error("Agent Payment Skills MCP Server running on stdio");

@@ -169,7 +169,8 @@ When the user asks to install this skill, the agent MUST follow this strict work
 
 3. **Execute High-Risk Operations**:
    ONLY AFTER receiving the text approval, call the `install_system_hooks` tool (or execute manually). The sequence MUST be:
-   - Run `npm install` inside the skill directory (`~/.openclaw/workspace/skills/agent-payment-skills`) to install required dependencies like zod and langchain.
+   - Run `npm install` inside the skill directory (`~/.openclaw/workspace/skills/agent-payment-skills`) to install required dependencies (`@modelcontextprotocol/sdk`).
+   - Register the MCP server: `mcp add agent-payment-skills "node ~/.openclaw/workspace/skills/agent-payment-skills/index.mjs"`
    - Copy `hooks/my_payment_webhook.js` into `~/.openclaw/hooks/transforms/`.
    - Inject `{"match": {"path": "hooks/clink/payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
    - Call `install_system_hooks` with `target_id` set to the current chat's open_id (group chat ID or user ID). The tool will schedule a three-stage background script: sleep 3s → restart gateway → sleep 10s → send notification to `target_id` once the gateway is back up.
