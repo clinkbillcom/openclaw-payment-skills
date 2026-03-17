@@ -867,6 +867,7 @@ try {
   console.error('Failed to send post-restart card:', err.message);
 }
 `;
+  await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn } = await import('child_process');
@@ -993,6 +994,7 @@ req.on('error', () => {});
 req.write(payload);
 req.end();
 `;
+  await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
 
   const { spawn } = await import('child_process');
