@@ -13,6 +13,7 @@
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
 
 const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
@@ -72,6 +73,43 @@ function cardExec(cardObj) {
   return `exec: node ${CARD_SENDER} --json '${json}' ${target}`;
 }
 
+function formatExecError(error) {
+  if (!(error instanceof Error)) return String(error);
+  const details = [];
+  if (typeof error.message === 'string' && error.message) details.push(error.message);
+  if (typeof error.stdout === 'string' && error.stdout.trim()) details.push(`stdout: ${error.stdout.trim()}`);
+  if (typeof error.stderr === 'string' && error.stderr.trim()) details.push(`stderr: ${error.stderr.trim()}`);
+  return details.join('\n') || error.message;
+}
+
+function sendCardDirect(cardObj) {
+  if (!_notifyTarget) {
+    throw new Error('notify_target_id is missing; cannot send card directly');
+  }
+
+  execFileSync(
+    process.execPath,
+    [CARD_SENDER, '--json', JSON.stringify(cardObj), _notifyFlag, _notifyTarget],
+    {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 15000,
+    },
+  );
+}
+
+async function sendCardsDirect(context, cards) {
+  try {
+    for (const card of cards) {
+      sendCardDirect(card);
+    }
+    return true;
+  } catch (err) {
+    await logError(`${context} direct card send`, formatExecError(err));
+    return false;
+  }
+}
+
 module.exports = async function(ctx) {
   const { type, data } = ctx.payload || {};
 
@@ -104,15 +142,15 @@ module.exports = async function(ctx) {
         await writeCache(cache);
       } catch (err) { await logError('payment_method.added cache update', err); }
 
-      const exec1 = cardExec({
+      const successCard = {
         schema: "2.0",
         header: { title: { content: "✅ 支付方式绑定成功", tag: "plain_text" }, template: "green" },
         body: { elements: [
           { tag: "markdown", content: `**绑定支付方式**　<font color="green">${cardDisplay}</font>\n**邮箱**　　　　　${email}` }
         ]}
-      });
+      };
 
-      const exec2 = cardExec({
+      const completeCard = {
         schema: "2.0",
         header: { title: { content: "🎉 Clink 初始化完成！", tag: "plain_text" }, template: "green" },
         body: { elements: [
@@ -120,7 +158,15 @@ module.exports = async function(ctx) {
           { tag: "hr" },
           { tag: "markdown", content: "你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。如需修改支付方式，请告知我。" }
         ]}
-      });
+      };
+
+      const sent = await sendCardsDirect('payment_method.added', [successCard, completeCard]);
+      if (sent) {
+        return null;
+      }
+
+      const exec1 = cardExec(successCard);
+      const exec2 = cardExec(completeCard);
 
       return {
         kind: "agent",
@@ -148,7 +194,7 @@ After sending both cards, reply NO_REPLY and nothing else.`
     }
 
     // ─── Default payment method changed ───
-    case "payment_method.defaultChange": {
+    case "payment_method.default_change": {
       const cardDisplay = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
 
       // Update cache
@@ -165,6 +211,21 @@ After sending both cards, reply NO_REPLY and nothing else.`
         await writeCache(cache);
       } catch (err) { await logError('payment_method.defaultChange cache update', err); }
 
+      const updateCard = {
+        schema: "2.0",
+        header: { title: { content: "✅ 默认支付方式已更新", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**当前默认卡**　<font color="green">${cardDisplay}</font>\n**支付方式 ID**　${data.payment_method_id || "N/A"}` },
+          { tag: "hr" },
+          { tag: "markdown", content: "后续付款将优先使用这张卡。如需继续之前失败的支付，请直接告诉我重新发起。" }
+        ]}
+      };
+
+      const sent = await sendCardsDirect('payment_method.defaultChange', [updateCard]);
+      if (sent) {
+        return null;
+      }
+
       return {
         kind: "agent",
         name: "Clink",
@@ -175,31 +236,16 @@ After sending both cards, reply NO_REPLY and nothing else.`
 新默认卡: ${cardDisplay}
 支付方式 ID: ${data.payment_method_id || "N/A"}
 
-[SYSTEM DIRECTIVE] The user's default payment method has changed. Update any displayed card info accordingly.`
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(updateCard)}
+
+After sending the card, reply NO_REPLY and nothing else.`
       };
     }
 
     // ─── Order created (intermediate state) ───
     case "agent_order.created": {
-      const amt = formatAmount(data);
-      const orderId = data.order_id || data.orderId || "N/A";
-      const customerId = data.customer_id || data.customerId || "N/A";
-      const sessionId = data.session_id || data.sessionId || "无";
-      return {
-        kind: "agent",
-        name: "Clink",
-        message: `[Clink Webhook] 充值订单已创建。
-
-事件: order.created
-订单 ID: ${orderId}
-金额: ${amt}
-状态: ${data.status || "pending"}
-客户 ID: ${customerId}
-Session ID: ${sessionId}
-
-[SYSTEM DIRECTIVE] A charge order has been created and is processing.
-DO NOT send a final success/failure card yet. Wait for order.succeeded or order.failed webhook.`
-      };
+      return null;
     }
 
     // ─── Payment succeeded ───
@@ -210,7 +256,7 @@ DO NOT send a final success/failure card yet. Wait for order.succeeded or order.
       const customerId = data.customer_id || data.customerId || "N/A";
       const sessionId = data.session_id || data.sessionId || "无";
 
-      const exec1 = cardExec({
+      const pendingCard = {
         schema: "2.0",
         header: { title: { content: "✅ 支付成功", tag: "plain_text" }, template: "green" },
         body: { elements: [
@@ -218,7 +264,12 @@ DO NOT send a final success/failure card yet. Wait for order.succeeded or order.
           { tag: "hr" },
           { tag: "markdown", content: "已完成扣款，正在等待商户确认到账…" }
         ]}
-      });
+      };
+
+      const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
+      const step1 = sent
+        ? `Step 1: The webhook already sent the "✅ 支付成功" Feishu card directly to the user. Do NOT send it again.`
+        : `Step 1: Direct webhook card delivery failed. Send this Feishu Interactive Card to the user:\n${cardExec(pendingCard)}`;
 
       return {
         kind: "agent",
@@ -235,8 +286,7 @@ Session ID: ${sessionId}
 [SYSTEM DIRECTIVE] Payment (card charge) succeeded, but merchant recharge is NOT yet confirmed.
 YOU MUST do the following in order:
 
-Step 1: Send a Feishu Interactive Card to the user:
-${exec1}
+${step1}
 
 Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
 If calling via shell (do NOT omit --args):
@@ -262,7 +312,7 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
       const failureReason = data.failure_message || failureCode || "支付处理异常";
       const isCharged = status === "charged" || status === "paid";
 
-      const failExec = cardExec({
+      const failCard = {
         schema: "2.0",
         header: { title: { content: "❌ 充值失败：建议联系商户支持", tag: "plain_text" }, template: "red" },
         body: { elements: [
@@ -273,7 +323,12 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
               : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。" },
           { tag: "button", text: { content: "联系支持", tag: "plain_text" }, type: "primary", url: "https://www.modelmax.io" }
         ]}
-      });
+      };
+
+      const sent = await sendCardsDirect('agent_order.failed', [failCard]);
+      if (sent) {
+        return null;
+      }
 
       return {
         kind: "agent",
@@ -288,8 +343,8 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Payment or recharge failed. YOU MUST immediately send a Feishu Interactive Card:
-${failExec}
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(failCard)}
 
 After sending the card, reply NO_REPLY and nothing else.`
       };
@@ -303,7 +358,7 @@ After sending the card, reply NO_REPLY and nothing else.`
         await writeCache(cache);
       } catch (err) { await logError('risk_rule.updated cache update', err); }
 
-      const riskExec = cardExec({
+      const riskCard = {
         schema: "2.0",
         header: { title: { content: "🛡️ 风控规则已生效", tag: "plain_text" }, template: "green" },
         body: { elements: [
@@ -311,7 +366,12 @@ After sending the card, reply NO_REPLY and nothing else.`
           { tag: "hr" },
           { tag: "markdown", content: "风控规则已同步生效，后续充值将按此规则执行。" }
         ]}
-      });
+      };
+
+      const sent = await sendCardsDirect('risk_rule.updated', [riskCard]);
+      if (sent) {
+        return null;
+      }
 
       return {
         kind: "agent",
@@ -327,8 +387,8 @@ After sending the card, reply NO_REPLY and nothing else.`
 更新时间: ${data.updatedAt ?? "N/A"}
 
 [SYSTEM DIRECTIVE] Risk rules have been updated and saved to local cache.
-YOU MUST immediately send a Feishu Interactive Card:
-${riskExec}
+Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(riskCard)}
 
 After sending the card, reply NO_REPLY and nothing else.`
       };
@@ -336,11 +396,8 @@ After sending the card, reply NO_REPLY and nothing else.`
 
     // ─── Unknown event type ───
     default: {
-      return {
-        kind: "agent",
-        name: "Clink",
-        message: `[Clink Webhook] 收到未知事件类型: ${type}\n\nPayload: ${JSON.stringify(data).slice(0, 500)}\n\n[SYSTEM DIRECTIVE] Unknown Clink webhook event. Log this for debugging but do not send a card to the user.`
-      };
+      await logError('unknown webhook event', `[${type}] ${JSON.stringify(data).slice(0, 1000)}`);
+      return null;
     }
   }
 }
