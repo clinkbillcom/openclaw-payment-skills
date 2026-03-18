@@ -214,12 +214,12 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
     case "agent_order.failed": {
       const amt = formatAmount(data);
       const card = formatCard(data);
-      const orderId = data.order_id || data.orderId || "N/A";
-      const customerId = data.customer_id || data.customerId || "N/A";
-      const sessionId = data.session_id || data.sessionId || "无";
+      const orderId = data.order_id || "N/A";
+      const customerId = data.customer_id || "N/A";
       const status = data.status || "failed";
-      const failureReason = data.failure_reason || data.failureReason || data.decline_reason || data.declineReason || "支付处理异常";
-      const isCharged = status === "charged" || status === "paid" || data.charge_status === "succeeded" || data.chargeStatus === "succeeded";
+      const failureCode = data.failure_code || "";
+      const failureReason = data.failure_message || failureCode || "支付处理异常";
+      const isCharged = status === "charged" || status === "paid";
 
       return {
         kind: "agent",
@@ -229,11 +229,10 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
 事件: order.failed
 订单 ID: ${orderId}
 金额: ${amt}
-支付方式: ${card}
 状态: ${status}
+失败代码: ${failureCode || "N/A"}
 失败原因: ${failureReason}
 客户 ID: ${customerId}
-Session ID: ${sessionId}
 
 [SYSTEM DIRECTIVE] Payment or recharge failed.
 YOU MUST immediately send a Feishu Interactive Card to the user:
