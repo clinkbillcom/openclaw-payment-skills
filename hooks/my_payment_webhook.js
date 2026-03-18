@@ -19,6 +19,18 @@ const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
 const CARD_SENDER = `${SKILL_DIR}/scripts/send-feishu-card.mjs`;
 
+// Read notify target from cache (stored at install time by install.mjs).
+// Falls back to {current_feishu_chat_id} placeholder if not found.
+let _notifyTarget = null;
+let _notifyFlag = '--chat-id';
+try {
+  const cache = JSON.parse(require('fs').readFileSync(CACHE_PATH, 'utf8'));
+  if (cache.notify_target_id) {
+    _notifyTarget = cache.notify_target_id;
+    _notifyFlag = cache.notify_target_type === 'open_id' ? '--open-id' : '--chat-id';
+  }
+} catch {}
+
 async function logError(context, error) {
   const line = `[${new Date().toISOString()}] [${context}] ${error instanceof Error ? error.stack || error.message : String(error)}\n`;
   try {
@@ -47,12 +59,17 @@ async function writeCache(cache) {
 }
 
 // Build an exec directive that sends a v2 Feishu card via send-feishu-card.mjs.
+// Uses the stored notify_target_id (resolved at install time) so the exec command
+// contains the actual chat/open ID — no unresolvable {placeholder} at runtime.
 // Note: JSON.stringify produces double-quoted strings, so no single-quote collision
 // with the outer shell wrapping. HTML attributes must use double quotes (color="green")
 // not single quotes to avoid breaking the shell command.
 function cardExec(cardObj) {
   const json = JSON.stringify(cardObj);
-  return `exec: node ${CARD_SENDER} --json '${json}' --chat-id {current_feishu_chat_id}`;
+  const target = _notifyTarget
+    ? `${_notifyFlag} ${_notifyTarget}`
+    : `--chat-id {current_feishu_chat_id}`;
+  return `exec: node ${CARD_SENDER} --json '${json}' ${target}`;
 }
 
 module.exports = async function(ctx) {

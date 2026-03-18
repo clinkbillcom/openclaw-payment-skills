@@ -80,6 +80,19 @@ try {
   }
 }
 
+// --- Store target_id in clink.config.json so webhook can resolve chat_id at runtime ---
+const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
+try {
+  let cache = {};
+  try { cache = JSON.parse(await fs.readFile(CACHE_PATH, 'utf8')); } catch {}
+  cache.notify_target_id = targetId;
+  cache.notify_target_type = openId ? 'open_id' : 'chat_id';
+  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+  console.log(`  ✅ Saved notify target: ${targetId}`);
+} catch (e) {
+  console.warn('  ⚠️  Could not save target_id to cache:', e.message);
+}
+
 // --- Step 2: Copy webhook file ---
 console.log('Step 2: Installing webhook transform...');
 const webhookSrc = path.join(SKILL_DIR, 'hooks', 'my_payment_webhook.js');
