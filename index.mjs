@@ -828,8 +828,7 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
   - 错误码: "${code || 'N/A'}"
   - 状态: "失败" (Red)
 - Description: "充值过程中出现异常，请联系支持获取帮助。"
-- Button 1 (red): "联系支持"
-- Button 2 (ghost): "查看充值记录"
+- Button 1 (primary): "联系支持" (url: https://www.modelmax.io)
 
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   }
