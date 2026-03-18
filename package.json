@@ -2,8 +2,15 @@
   "name": "agent-payment-skills",
   "version": "1.0.0",
   "description": "Agent payment skills backed by Clink",
-  "main": "index.mjs",
+  "main": "index.bundle.mjs",
   "type": "module",
+  "scripts": {
+    "build": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=index.bundle.mjs --external:crypto --external:fs --external:path --external:os --external:https --external:fs/promises --external:stream --external:util --external:events --external:buffer --external:net --external:tls --external:http --external:http2 --minify",
+    "build:dev": "esbuild index.mjs --bundle --platform=node --format=esm --outfile=index.bundle.mjs --external:crypto --external:fs --external:path --external:os --external:https --external:fs/promises --external:stream --external:util --external:events --external:buffer --external:net --external:tls --external:http --external:http2"
+  },
+  "devDependencies": {
+    "esbuild": "latest"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.9.0"
   }
