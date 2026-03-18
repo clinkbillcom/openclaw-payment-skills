@@ -99,11 +99,12 @@ CLI 环境（Claude Code、Cursor 等）同样支持上述命令。
 ```
 pre_check_account（账户预检）
 → clink_pay（发起支付）
+→ 商户确认到账轮询（同一轮立即开始）
   ├─ 3DS 触发 → 用户完成验证 → webhook 确认
   ├─ 卡被拒 → 引导换卡 → 自动重试
   ├─ 风控触发 → 用户选择（继续/改规则/暂停）
   └─ 邮箱不匹配 → 安全拦截，不重试
-→ agent_order.succeeded webhook → 商户确认到账
+→ agent_order.succeeded webhook（兜底唤起）
 → ✅ 充值成功
 ```
 
@@ -115,8 +116,8 @@ pre_check_account（账户预检）
 商户 Skill 返回 402（含 session_id）
 → agent-payment-skills.pre_check_account
 → agent-payment-skills.clink_pay（Session 模式）
-→ order.succeeded webhook
-→ 商户 Skill 确认到账
+→ 商户 Skill 立即确认到账轮询
+→ order.succeeded webhook（兜底）
 → 自动重试原任务
 ```
 

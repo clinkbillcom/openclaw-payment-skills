@@ -141,7 +141,8 @@ When a user asks to top up / recharge any of the following merchants, you MUST a
 3. Call `clink_pay` with the merchant_id and amount:
    - If the user explicitly specified an amount, use that amount.
    - **If triggered automatically (402 / low-balance): use the `default_amount` and `currency` returned by the merchant's `get_payment_config` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
-4. After `agent_order.succeeded` webhook is received AND merchant recharge is confirmed (via `check_recharge_status`): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
+4. After `clink_pay` succeeds, immediately start the merchant-side recharge confirmation step in the same flow. Do NOT wait for webhook before starting the merchant status poll.
+5. After merchant recharge is confirmed (via `check_recharge_status` or the equivalent merchant-side checker): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
 
 ## Instructions & Workflows
 
@@ -189,14 +190,14 @@ When the user requests a recharge or another skill triggers an auto top-up:
      - 充值金额: the requested amount + currency (e.g. "$10.00 USD")
      - 商户: merchant name
      - 订单状态: "处理中…"
-   - Description: "已提交至支付网关，正在等待银行确认。结果将通过通知自动推送。"
+   - Description: "已提交至支付网关，正在等待银行确认。系统会继续自动确认到账。"
    - No action buttons needed.
-   - After sending this card, reply `NO_REPLY` and wait for the webhook.
-4. **Wait for Result:** The payment result comes asynchronously via webhook:
-   - `order.succeeded` → Send "✅ 支付成功" card, then use the merchant's skill/API to confirm recharge is credited.
+4. **Immediately continue merchant confirmation:** After sending the "⏳ 充值处理中" card, immediately call the merchant-side recharge status checker that belongs to the current recharge flow. Do NOT wait for the webhook before starting this poll.
+5. **Async webhook is fallback:** The payment result may also arrive asynchronously via webhook:
+   - `order.succeeded` → If merchant confirmation is not already complete, continue/finish the merchant recharge confirmation flow.
    - `order.failed` → Send "❌ 充值失败" card with order reference for support.
    - `flag3DS=1` (synchronous) → Send "🔐 3DS 验证" card with link, wait for webhook.
-4. **Handle Failures:**
+6. **Handle Failures:**
    - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
    - Email mismatch → Show the security block card. Do NOT retry.
    - Risk rule triggered → Show options (override / modify rules / pause).

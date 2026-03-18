@@ -123,6 +123,25 @@ async function overwriteCachedBindingMethods(methods) {
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
+function buildMerchantRechargeStatusArgs(orderId, sessionId, cache) {
+  const payload = { order_id: orderId };
+  if (typeof sessionId === "string" && sessionId.trim()) {
+    payload.session_id = sessionId.trim();
+  }
+  const notifyTargetId =
+    typeof cache?.notifyTargetId === "string" && cache.notifyTargetId.trim()
+      ? cache.notifyTargetId.trim()
+      : null;
+  if (notifyTargetId) {
+    if (cache.notifyTargetType === "open_id") {
+      payload.open_id = notifyTargetId;
+    } else {
+      payload.chat_id = notifyTargetId;
+    }
+  }
+  return JSON.stringify(payload);
+}
+
 // ------------------------------------------------------------------
 // API HELPERS
 // ------------------------------------------------------------------
@@ -642,6 +661,8 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
     const orderId = data.paySuccessInfo?.orderId || data.orderId || "N/A";
     const merchantName = data.paySuccessInfo?.merchantName || args.merchant_id || "商户";
     const amtDisplay = `${data.paySuccessInfo?.currencySymbol || "$"}${data.paySuccessInfo?.amount || args.amount}`;
+    const cache = await readPaymentMethodsCache();
+    const rechargeStatusArgs = buildMerchantRechargeStatusArgs(orderId, args.sessionId, cache);
     const cardInfo = (() => {
       const pmd = data.channelPaymentResponse?.paymentMethodDetail?.card || {};
       const psi = data.paySuccessInfo || {};
@@ -660,8 +681,15 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "已提交至支付网关，正在等待银行确认。结果将通过通知自动推送。"
 - No action buttons needed.
 
-After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY.
-DO NOT output any other text. DO NOT send a success/failure card — wait for the async webhook.`;
+After sending the card, DO NOT stop. You MUST immediately continue the CURRENT merchant recharge flow by invoking that merchant's recharge-status checker with this exact JSON args payload:
+${rechargeStatusArgs}
+
+Rules:
+1. Do NOT ask the user any question.
+2. Do NOT wait for the async webhook before starting the merchant-side status poll.
+3. Reuse the SAME merchant skill / merchant API flow that initiated this recharge. Do NOT switch merchants.
+4. If the merchant-side recharge checker later sends cards directly and/or resumes the original task, end with exactly and ONLY the token NO_REPLY.
+5. The async webhook is only a fallback wake-up signal if merchant confirmation arrives after this turn has already ended.`;
   } catch (err) {
     await logError('clink_pay', err);
     const code = err instanceof ClinkApiError ? err.code : null;
