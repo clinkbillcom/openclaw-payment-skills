@@ -17,6 +17,7 @@ const path = require('path');
 const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
+const CARD_SENDER = `${SKILL_DIR}/scripts/send-feishu-card.mjs`;
 
 async function logError(context, error) {
   const line = `[${new Date().toISOString()}] [${context}] ${error instanceof Error ? error.stack || error.message : String(error)}\n`;
@@ -45,6 +46,15 @@ async function writeCache(cache) {
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
+// Build an exec directive that sends a v2 Feishu card via send-feishu-card.mjs.
+// Note: JSON.stringify produces double-quoted strings, so no single-quote collision
+// with the outer shell wrapping. HTML attributes must use double quotes (color="green")
+// not single quotes to avoid breaking the shell command.
+function cardExec(cardObj) {
+  const json = JSON.stringify(cardObj);
+  return `exec: node ${CARD_SENDER} --json '${json}' --chat-id {current_feishu_chat_id}`;
+}
+
 module.exports = async function(ctx) {
   const { type, data } = ctx.payload || {};
 
@@ -56,7 +66,7 @@ module.exports = async function(ctx) {
 
     // ─── Card binding completed ───
     case "payment_method.added": {
-      const card = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
+      const cardDisplay = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
       const email = data.customer_email || "N/A";
 
       // Update cache
@@ -73,10 +83,27 @@ module.exports = async function(ctx) {
           cache.default_payment_method_id = data.payment_method_id;
         }
         if (!cache.initialized) cache.initialized = true;
-        // Persist customer email from webhook if not already saved
         if (data.customer_email && !cache.email) cache.email = data.customer_email;
         await writeCache(cache);
       } catch (err) { await logError('payment_method.added cache update', err); }
+
+      const exec1 = cardExec({
+        schema: "2.0",
+        header: { title: { content: "✅ 支付方式绑定成功", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**绑定支付方式**　<font color="green">${cardDisplay}</font>\n**邮箱**　　　　　${email}` }
+        ]}
+      });
+
+      const exec2 = cardExec({
+        schema: "2.0",
+        header: { title: { content: "🎉 Clink 初始化完成！", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**绑定支付方式**　<font color="green">${cardDisplay} ✓</font>\n**规则状态**　　　<font color="green">已生效</font>` },
+          { tag: "hr" },
+          { tag: "markdown", content: "你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。如需修改支付方式，请告知我。" }
+        ]}
+      });
 
       return {
         kind: "agent",
@@ -87,33 +114,25 @@ module.exports = async function(ctx) {
 客户邮箱: ${email}
 客户 ID: ${data.customer_id || "N/A"}
 支付方式 ID: ${data.payment_method_id || "N/A"}
-卡片: ${card}
+卡片: ${cardDisplay}
 状态: ${data.status || "active"}
 
 [SYSTEM DIRECTIVE] The user has successfully bound a new payment method. Initialization is now complete.
 YOU MUST send TWO Feishu Interactive Cards in order:
 
 Card 1:
-- Template / Style: "✅ 支付方式绑定成功" (Green theme, header h-ok)
-- Key-Value Rows:
-  - 绑定支付方式: "${card}" (Green)
-  - 邮箱: "${email}"
+${exec1}
 
-Card 2 (initialization complete):
-- Template / Style: "🎉 Clink 初始化完成！" (Green theme, header h-ok)
-- Key-Value Rows:
-  - 绑定支付方式: "${card} ✓" (Green)
-  - 规则状态: "已生效" (Green)
-- Description: "你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。"
-- Buttons:
-  - Button 1 (primary/blue): "修改绑卡" — action: call get_payment_method_modify_link and send result as a card
-  - Button 2 (ghost): "查看风控规则" — action: call get_risk_rules_link and send result as a card`
+Card 2:
+${exec2}
+
+After sending both cards, reply NO_REPLY and nothing else.`
       };
     }
 
     // ─── Default payment method changed ───
     case "payment_method.defaultChange": {
-      const card = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
+      const cardDisplay = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
 
       // Update cache
       try {
@@ -136,7 +155,7 @@ Card 2 (initialization complete):
 
 事件: payment_method.defaultChange
 客户 ID: ${data.customer_id || "N/A"}
-新默认卡: ${card}
+新默认卡: ${cardDisplay}
 支付方式 ID: ${data.payment_method_id || "N/A"}
 
 [SYSTEM DIRECTIVE] The user's default payment method has changed. Update any displayed card info accordingly.`
@@ -174,6 +193,16 @@ DO NOT send a final success/failure card yet. Wait for order.succeeded or order.
       const customerId = data.customer_id || data.customerId || "N/A";
       const sessionId = data.session_id || data.sessionId || "无";
 
+      const exec1 = cardExec({
+        schema: "2.0",
+        header: { title: { content: "✅ 支付成功", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**支付金额**　${amt}\n**扣款方式**　${card}` },
+          { tag: "hr" },
+          { tag: "markdown", content: "已完成扣款，正在等待商户确认到账…" }
+        ]}
+      });
+
       return {
         kind: "agent",
         name: "Clink",
@@ -190,11 +219,7 @@ Session ID: ${sessionId}
 YOU MUST do the following in order:
 
 Step 1: Send a Feishu Interactive Card to the user:
-- Template / Style: "✅ 支付成功" (Green theme, header h-ok)
-- Key-Value Rows:
-  - 支付金额: "${amt}"
-  - 扣款方式: "${card}"
-- Description: "已完成扣款，正在等待商户确认到账…"
+${exec1}
 
 Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
 If calling via shell (do NOT omit --args):
@@ -213,13 +238,25 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
     // ─── Payment or recharge failed ───
     case "agent_order.failed": {
       const amt = formatAmount(data);
-      const card = formatCard(data);
       const orderId = data.order_id || "N/A";
       const customerId = data.customer_id || "N/A";
       const status = data.status || "failed";
       const failureCode = data.failure_code || "";
       const failureReason = data.failure_message || failureCode || "支付处理异常";
       const isCharged = status === "charged" || status === "paid";
+
+      const failExec = cardExec({
+        schema: "2.0",
+        header: { title: { content: "❌ 充值失败：建议联系商户支持", tag: "plain_text" }, template: "red" },
+        body: { elements: [
+          { tag: "markdown", content: `**支付状态**　<font color="${isCharged ? "green" : "red"}">${isCharged ? `已扣款 ${amt}` : "扣款失败"}</font>\n**充值状态**　<font color="red">失败</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单参考号**　${orderId}` },
+          { tag: "hr" },
+          { tag: "markdown", content: isCharged
+              ? "您的银行卡已成功扣款，但商户账户未收到充值。请携带以上订单号联系商户客服处理。"
+              : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。" },
+          { tag: "button", text: { content: "联系支持", tag: "plain_text" }, type: "primary", url: "https://www.modelmax.io" }
+        ]}
+      });
 
       return {
         kind: "agent",
@@ -234,17 +271,10 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Payment or recharge failed.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：建议联系商户支持" (Red theme, header h-danger)
-- Key-Value Rows:
-  - 支付状态: "${isCharged ? `已扣款 ${amt}` : '扣款失败'}" (${isCharged ? 'Green' : 'Red'})
-  - 充值状态: "失败" (Red)
-  - 失败原因: "${failureReason}" (Red)
-  - 订单参考号: "${orderId}"
-- Description: "${isCharged ? '您的银行卡已成功扣款，但商户账户未收到充值。请携带以上订单号联系商户客服处理。' : '银行卡扣款失败，请检查卡片状态或更换支付方式后重试。'}"
-- Button 1 (red, ${isCharged ? 'non-interactive label' : 'action: call get_payment_method_modify_link to open payment method switch page'}): "${isCharged ? '联系商户支持' : '更换支付方式'}"
-- Button 2 (ghost): "查看充值记录"`
+[SYSTEM DIRECTIVE] Payment or recharge failed. YOU MUST immediately send a Feishu Interactive Card:
+${failExec}
+
+After sending the card, reply NO_REPLY and nothing else.`
       };
     }
 
@@ -255,6 +285,16 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
         cache.risk_rules = data;
         await writeCache(cache);
       } catch (err) { await logError('risk_rule.updated cache update', err); }
+
+      const riskExec = cardExec({
+        schema: "2.0",
+        header: { title: { content: "🛡️ 风控规则已生效", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**单次上限**　${data.singleRechargeLimit ?? "N/A"}\n**每日总额**　${data.dailyTotalLimit ?? "N/A"}\n**每日次数**　${data.dailyMaxCount ?? "N/A"} 次\n**充值间隔**　${data.rechargeInterval ?? "N/A"}` },
+          { tag: "hr" },
+          { tag: "markdown", content: "风控规则已同步生效，后续充值将按此规则执行。" }
+        ]}
+      });
 
       return {
         kind: "agent",
@@ -270,15 +310,10 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 更新时间: ${data.updatedAt ?? "N/A"}
 
 [SYSTEM DIRECTIVE] Risk rules have been updated and saved to local cache.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🛡️ 风控规则已生效" (Green theme, header h-ok)
-- Key-Value Rows:
-  - 单次上限: "${data.singleRechargeLimit ?? 'N/A'}"
-  - 每日总额: "${data.dailyTotalLimit ?? 'N/A'}"
-  - 每日次数: "${data.dailyMaxCount ?? 'N/A'} 次"
-  - 充值间隔: "${data.rechargeInterval ?? 'N/A'}"
-- Description: "风控规则已同步生效，后续充值将按此规则执行。"
-- No action buttons needed.`
+YOU MUST immediately send a Feishu Interactive Card:
+${riskExec}
+
+After sending the card, reply NO_REPLY and nothing else.`
       };
     }
 
