@@ -2,11 +2,11 @@
   "schema": "2.0",
   "header": {
     "title": { "content": "🔌 安装 Clink Payment Skill", "tag": "plain_text" },
-    "template": "green"
+    "template": "blue"
   },
   "body": { "elements": [
-    { "tag": "markdown", "content": "**注册 Webhook 回调路由**　<font color=\"green\">已完成 ✓</font>\n**写入网关配置文件**　　　<font color=\"green\">已完成 ✓</font>\n**重启网关进程**　　　　　<font color=\"orange\">待执行</font>" },
+    { "tag": "markdown", "content": "**注册 Webhook 回调路由**　<font color=\"green\">已完成 ✓</font>\n**写入网关配置文件**　　　<font color=\"green\">已完成 ✓</font>\n**重启网关进程**　　　　　<font color=\"orange\">正在重启…</font>" },
     { "tag": "hr" },
-    { "tag": "markdown", "content": "配置已写入，请在输入框回复以下内容使配置生效：\n```\n重启openclaw gateway\n```" }
+    { "tag": "markdown", "content": "网关重启完成后将自动发送下一步提示。" }
   ]}
 }

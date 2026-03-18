@@ -213,21 +213,20 @@ When the user asks to install this skill, the agent MUST follow this strict work
    - **Feishu group chat:** `node {SKILL_DIR}/scripts/pre_install.mjs --chat-id {current_feishu_chat_id}`
    - **Feishu direct message:** `node {SKILL_DIR}/scripts/pre_install.mjs --open-id {current_feishu_open_id}`
 
-2. **Send Status Card**:
-   After pre_install.mjs exits successfully, send the auth card showing steps 1&2 done:
+2. **Spawn post-restart notify process**:
+   Must run before the gateway restart so it survives as an independent process:
+   - `node {SKILL_DIR}/scripts/spawn_notify.mjs`
+
+3. **Send status card**:
    - **Feishu channel:** `node {SKILL_DIR}/scripts/send-feishu-card.mjs {SKILL_DIR}/cards/auth_request.json --chat-id {current_feishu_chat_id}`
-   - **Non-Feishu channel:** Send plain text: "✅ 注册 Webhook 回调路由 已完成\n✅ 写入网关配置文件 已完成\n\n请回复 \"重启openclaw gateway\" 以重启网关使配置生效。"
+   - **Non-Feishu channel:** Send plain text: "✅ 注册 Webhook 回调路由 已完成\n✅ 写入网关配置文件 已完成\n🔄 网关正在重启…"
    - After sending the card, reply `NO_REPLY` and nothing else.
 
-3. **Wait for Restart Approval**:
-   Pause execution. **Wait for the user to explicitly reply with "重启openclaw gateway" or similar restart confirmation in the chat.**
-
-4. **Execute Gateway Restart**:
-   ONLY AFTER receiving the restart confirmation, run:
+4. **Restart the gateway**:
    ```
    openclaw gateway restart
    ```
-   Then reply with plain text: "网关正在重启，重启完成后请直接回复您的邮箱地址完成钱包初始化。"
+   The notify process will detect when the gateway is back up and send the post-restart initialization card automatically.
 
 ### 4. Uninstall (Text-Based Workflow)
 

@@ -110,6 +110,20 @@ if (!config.hooks.mappings.some(m => m.transform?.module === 'my_payment_webhook
   config.hooks.mappings.push({ match: { path: CLINK_PATH }, transform: { module: 'my_payment_webhook.js' } });
 }
 await saveConfig(config);
-console.log('  ✅ Config updated');
 
-console.log('\nPre-install complete. Send auth card, then await restart approval.');
+// Verify the write actually landed
+const verify = await loadConfig();
+const routeOk = verify.hooks?.mappings?.some(m => m.transform?.module === 'my_payment_webhook.js');
+const webhookFileOk = await fs.access(webhookDst).then(() => true).catch(() => false);
+if (!routeOk) {
+  console.error('  ❌ Verification failed: webhook route not found in openclaw.json after write');
+  process.exit(1);
+}
+if (!webhookFileOk) {
+  console.error('  ❌ Verification failed: webhook file not found at', webhookDst);
+  process.exit(1);
+}
+console.log('  ✅ Config updated and verified');
+console.log('  ✅ Webhook route:', CLINK_PATH, '→ my_payment_webhook.js');
+
+console.log('\nPre-install complete.');
