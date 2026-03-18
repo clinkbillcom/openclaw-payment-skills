@@ -318,6 +318,7 @@ YOU MUST do the following in order:
 ${step1}
 
 Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
+This step is mandatory even if the webhook already sent the "✅ 支付成功" card directly. Direct card delivery does NOT complete the flow.
 If calling via shell (do NOT omit --args):
 \`\`\`
 npx mcporter call modelmax-media check_recharge_status --args '${rechargeStatusArgs}'
