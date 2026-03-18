@@ -4,7 +4,7 @@
 //
 // Handles:
 //   1. payment_method.added        — user finished binding a card on Clink hosted page
-//   2. payment_method.defaultChange — user changed their default payment method
+//   2. payment_method.default_change — user changed their default payment method
 //   3. agent_order.created  — charge order created (intermediate)
 //   4. agent_order.succeeded — payment succeeded
 //   5. agent_order.failed   — payment or recharge failed
@@ -26,9 +26,9 @@ let _notifyTarget = null;
 let _notifyFlag = '--chat-id';
 try {
   const cache = JSON.parse(require('fs').readFileSync(CACHE_PATH, 'utf8'));
-  if (cache.notify_target_id) {
-    _notifyTarget = cache.notify_target_id;
-    _notifyFlag = cache.notify_target_type === 'open_id' ? '--open-id' : '--chat-id';
+  if (cache.notifyTargetId) {
+    _notifyTarget = cache.notifyTargetId;
+    _notifyFlag = cache.notifyTargetType === 'open_id' ? '--open-id' : '--chat-id';
   }
 } catch {}
 
@@ -42,20 +42,19 @@ async function logError(context, error) {
 async function readCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
-    const parsed = JSON.parse(content);
-    // Ensure payment_methods array always exists (initialize_wallet writes cache without it)
-    if (!Array.isArray(parsed.payment_methods)) parsed.payment_methods = [];
-    if (parsed.default_payment_method_id === undefined) parsed.default_payment_method_id = null;
-    return parsed;
+    const cache = JSON.parse(content);
+    if (!Array.isArray(cache.paymentMethods)) cache.paymentMethods = [];
+    if (cache.defaultPaymentMethodId === undefined) cache.defaultPaymentMethodId = null;
+    return cache;
   } catch (err) {
     await logError('readCache', err);
-    return { payment_methods: [], default_payment_method_id: null, cached_at: null };
+    return { paymentMethods: [], defaultPaymentMethodId: null, cachedAt: null };
   }
 }
 
 async function writeCache(cache) {
   await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-  cache.cached_at = new Date().toISOString();
+  cache.cachedAt = new Date().toISOString();
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
@@ -110,6 +109,31 @@ async function sendCardsDirect(context, cards) {
   }
 }
 
+function buildRechargeStatusArgs(orderId) {
+  const args = { order_id: orderId };
+  if (_notifyTarget) {
+    if (_notifyFlag === '--open-id') {
+      args.open_id = _notifyTarget;
+    } else {
+      args.chat_id = _notifyTarget;
+    }
+  }
+  return JSON.stringify(args);
+}
+
+function toCachedPaymentMethod(data) {
+  return {
+    paymentInstrumentId: data.paymentMethodId,
+    paymentInstrumentType: data.paymentMethodType,
+    cardScheme: data.cardBrand,
+    cardLastFour: data.cardLast4,
+    issuerBank: data.issuerBank || null,
+    isDefault: data.isDefault ?? false,
+    isDisabled: data.isDisabled ?? false,
+    status: data.status || ((data.isDisabled ?? false) ? 'disabled' : 'active'),
+  };
+}
+
 module.exports = async function(ctx) {
   const { type, data } = ctx.payload || {};
 
@@ -121,24 +145,25 @@ module.exports = async function(ctx) {
 
     // ─── Card binding completed ───
     case "payment_method.added": {
-      const cardDisplay = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
-      const email = data.customer_email || "N/A";
+      const cardDisplay = `${(data.cardBrand || "CARD").toUpperCase()} ••••${data.cardLast4 || "????"}`;
+      const email = data.customerEmail || "N/A";
+      const cachedMethod = toCachedPaymentMethod(data);
 
       // Update cache
       try {
         const cache = await readCache();
-        const existing = cache.payment_methods.findIndex(m => m.payment_method_id === data.payment_method_id);
+        const existing = cache.paymentMethods.findIndex(m => m.paymentInstrumentId === data.paymentMethodId);
         if (existing >= 0) {
-          cache.payment_methods[existing] = data;
+          cache.paymentMethods[existing] = cachedMethod;
         } else {
-          cache.payment_methods.push(data);
+          cache.paymentMethods.push(cachedMethod);
         }
-        if (data.is_default) {
-          cache.payment_methods.forEach(m => { m.is_default = m.payment_method_id === data.payment_method_id; });
-          cache.default_payment_method_id = data.payment_method_id;
+        if (data.isDefault) {
+          cache.paymentMethods.forEach(m => { m.isDefault = m.paymentInstrumentId === data.paymentMethodId; });
+          cache.defaultPaymentMethodId = data.paymentMethodId;
         }
         if (!cache.initialized) cache.initialized = true;
-        if (data.customer_email && !cache.email) cache.email = data.customer_email;
+        if (data.customerEmail && !cache.email) cache.email = data.customerEmail;
         await writeCache(cache);
       } catch (err) { await logError('payment_method.added cache update', err); }
 
@@ -175,8 +200,8 @@ module.exports = async function(ctx) {
 
 事件: payment_method.added
 客户邮箱: ${email}
-客户 ID: ${data.customer_id || "N/A"}
-支付方式 ID: ${data.payment_method_id || "N/A"}
+客户 ID: ${data.customerId || "N/A"}
+支付方式 ID: ${data.paymentMethodId || "N/A"}
 卡片: ${cardDisplay}
 状态: ${data.status || "active"}
 
@@ -195,33 +220,34 @@ After sending both cards, reply NO_REPLY and nothing else.`
 
     // ─── Default payment method changed ───
     case "payment_method.default_change": {
-      const cardDisplay = `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
+      const cardDisplay = `${(data.cardBrand || "CARD").toUpperCase()} ••••${data.cardLast4 || "????"}`;
+      const cachedMethod = toCachedPaymentMethod(data);
 
       // Update cache
       try {
         const cache = await readCache();
-        const existing = cache.payment_methods.findIndex(m => m.payment_method_id === data.payment_method_id);
+        const existing = cache.paymentMethods.findIndex(m => m.paymentInstrumentId === data.paymentMethodId);
         if (existing >= 0) {
-          cache.payment_methods[existing] = data;
+          cache.paymentMethods[existing] = cachedMethod;
         } else {
-          cache.payment_methods.push(data);
+          cache.paymentMethods.push(cachedMethod);
         }
-        cache.payment_methods.forEach(m => { m.is_default = m.payment_method_id === data.payment_method_id; });
-        cache.default_payment_method_id = data.payment_method_id;
+        cache.paymentMethods.forEach(m => { m.isDefault = m.paymentInstrumentId === data.paymentMethodId; });
+        cache.defaultPaymentMethodId = data.paymentMethodId;
         await writeCache(cache);
-      } catch (err) { await logError('payment_method.defaultChange cache update', err); }
+      } catch (err) { await logError('payment_method.default_change cache update', err); }
 
       const updateCard = {
         schema: "2.0",
         header: { title: { content: "✅ 默认支付方式已更新", tag: "plain_text" }, template: "green" },
         body: { elements: [
-          { tag: "markdown", content: `**当前默认卡**　<font color="green">${cardDisplay}</font>\n**支付方式 ID**　${data.payment_method_id || "N/A"}` },
+          { tag: "markdown", content: `**当前默认卡**　<font color="green">${cardDisplay}</font>\n**支付方式 ID**　${data.paymentMethodId || "N/A"}` },
           { tag: "hr" },
           { tag: "markdown", content: "后续付款将优先使用这张卡。如需继续之前失败的支付，请直接告诉我重新发起。" }
         ]}
       };
 
-      const sent = await sendCardsDirect('payment_method.defaultChange', [updateCard]);
+      const sent = await sendCardsDirect('payment_method.default_change', [updateCard]);
       if (sent) {
         return null;
       }
@@ -231,10 +257,10 @@ After sending both cards, reply NO_REPLY and nothing else.`
         name: "Clink",
         message: `[Clink Webhook] 默认支付方式已变更。
 
-事件: payment_method.defaultChange
-客户 ID: ${data.customer_id || "N/A"}
+事件: payment_method.default_change
+客户 ID: ${data.customerId || "N/A"}
 新默认卡: ${cardDisplay}
-支付方式 ID: ${data.payment_method_id || "N/A"}
+支付方式 ID: ${data.paymentMethodId || "N/A"}
 
 [SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
 ${cardExec(updateCard)}
@@ -251,10 +277,11 @@ After sending the card, reply NO_REPLY and nothing else.`
     // ─── Payment succeeded ───
     case "agent_order.succeeded": {
       const amt = formatAmount(data);
-      const card = formatCard(data);
-      const orderId = data.order_id || data.orderId || "N/A";
-      const customerId = data.customer_id || data.customerId || "N/A";
-      const sessionId = data.session_id || data.sessionId || "无";
+      const cache = await readCache();
+      const card = formatCard(data.paymentMethod.paymentInstrumentId, data, cache);
+      const orderId = data.orderId || "N/A";
+      const customerId = data.customerId || "N/A";
+      const sessionId = data.sessionId || "无";
 
       const pendingCard = {
         schema: "2.0",
@@ -270,6 +297,7 @@ After sending the card, reply NO_REPLY and nothing else.`
       const step1 = sent
         ? `Step 1: The webhook already sent the "✅ 支付成功" Feishu card directly to the user. Do NOT send it again.`
         : `Step 1: Direct webhook card delivery failed. Send this Feishu Interactive Card to the user:\n${cardExec(pendingCard)}`;
+      const rechargeStatusArgs = buildRechargeStatusArgs(orderId);
 
       return {
         kind: "agent",
@@ -291,7 +319,7 @@ ${step1}
 Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
 If calling via shell (do NOT omit --args):
 \`\`\`
-npx mcporter call modelmax-media check_recharge_status --args '{"order_id":"${orderId}"}'
+npx mcporter call modelmax-media check_recharge_status --args '${rechargeStatusArgs}'
 \`\`\`
 
 Step 3: Based on the merchant confirmation result:
@@ -305,11 +333,11 @@ DO NOT send a "充值成功" card until the merchant confirms the recharge is cr
     // ─── Payment or recharge failed ───
     case "agent_order.failed": {
       const amt = formatAmount(data);
-      const orderId = data.order_id || "N/A";
-      const customerId = data.customer_id || "N/A";
+      const orderId = data.orderId || "N/A";
+      const customerId = data.customerId || "N/A";
       const status = data.status || "failed";
-      const failureCode = data.failure_code || "";
-      const failureReason = data.failure_message || failureCode || "支付处理异常";
+      const failureCode = data.failureCode || "";
+      const failureReason = data.failureMessage || failureCode || "支付处理异常";
       const isCharged = status === "charged" || status === "paid";
 
       const failCard = {
@@ -354,7 +382,7 @@ After sending the card, reply NO_REPLY and nothing else.`
     case "risk_rule.updated": {
       try {
         const cache = await readCache();
-        cache.risk_rules = data;
+        cache.riskRules = data;
         await writeCache(cache);
       } catch (err) { await logError('risk_rule.updated cache update', err); }
 
@@ -405,27 +433,40 @@ After sending the card, reply NO_REPLY and nothing else.`
 // ─── Helpers ───
 
 function formatAmount(data) {
-  // Support both snake_case and camelCase field names
   const currency = data.currency || data.paymentCurrency || "";
   const symbol = currency === "USD" ? "$" : currency;
   const amount = data.amount ?? data.amountTotal ?? data.amountSubtotal ?? "N/A";
   return amount === "N/A" ? "N/A" : `${symbol}${amount}`;
 }
 
-function formatCard(data) {
-  // Top-level snake_case (payment_method.added style)
-  if (data.card_brand || data.card_last4) {
-    return `${(data.card_brand || "CARD").toUpperCase()} ••••${data.card_last4 || "????"}`;
+function formatCachedCard(method) {
+  const brand = method.cardScheme || "CARD";
+  const last4 = method.cardLastFour || "????";
+  return `${String(brand).toUpperCase()} ••••${last4}`;
+}
+
+function formatCard(paymentInstrumentId, data, cache) {
+  if (Array.isArray(cache?.paymentMethods)) {
+    const matchedMethod = cache.paymentMethods.find(
+      (method) => method.paymentInstrumentId === paymentInstrumentId,
+    );
+    if (matchedMethod) {
+      return formatCachedCard(matchedMethod);
+    }
   }
-  // Nested paymentMethod object (legacy)
+
+  if (data.cardBrand || data.cardLast4) {
+    return `${(data.cardBrand || "CARD").toUpperCase()} ••••${data.cardLast4 || "????"}`;
+  }
+
   if (data.paymentMethod) {
     const pm = data.paymentMethod;
-    if (pm.card_brand || pm.card_last4 || pm.cardBrand || pm.cardLastFour) {
-      const brand = pm.card_brand || pm.cardBrand || "CARD";
-      const last4 = pm.card_last4 || pm.cardLastFour || "????";
+    if (pm.cardBrand || pm.cardLastFour) {
+      const brand = pm.cardBrand || "CARD";
+      const last4 = pm.cardLastFour || "????";
       return `${brand.toUpperCase()} ••••${last4}`;
     }
-    return `${pm.paymentMethodType || "CARD"} ${pm.paymentInstrumentId || ""}`.trim();
+    return `${pm.paymentMethodType || "CARD"} ${paymentInstrumentId}`.trim();
   }
   return "N/A";
 }

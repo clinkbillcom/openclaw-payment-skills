@@ -9,7 +9,7 @@
  *
  * What it does (all in one):
  *   1. Registers the MCP server via mcporter config add (or mcp add as fallback)
- *   2. Stores notify_target_id in clink.config.json
+ *   2. Stores notifyTargetId in clink.config.json
  *   3. Copies hooks/my_payment_webhook.js → ~/.openclaw/hooks/transforms/
  *   4. Injects webhook mapping into ~/.openclaw/openclaw.json and verifies
  *   5. Writes + spawns background notify process (polls for gateway, then sends post-restart card)
@@ -83,8 +83,8 @@ const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 try {
   let cache = {};
   try { cache = JSON.parse(await fs.readFile(CACHE_PATH, 'utf8')); } catch {}
-  cache.notify_target_id = targetId;
-  cache.notify_target_type = openId ? 'open_id' : 'chat_id';
+  cache.notifyTargetId = targetId;
+  cache.notifyTargetType = openId ? 'open_id' : 'chat_id';
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
   console.log(`  ✅ Saved notify target: ${targetId}`);
 } catch (e) {

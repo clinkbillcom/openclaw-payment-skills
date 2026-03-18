@@ -39,9 +39,9 @@ async function getPaymentEnv() {
   try {
     const cache = await readPaymentMethodsCache();
     if (cache?.email) env.CLINK_USER_EMAIL = cache.email;
-    if (cache?.customer_id) env.CLINK_CUSTOMER_ID = cache.customer_id;
-    if (cache?.customer_api_key) env.CLINK_CUSTOMER_API_KEY = cache.customer_api_key;
-    if (cache?.webhook_signkey) env.CLINK_WEBHOOK_SIGNKEY = cache.webhook_signkey;
+    if (cache?.customerId) env.CLINK_CUSTOMER_ID = cache.customerId;
+    if (cache?.customerAPIKey) env.CLINK_CUSTOMER_API_KEY = cache.customerAPIKey;
+    if (cache?.webhookSignKey) env.CLINK_WEBHOOK_SIGNKEY = cache.webhookSignKey;
   } catch (err) { await logError('getPaymentEnv/readCache', err); }
   return env;
 }
@@ -84,7 +84,10 @@ async function logError(context, error) {
 async function readPaymentMethodsCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
-    return JSON.parse(content);
+    const cache = JSON.parse(content);
+    if (!Array.isArray(cache.paymentMethods)) cache.paymentMethods = [];
+    if (cache.defaultPaymentMethodId === undefined) cache.defaultPaymentMethodId = null;
+    return cache;
   } catch (err) {
     if (err.code !== 'ENOENT') await logError('readPaymentMethodsCache', err);
     return null;
@@ -93,13 +96,42 @@ async function readPaymentMethodsCache() {
 
 function normalizeCachedMethod(m) {
   return {
-    paymentInstrumentId: m.payment_method_id,
-    paymentInstrumentType: m.payment_method_type,
-    cardScheme: m.card_brand,
-    cardLastFour: m.card_last4,
-    isDefault: m.is_default,
+    paymentInstrumentId: m.paymentInstrumentId,
+    paymentInstrumentType: m.paymentInstrumentType,
+    cardScheme: m.cardScheme,
+    cardLastFour: m.cardLastFour,
+    isDefault: m.isDefault,
     status: m.status,
   };
+}
+
+async function overwriteCachedBindingMethods(methods) {
+  const cache = await readPaymentMethodsCache() || {};
+  const normalizedMethods = Array.isArray(methods)
+    ? methods
+        .map((method) => ({
+          paymentInstrumentId: method.paymentInstrumentId || null,
+          paymentInstrumentType: method.paymentInstrumentType || null,
+          cardScheme: method.cardScheme || null,
+          cardLastFour: method.cardLastFour || null,
+          issuerBank: method.issuerBank || null,
+          isDefault: method.isDefault ?? false,
+          isDisabled: method.isDisabled ?? false,
+          status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
+        }))
+        .filter((method) => typeof method.paymentInstrumentId === "string" && method.paymentInstrumentId.trim())
+    : [];
+  const defaultMethod =
+    normalizedMethods.find((method) => method.isDefault) ||
+    normalizedMethods[0] ||
+    null;
+
+  cache.paymentMethods = normalizedMethods;
+  cache.defaultPaymentMethodId = defaultMethod?.paymentInstrumentId || null;
+  cache.cachedAt = new Date().toISOString();
+
+  await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
 // ------------------------------------------------------------------
@@ -188,6 +220,12 @@ async function fetchBindingData() {
     bindingToken = bindingUrl.split("#")[1];
   }
 
+  try {
+    await overwriteCachedBindingMethods(data.paymentMethodsVoList || []);
+  } catch (err) {
+    await logError('fetchBindingData/overwriteCachedBindingMethods', err);
+  }
+
   return { bindingUrl, bindingToken, methods: data.paymentMethodsVoList || [], env };
 }
 
@@ -212,10 +250,10 @@ async function handle_initialize_wallet(args) {
 
   try {
     const cache = await readPaymentMethodsCache() || {};
-    cache.webhook_signkey = signkey;
+    cache.webhookSignKey = signkey;
     cache.email = args.email;
     await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-    cache.cached_at = new Date().toISOString();
+    cache.cachedAt = new Date().toISOString();
     await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
   } catch (err) {
     await logError('initialize_wallet/saveInitialCache', err);
@@ -247,9 +285,9 @@ async function handle_initialize_wallet(args) {
 
     try {
       const cache = await readPaymentMethodsCache() || {};
-      cache.customer_id = data.customerId;
-      cache.customer_api_key = data.customerAPIKey;
-      cache.cached_at = new Date().toISOString();
+      cache.customerId = data.customerId;
+      cache.customerAPIKey = data.customerAPIKey;
+      cache.cachedAt = new Date().toISOString();
       await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
       await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
     } catch (err) {
@@ -481,10 +519,10 @@ Call initialize_wallet first before attempting to charge.`;
   let defaultCard = null;
   try {
     const cache = await readPaymentMethodsCache();
-    if (cache && cache.payment_methods && cache.payment_methods.length > 0) {
-      const defaultRaw = cache.payment_methods.find(m => m.payment_method_id === cache.default_payment_method_id)
-        || cache.payment_methods.find(m => m.is_default)
-        || cache.payment_methods[0];
+    if (cache && cache.paymentMethods && cache.paymentMethods.length > 0) {
+      const defaultRaw = cache.paymentMethods.find(m => m.paymentInstrumentId === cache.defaultPaymentMethodId)
+        || cache.paymentMethods.find(m => m.isDefault)
+        || cache.paymentMethods[0];
       defaultCard = normalizeCachedMethod(defaultRaw);
     } else {
       // Cache empty — fall back to live Clink API (e.g. after reinstall)
@@ -546,12 +584,12 @@ async function handle_clink_pay(args) {
   if (!piId) {
     try {
       const cache = await readPaymentMethodsCache();
-      if (cache && cache.payment_methods && cache.payment_methods.length > 0) {
-        const defaultRaw = cache.payment_methods.find(m => m.payment_method_id === cache.default_payment_method_id)
-          || cache.payment_methods.find(m => m.is_default)
-          || cache.payment_methods[0];
-        piId = defaultRaw.payment_method_id;
-        pmType = defaultRaw.payment_method_type || pmType;
+      if (cache && cache.paymentMethods && cache.paymentMethods.length > 0) {
+        const defaultRaw = cache.paymentMethods.find(m => m.paymentInstrumentId === cache.defaultPaymentMethodId)
+          || cache.paymentMethods.find(m => m.isDefault)
+          || cache.paymentMethods[0];
+        piId = defaultRaw.paymentInstrumentId;
+        pmType = defaultRaw.paymentInstrumentType || pmType;
       } else {
         // Cache empty — fall back to live Clink API (e.g. after reinstall)
         const { methods } = await fetchBindingData();
