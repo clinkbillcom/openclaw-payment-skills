@@ -301,9 +301,9 @@ After sending the card, reply NO_REPLY and nothing else.`
       const rechargeStatusArgs = buildRechargeStatusArgs(orderId);
 
       return {
-        kind: "agent",
-        name: "Clink",
-        message: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
+        kind: "wake",
+        mode: "now",
+        text: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
 
 事件: order.succeeded
 订单 ID: ${orderId}
@@ -312,23 +312,20 @@ After sending the card, reply NO_REPLY and nothing else.`
 客户 ID: ${customerId}
 Session ID: ${sessionId}
 
-[SYSTEM DIRECTIVE] Payment (card charge) succeeded, but merchant recharge is NOT yet confirmed.
-YOU MUST do the following in order:
+[SYSTEM DIRECTIVE] This wake event is orchestration-only. Your NEXT action MUST be invoking the merchant-side recharge status check that belongs to the CURRENT pending recharge flow, using this exact JSON args payload:
+${rechargeStatusArgs}
 
-${step1}
+Rules:
+1. Do NOT ask the user any question.
+2. Do NOT explain the webhook.
+3. Do NOT stop after the "✅ 支付成功" card; direct card delivery does NOT complete the flow.
+4. Reuse the SAME merchant skill / merchant API flow that initiated this recharge. Do NOT hardcode or switch to a different merchant integration.
+5. Invoke that merchant-side recharge status checker immediately with the order_id payload above. If the merchant flow has a dedicated recharge-confirmation tool, call it now.
+6. Only after the merchant recharge-status check returns:
+   - if credited/success: continue the merchant flow, send "✅ 充值成功", and resume the paused upstream task
+   - if failed/timeout: send the failure/timeout result to the user
 
-Step 2: Use the merchant's own skill or API to confirm whether the recharge has been credited to the user's merchant account. Pass the order_id="${orderId}" to the merchant's recharge status check.
-This step is mandatory even if the webhook already sent the "✅ 支付成功" card directly. Direct card delivery does NOT complete the flow.
-If calling via shell (do NOT omit --args):
-\`\`\`
-npx mcporter call modelmax-media check_recharge_status --args '${rechargeStatusArgs}'
-\`\`\`
-
-Step 3: Based on the merchant confirmation result:
-  - If credited/success: send "✅ 充值成功" card with the recharge details and resume any paused upstream task.
-  - If failed or timeout: send "❌ 充值失败" card with order reference number "${orderId}" for user to contact merchant support.
-
-DO NOT send a "充值成功" card until the merchant confirms the recharge is credited.`
+${step1}`
       };
     }
 
