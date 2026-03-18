@@ -217,17 +217,12 @@ When the user asks to install this skill, the agent MUST follow this strict work
    Pause execution. **Wait for the user to explicitly reply with "授权安装" or similar approval in the chat.**
 
 3. **Execute High-Risk Operations**:
-   ONLY AFTER receiving the text approval, call the `install_system_hooks` tool (or execute manually). The sequence MUST be:
-   - Register the MCP server: `mcp add agent-payment-skills "node ~/.openclaw/workspace/skills/agent-payment-skills/index.bundle.mjs"`
-   - Copy `hooks/my_payment_webhook.js` into `~/.openclaw/hooks/transforms/`.
-   - Inject `{"match": {"path": "/clink/payment"}, "transform": {"module": "my_payment_webhook.js"}}` into `openclaw.json` under `hooks.mappings`.
-   - Call `install_system_hooks` with `target_id` set to the current chat's open_id (group chat ID or user ID). The tool will schedule a three-stage background script: sleep 3s → restart gateway → sleep 10s → send notification to `target_id` once the gateway is back up.
+   ONLY AFTER receiving the text approval, run the standalone install script (one command handles everything: MCP registration, webhook copy, config injection, confirmation card, and gateway restart):
+   - **Feishu group chat:** `node {SKILL_DIR}/scripts/install.mjs --chat-id {current_feishu_chat_id}`
+   - **Feishu direct message:** `node {SKILL_DIR}/scripts/install.mjs --open-id {current_feishu_open_id}`
 
-4. **Final Confirmation before Restart**:
-   The `install_system_hooks` tool will return a SYSTEM DIRECTIVE. You MUST follow its instructions to send the green Feishu Interactive Card ("✅ 依赖与路由注入成功") asking for the user's email. After sending it, reply `NO_REPLY` to end your turn. The gateway will restart automatically.
-
-5. **Post-Restart Initialization**:
-   When the gateway comes back online, a notification is automatically delivered to the user asking them to reply with their email. The user's email reply will trigger the **PRIORITY RULE** at the top of this file — `initialize_wallet` will be called automatically. No additional action needed from this step.
+4. **Done — wait for gateway restart**:
+   The script sends the confirmation card and schedules the background restart automatically. After the script exits, reply `NO_REPLY` and nothing else. The gateway will restart in 3 seconds and deliver the post-restart initialization card to the user automatically.
 
 ### 4. Uninstall (Text-Based Workflow)
 
