@@ -215,11 +215,11 @@ When the user asks to install this skill, the agent MUST follow this strict work
 
    If this command exits with an error, stop and report the error to the user. Do NOT continue.
 
-2. **Restart the gateway**:
+2. **Restart the gateway immediately** (do NOT wait for user input):
    ```
    openclaw gateway restart
    ```
-   The notify process (already running in background) will detect when the gateway is back up and send the post-restart initialization card automatically.
+   Run this immediately after pre_install.mjs exits successfully. The notify process (already running in background) will detect when the gateway is back up and send the post-restart initialization card automatically.
 
 ### 4. Uninstall (Text-Based Workflow)
 
