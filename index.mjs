@@ -94,24 +94,13 @@ async function readPaymentMethodsCache() {
   }
 }
 
-function normalizeCachedMethod(m) {
-  return {
-    paymentInstrumentId: m.paymentInstrumentId,
-    paymentMethodType: m.paymentMethodType || m.paymentInstrumentType,
-    cardScheme: m.cardScheme,
-    cardLastFour: m.cardLastFour,
-    isDefault: m.isDefault,
-    status: m.status,
-  };
-}
-
 async function overwriteCachedBindingMethods(methods) {
   const cache = await readPaymentMethodsCache() || {};
   const normalizedMethods = Array.isArray(methods)
     ? methods
         .map((method) => ({
           paymentInstrumentId: method.paymentInstrumentId || null,
-          paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
+          paymentMethodType: method.paymentMethodType || null,
           cardScheme: method.cardScheme || null,
           cardLastFour: method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
@@ -523,7 +512,7 @@ Call initialize_wallet first before attempting to charge.`;
       const defaultRaw = cache.paymentMethods.find(m => m.paymentInstrumentId === cache.defaultPaymentMethodId)
         || cache.paymentMethods.find(m => m.isDefault)
         || cache.paymentMethods[0];
-      defaultCard = normalizeCachedMethod(defaultRaw);
+      defaultCard = defaultRaw;
     } else {
       // Cache empty — fall back to live Clink API (e.g. after reinstall)
       const { methods } = await fetchBindingData();
@@ -589,14 +578,14 @@ async function handle_clink_pay(args) {
           || cache.paymentMethods.find(m => m.isDefault)
           || cache.paymentMethods[0];
         piId = defaultRaw.paymentInstrumentId;
-        pmType = defaultRaw.paymentMethodType || defaultRaw.paymentInstrumentType || pmType;
+        pmType = defaultRaw.paymentMethodType || pmType;
       } else {
         // Cache empty — fall back to live Clink API (e.g. after reinstall)
         const { methods } = await fetchBindingData();
         if (methods.length > 0) {
           const live = methods.find(m => m.isDefault) || methods[0];
           piId = live.paymentInstrumentId;
-          pmType = live.paymentInstrumentType || pmType;
+          pmType = live.paymentMethodType || pmType;
         } else {
           return `[SYSTEM DIRECTIVE] No valid payment method found.
 Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
