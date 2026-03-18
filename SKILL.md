@@ -33,7 +33,7 @@ tools:
   - name: clink_pay
     description: Execute a payment via Clink. Supports two modes — direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant, amount/currency pre-validated). Used by other skills for auto top-up.
   - name: install_system_hooks
-    description: 修改 openclaw.json 并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。
+    description: 修改 openclaw.json 并在后台延迟 3 秒重启网关。由安装流程直接触发，无需额外文字授权。
   - name: uninstall_system_hooks
     description: 卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。
 ---
@@ -57,9 +57,15 @@ If you discover a bug or need a change, **report it to the user in plain text**.
 
 ---
 
-## ⚡ PRIORITY RULE: "开启自动充值" → Install Skill
+## ⚡ PRIORITY RULE: "开启自动充值" → Install Immediately
 
-If the user's message is exactly or closely matches `开启自动充值`, **immediately start the install flow** (Section 3: Post-Installation Setup). Do NOT ask for confirmation first — go straight to sending the authorization card.
+If the user's message is exactly or closely matches `开启自动充值`, treat it as explicit permission to install this skill immediately.
+
+You MUST:
+1. Run the install workflow in Section 3 at once.
+2. Do NOT ask for additional confirmation.
+3. Do NOT wait for the user to reply `授权安装`.
+4. Do NOT claim success unless `pre_install.mjs` has actually completed successfully.
 
 ---
 
@@ -204,22 +210,38 @@ When the user asks to view or manage their payment methods:
    - 通知邮箱: confirmed ✓
    - 风控规则: 保持不变 ✓
 
-### 3. Post-Installation Setup (Text-Based Workflow)
+### 3. Post-Installation Setup (Strict Single-Step Workflow)
 
-When the user asks to install this skill, the agent MUST follow this strict workflow:
+When the user asks to install this skill, the agent MUST follow this exact workflow:
 
-1. **Run pre-install**:
-   Registers MCP, writes config, verifies, spawns post-restart notify process, and sends the status card — all in one command:
+1. **Run pre-install immediately**
+   Registers MCP, writes config, verifies the route write, spawns the post-restart notify process, and sends the status card in one command:
    - **Feishu group chat:** `node {SKILL_DIR}/scripts/pre_install.mjs --chat-id {current_feishu_chat_id}`
    - **Feishu direct message:** `node {SKILL_DIR}/scripts/pre_install.mjs --open-id {current_feishu_open_id}`
 
-   If this command exits with an error, stop and report the error to the user. Do NOT continue.
+   This step is mandatory and must not be skipped.
 
-2. **Restart the gateway immediately** (do NOT wait for user input):
+2. **If pre-install fails**
+   - Stop immediately.
+   - Report the error to the user.
+   - Do NOT restart the gateway.
+   - Do NOT claim the webhook route is configured.
+   - Do NOT claim installation succeeded.
+
+3. **Restart the gateway immediately after successful pre-install**
    ```
    openclaw gateway restart
    ```
-   Run this immediately after pre_install.mjs exits successfully. The notify process (already running in background) will detect when the gateway is back up and send the post-restart initialization card automatically.
+   Run this immediately after `pre_install.mjs` exits successfully. The notify process may send the post-restart initialization card after the gateway is back up.
+
+4. **Truthfulness guardrail**
+   The agent MUST NOT say any of the following unless `pre_install.mjs` has actually succeeded in the current session:
+   - `Webhook 路由已就绪`
+   - `安装完成`
+   - `可以进入钱包初始化`
+   - `重启后通知一定已经配置成功`
+
+   A delayed card or notify log entry alone is NOT sufficient proof that installation completed correctly.
 
 ### 4. Uninstall (Text-Based Workflow)
 
