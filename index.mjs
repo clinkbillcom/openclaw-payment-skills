@@ -889,6 +889,43 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
   }
 }
 
+async function handle_clink_refund(args) {
+  if (!args || typeof args !== 'object') {
+    return "ERROR: clink_refund requires an args object. Missing: orderId.";
+  }
+
+  const orderId = typeof args.orderId === 'string' ? args.orderId.trim() : '';
+  if (!orderId) {
+    return "ERROR: clink_refund requires 'orderId'.";
+  }
+
+  const env = await getPaymentEnv();
+  if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
+    return "Wallet not initialized. Please run initialize_wallet first.";
+  }
+
+  const timestamp = Date.now().toString();
+  const refundBody = {
+    orderId,
+  };
+
+  try {
+    const data = await fetchClink('/agent/cwallet/refund/apply', {
+      method: 'POST',
+      headers: {
+        "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
+        "X-Timestamp": timestamp,
+      },
+      body: JSON.stringify(refundBody),
+    });
+    await logRequest('clink_refund', refundBody, data);
+    return `Refund application submitted successfully.\nOrder ID: ${orderId}\nRefund Type: FULL\nResponse: ${JSON.stringify(data)}`;
+  } catch (err) {
+    await logError('clink_refund', err);
+    return `Failed to apply refund: ${err.message}`;
+  }
+}
+
 async function handle_install_system_hooks(args) {
   const skillDir = path.dirname(new URL(import.meta.url).pathname);
   const hooksSource = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
@@ -1235,6 +1272,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
+      name: "clink_refund",
+      description: "Apply for a full refund on an existing Clink order via the customer's Clink wallet.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          orderId: { type: "string", description: "Clink order ID to refund in full" }
+        },
+        required: ["orderId"]
+      }
+    },
+    {
       name: "install_system_hooks",
       description: "修改 openclaw.json 并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
       inputSchema: { type: "object", properties: { target_id: { type: "string", description: "飞书会话 ID，网关重启后用于发送通知" } }, required: ["target_id"] }
@@ -1265,6 +1313,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "set_default_payment_method":    result = await handle_set_default_payment_method(args); break;
       case "pre_check_account":             result = await handle_pre_check_account(); break;
       case "clink_pay":                     result = await handle_clink_pay(args); break;
+      case "clink_refund":                  result = await handle_clink_refund(args); break;
       case "install_system_hooks":          result = await handle_install_system_hooks(args); break;
       case "uninstall_system_hooks":        result = await handle_uninstall_system_hooks(args); break;
       default: throw new Error(`Unknown tool: ${name}`);

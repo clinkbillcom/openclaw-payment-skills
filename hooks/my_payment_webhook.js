@@ -8,7 +8,9 @@
 //   3. agent_order.created  — charge order created (intermediate)
 //   4. agent_order.succeeded — payment succeeded
 //   5. agent_order.failed   — payment or recharge failed
-//   6. risk_rule.updated — risk rules changed
+//   6. agent_refund.succeeded — refund succeeded
+//   7. agent_refund.failed — refund failed
+//   8. risk_rule.updated — risk rules changed
 
 const fs = require('fs/promises');
 const os = require('os');
@@ -380,6 +382,97 @@ After sending the card, reply NO_REPLY and nothing else.`
       };
     }
 
+    // ─── Refund succeeded ───
+    case "agent_refund.succeeded": {
+      const amt = formatRefundAmount(data);
+      const cache = await readCache();
+      const paymentInstrumentId =
+        data.payment_instrument_id || data.paymentInstrumentId || null;
+      const card = formatCard(paymentInstrumentId, data, cache);
+      const orderId = data.order_id || data.orderId || "N/A";
+      const refundId = data.refund_id || data.refundId || "N/A";
+
+      const refundCard = {
+        schema: "2.0",
+        header: { title: { content: "✅ 退款成功", tag: "plain_text" }, template: "green" },
+        body: { elements: [
+          { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**退款状态**　<font color="green">成功</font>` },
+          { tag: "hr" },
+          { tag: "markdown", content: "退款申请已处理成功，资金将按发卡行或支付渠道的到账时效原路退回。" }
+        ]}
+      };
+
+      const sent = await sendCardsDirect('agent_refund.succeeded', [refundCard]);
+      if (sent) {
+        return null;
+      }
+
+      return {
+        kind: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 退款成功回调。
+
+事件: agent_refund.succeeded
+退款单号: ${refundId}
+原订单号: ${orderId}
+退款金额: ${amt}
+退款方式: ${card}
+客户 ID: ${data.customer_id || data.customerId || "N/A"}
+
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(refundCard)}
+
+After sending the card, reply NO_REPLY and nothing else.`
+      };
+    }
+
+    // ─── Refund failed ───
+    case "agent_refund.failed": {
+      const amt = formatRefundAmount(data);
+      const cache = await readCache();
+      const paymentInstrumentId =
+        data.payment_instrument_id || data.paymentInstrumentId || null;
+      const card = formatCard(paymentInstrumentId, data, cache);
+      const orderId = data.order_id || data.orderId || "N/A";
+      const refundId = data.refund_id || data.refundId || "N/A";
+      const failureReason =
+        data.failure_message || data.failureMessage || data.failure_code || data.failureCode || "退款处理失败";
+
+      const refundFailCard = {
+        schema: "2.0",
+        header: { title: { content: "❌ 退款失败", tag: "plain_text" }, template: "red" },
+        body: { elements: [
+          { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**失败原因**　<font color="red">${failureReason}</font>` },
+          { tag: "hr" },
+          { tag: "markdown", content: "退款申请未能成功处理，请稍后重试或联系 Clink 支持排查。" }
+        ]}
+      };
+
+      const sent = await sendCardsDirect('agent_refund.failed', [refundFailCard]);
+      if (sent) {
+        return null;
+      }
+
+      return {
+        kind: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 退款失败回调。
+
+事件: agent_refund.failed
+退款单号: ${refundId}
+原订单号: ${orderId}
+退款金额: ${amt}
+退款方式: ${card}
+失败原因: ${failureReason}
+客户 ID: ${data.customer_id || data.customerId || "N/A"}
+
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(refundFailCard)}
+
+After sending the card, reply NO_REPLY and nothing else.`
+      };
+    }
+
     // ─── Risk rules updated ───
     case "risk_rule.updated": {
       try {
@@ -438,6 +531,13 @@ function formatAmount(data) {
   const currency = data.currency || data.paymentCurrency || "";
   const symbol = currency === "USD" ? "$" : currency;
   const amount = data.amount ?? data.amountTotal ?? data.amountSubtotal ?? "N/A";
+  return amount === "N/A" ? "N/A" : `${symbol}${amount}`;
+}
+
+function formatRefundAmount(data) {
+  const currency = data.refund_currency || data.refundCurrency || "";
+  const symbol = currency === "USD" ? "$" : currency;
+  const amount = data.refund_amount ?? data.refundAmount ?? "N/A";
   return amount === "N/A" ? "N/A" : `${symbol}${amount}`;
 }
 
