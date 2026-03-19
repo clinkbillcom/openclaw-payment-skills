@@ -165,10 +165,13 @@ module.exports = async function(ctx) {
       const cardDisplay = `${(data.cardBrand || data.paymentMethodType || "Unknow").toUpperCase()} ••••${data.cardLast4 || "****"}`;
       const email = data.customerEmail || "N/A";
       const cachedMethod = toCachedPaymentMethod(data, data.paymentInstrumentId);
+      let shouldSendCompleteCard = true;
 
       // Update cache
       try {
         const cache = await readCache();
+        const hadExistingPaymentMethod = Array.isArray(cache.paymentMethods) && cache.paymentMethods.length > 0;
+        shouldSendCompleteCard = !cache.initialized && !hadExistingPaymentMethod;
         const existing = cache.paymentMethods.findIndex(m => m.paymentInstrumentId === data.paymentInstrumentId);
         if (existing >= 0) {
           cache.paymentMethods[existing] = cachedMethod;
@@ -202,13 +205,14 @@ module.exports = async function(ctx) {
         ]}
       };
 
-      const sent = await sendCardsDirect('payment_method.added', [successCard, completeCard]);
+      const cardsToSend = shouldSendCompleteCard ? [successCard, completeCard] : [successCard];
+      const sent = await sendCardsDirect('payment_method.added', cardsToSend);
       if (sent) {
         return null;
       }
 
       const exec1 = cardExec(successCard);
-      const exec2 = cardExec(completeCard);
+      const exec2 = shouldSendCompleteCard ? cardExec(completeCard) : null;
 
       return {
         kind: "agent",
@@ -222,16 +226,16 @@ module.exports = async function(ctx) {
 卡片: ${cardDisplay}
 状态: ${data.status || "active"}
 
-[SYSTEM DIRECTIVE] The user has successfully bound a new payment method. Initialization is now complete.
-YOU MUST send TWO Feishu Interactive Cards in order:
+[SYSTEM DIRECTIVE] The user has successfully bound a new payment method.${shouldSendCompleteCard ? " Initialization is now complete." : ""}
+YOU MUST send ${shouldSendCompleteCard ? "TWO" : "ONE"} Feishu Interactive Card${shouldSendCompleteCard ? "s" : ""} in order:
 
 Card 1:
 ${exec1}
 
-Card 2:
+${exec2 ? `Card 2:
 ${exec2}
 
-After sending both cards, reply NO_REPLY and nothing else.`
+` : ""}After sending ${shouldSendCompleteCard ? "both cards" : "the card"}, reply NO_REPLY and nothing else.`
       };
     }
 
