@@ -10,7 +10,9 @@
 //   5. agent_order.failed   — payment or recharge failed
 //   6. agent_refund.succeeded — refund succeeded
 //   7. agent_refund.failed — refund failed
-//   8. risk_rule.updated — risk rules changed
+//   8. agent_refund.approved — refund approved
+//   9. agent_refund.rejected — refund rejected
+//   10. risk_rule.updated — risk rules changed
 
 const fs = require('fs/promises');
 const os = require('os');
@@ -136,6 +138,16 @@ function toCachedPaymentMethod(data, paymentInstrumentId) {
     isDefault: data.isDefault ?? false,
     isDisabled: data.isDisabled ?? false,
     status: data.status || ((data.isDisabled ?? false) ? 'disabled' : 'active'),
+  };
+}
+
+function getRefundMeta(data) {
+  return {
+    amt: formatRefundAmount(data),
+    paymentInstrumentId: data.payment_instrument_id || data.paymentInstrumentId || null,
+    orderId: data.order_id || data.orderId || "N/A",
+    refundId: data.refund_id || data.refundId || "N/A",
+    customerId: data.customer_id || data.customerId || "N/A",
   };
 }
 
@@ -383,26 +395,25 @@ After sending the card, reply NO_REPLY and nothing else.`
     }
 
     // ─── Refund succeeded ───
-    case "agent_refund.succeeded": {
-      const amt = formatRefundAmount(data);
+    case "agent_refund.succeeded":
+    case "agent_refund.approved": {
       const cache = await readCache();
-      const paymentInstrumentId =
-        data.payment_instrument_id || data.paymentInstrumentId || null;
+      const { amt, paymentInstrumentId, orderId, refundId, customerId } = getRefundMeta(data);
       const card = formatCard(paymentInstrumentId, data, cache);
-      const orderId = data.order_id || data.orderId || "N/A";
-      const refundId = data.refund_id || data.refundId || "N/A";
+      const eventName = type;
+      const isApproved = type === "agent_refund.approved";
 
       const refundCard = {
         schema: "2.0",
-        header: { title: { content: "✅ 退款成功", tag: "plain_text" }, template: "green" },
+        header: { title: { content: isApproved ? "✅ 退款已通过" : "✅ 退款成功", tag: "plain_text" }, template: "green" },
         body: { elements: [
           { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**退款状态**　<font color="green">成功</font>` },
           { tag: "hr" },
-          { tag: "markdown", content: "退款申请已处理成功，资金将按发卡行或支付渠道的到账时效原路退回。" }
+          { tag: "markdown", content: isApproved ? "退款申请已审核通过，资金将按发卡行或支付渠道的到账时效原路退回。" : "退款申请已处理成功，资金将按发卡行或支付渠道的到账时效原路退回。" }
         ]}
       };
 
-      const sent = await sendCardsDirect('agent_refund.succeeded', [refundCard]);
+      const sent = await sendCardsDirect(eventName, [refundCard]);
       if (sent) {
         return null;
       }
@@ -410,14 +421,14 @@ After sending the card, reply NO_REPLY and nothing else.`
       return {
         kind: "agent",
         name: "Clink",
-        message: `[Clink Webhook] 退款成功回调。
+        message: `[Clink Webhook] ${isApproved ? "退款审核通过回调" : "退款成功回调"}。
 
-事件: agent_refund.succeeded
+事件: ${eventName}
 退款单号: ${refundId}
 原订单号: ${orderId}
 退款金额: ${amt}
 退款方式: ${card}
-客户 ID: ${data.customer_id || data.customerId || "N/A"}
+客户 ID: ${customerId}
 
 [SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
 ${cardExec(refundCard)}
@@ -427,28 +438,27 @@ After sending the card, reply NO_REPLY and nothing else.`
     }
 
     // ─── Refund failed ───
-    case "agent_refund.failed": {
-      const amt = formatRefundAmount(data);
+    case "agent_refund.failed":
+    case "agent_refund.rejected": {
       const cache = await readCache();
-      const paymentInstrumentId =
-        data.payment_instrument_id || data.paymentInstrumentId || null;
+      const { amt, paymentInstrumentId, orderId, refundId, customerId } = getRefundMeta(data);
       const card = formatCard(paymentInstrumentId, data, cache);
-      const orderId = data.order_id || data.orderId || "N/A";
-      const refundId = data.refund_id || data.refundId || "N/A";
       const failureReason =
         data.failure_message || data.failureMessage || data.failure_code || data.failureCode || "退款处理失败";
+      const eventName = type;
+      const isRejected = type === "agent_refund.rejected";
 
       const refundFailCard = {
         schema: "2.0",
-        header: { title: { content: "❌ 退款失败", tag: "plain_text" }, template: "red" },
+        header: { title: { content: isRejected ? "❌ 退款已拒绝" : "❌ 退款失败", tag: "plain_text" }, template: "red" },
         body: { elements: [
           { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**失败原因**　<font color="red">${failureReason}</font>` },
           { tag: "hr" },
-          { tag: "markdown", content: "退款申请未能成功处理，请稍后重试或联系 Clink 支持排查。" }
+          { tag: "markdown", content: isRejected ? "退款申请未通过审核，请根据失败原因调整后再试或联系 Clink 支持排查。" : "退款申请未能成功处理，请稍后重试或联系 Clink 支持排查。" }
         ]}
       };
 
-      const sent = await sendCardsDirect('agent_refund.failed', [refundFailCard]);
+      const sent = await sendCardsDirect(eventName, [refundFailCard]);
       if (sent) {
         return null;
       }
@@ -456,15 +466,15 @@ After sending the card, reply NO_REPLY and nothing else.`
       return {
         kind: "agent",
         name: "Clink",
-        message: `[Clink Webhook] 退款失败回调。
+        message: `[Clink Webhook] ${isRejected ? "退款审核拒绝回调" : "退款失败回调"}。
 
-事件: agent_refund.failed
+事件: ${eventName}
 退款单号: ${refundId}
 原订单号: ${orderId}
 退款金额: ${amt}
 退款方式: ${card}
 失败原因: ${failureReason}
-客户 ID: ${data.customer_id || data.customerId || "N/A"}
+客户 ID: ${customerId}
 
 [SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
 ${cardExec(refundFailCard)}
