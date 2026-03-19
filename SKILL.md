@@ -2,6 +2,12 @@
 name: agent-payment-skills
 description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Cards are sent via exec using the built-in scripts/send-feishu-card.mjs script (no external skill dependency). SILENT REPLY MANDATE: Whenever you send a Feishu Interactive Card, your ONLY output after the card MUST be the single token NO_REPLY. DO NOT output any other text, markdown, or explanation."
 version: "1.0.0"
+metadata:
+  openclaw:
+    scriptsDir: "scripts"
+    tools:
+      card_sender: "scripts/send-feishu-card.mjs"
+      mcp_server: "index.bundle.mjs"
 permissions:
   - network
   - system
