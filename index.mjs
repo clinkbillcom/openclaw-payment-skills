@@ -912,10 +912,10 @@ async function handle_clink_refund(args) {
       body: JSON.stringify(refundBody),
     });
     await logRequest('clink_refund', refundBody, data);
-    const refundId = data.refund_id || data.refundId || "N/A";
-    const responseOrderId = data.order_id || data.orderId || orderId;
-    const refundAmountRaw = data.refund_amount ?? data.refundAmount ?? null;
-    const refundCurrency = data.refund_currency || data.refundCurrency || "USD";
+    const refundId = data.refundOrderId || "N/A";
+    const responseOrderId = data.orderId || orderId;
+    const refundAmountRaw = data.refundAmount ?? null;
+    const refundCurrency = data.refundCurrency || "USD";
     const refundStatus = data.status || "pending_review";
     const refundAmountNumber = refundAmountRaw === null || refundAmountRaw === undefined
       ? null
