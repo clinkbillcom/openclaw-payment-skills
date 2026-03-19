@@ -249,7 +249,7 @@ When the user asks to uninstall this skill, the agent MUST follow the same stric
    Pause execution. **Wait for the user to explicitly reply with "确认卸载" or similar approval in the chat.**
 
 3. **Execute Uninstall**:
-   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with `target_id` set to the current chat's open_id (same as install). This tool will:
+   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with `target_id` set to the current chat's open_id (same as install). Do NOT manually run `openclaw mcp remove`, edit `openclaw.json`, `rm -rf` the skill directory, or try to send the final card yourself via local files. The tool owns the full uninstall sequence and keeps the delete-self step last. This tool will:
    - Remove `my_payment_webhook.js` from `~/.openclaw/hooks/transforms/`.
    - Remove the `hooks/clink/payment` route mapping from `openclaw.json` `hooks.mappings`.
    - Remove Clink skill config (`skills.entries["agent-payment-skills"]`) from `openclaw.json`.
