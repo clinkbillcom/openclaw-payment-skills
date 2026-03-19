@@ -361,7 +361,7 @@ ${step1}`
         schema: "2.0",
         header: { title: { content: title, tag: "plain_text" }, template: "red" },
         body: { elements: [
-          { tag: "markdown", content: `**支付金额**　${amt}\n**支付状态**　<font color="${isCharged ? "orange" : "red"}">${isCharged ? "已扣款，等待人工处理" : "扣款失败"}</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单参考号**　${orderId}` },
+          { tag: "markdown", content: `**支付金额**　${amt}\n**支付状态**　<font color="${isCharged ? "orange" : "red"}">${isCharged ? "已扣款，等待人工处理" : "扣款失败"}</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单号**　${orderId}` },
           { tag: "hr" },
           { tag: "markdown", content: isCharged
               ? "支付网关侧已记录扣款异常，请携带以上订单号联系商户支持继续处理。"
