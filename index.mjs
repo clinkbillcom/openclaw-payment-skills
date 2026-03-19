@@ -661,8 +661,6 @@ After sending the card, your turn MUST end with exactly and ONLY the token NO_RE
     const orderId = data.paySuccessInfo?.orderId || data.orderId || "N/A";
     const merchantName = data.paySuccessInfo?.merchantName || args.merchant_id || "商户";
     const amtDisplay = `${data.paySuccessInfo?.currencySymbol || "$"}${data.paySuccessInfo?.amount || args.amount}`;
-    const cache = await readPaymentMethodsCache();
-    const rechargeStatusArgs = buildMerchantRechargeStatusArgs(orderId, args.sessionId, cache);
     const cardInfo = (() => {
       const pmd = data.channelPaymentResponse?.paymentMethodDetail?.card || {};
       const psi = data.paySuccessInfo || {};
@@ -681,15 +679,10 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "已提交至支付网关，正在等待银行确认。结果将通过通知自动推送。"
 - No action buttons needed.
 
-After sending the card, DO NOT stop. You MUST immediately continue the CURRENT merchant recharge flow by invoking that merchant's recharge-status checker with this exact JSON args payload:
-${rechargeStatusArgs}
-
-Rules:
-1. Do NOT ask the user any question.
-2. Do NOT wait for the async webhook before starting the merchant-side status poll.
-3. Reuse the SAME merchant skill / merchant API flow that initiated this recharge. Do NOT switch merchants.
-4. If the merchant-side recharge checker later sends cards directly and/or resumes the original task, end with exactly and ONLY the token NO_REPLY.
-5. The async webhook is only a fallback wake-up signal if merchant confirmation arrives after this turn has already ended.`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY.
+Do NOT ask the user any question.
+Do NOT invoke the merchant-side recharge-status checker in this turn.
+The merchant-side recharge confirmation and original-task resume must happen only after the later async webhook wake for payment/order.succeeded arrives.`;
   } catch (err) {
     await logError('clink_pay', err);
     const code = err instanceof ClinkApiError ? err.code : null;
@@ -871,19 +864,19 @@ YOU MUST immediately send a Feishu Interactive Card to the user:
 - Description: "Clink 支付服务暂时不可用，请稍后重试。如果持续出现此问题，请联系支持。"
 - Button 1 (ghost): "联系支持"
 
-You may retry after a short delay.`;
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
     }
 
     return `[SYSTEM DIRECTIVE] Payment Failed: Unexpected error.
 YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：建议联系商户支持" (Red theme, header h-danger)
+- Template / Style: "❌ 充值失败：处理异常" (Red theme, header h-danger)
 - Key-Value Rows:
   - 充值金额: "${amt}"
   - 失败原因: "${err.message}" (Red)
   - 错误码: "${code || 'N/A'}"
   - 状态: "失败" (Red)
-- Description: "充值过程中出现异常，请联系支持获取帮助。"
-- Button 1 (primary): "联系支持" (url: https://www.modelmax.io)
+- Description: "充值过程中出现异常，请稍后重试。如问题持续，请联系支付服务支持排查。"
+- No action buttons needed.
 
 After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY. DO NOT output any other text.`;
   }
@@ -919,10 +912,60 @@ async function handle_clink_refund(args) {
       body: JSON.stringify(refundBody),
     });
     await logRequest('clink_refund', refundBody, data);
-    return `Refund application submitted successfully.\nOrder ID: ${orderId}\nRefund Type: FULL\nResponse: ${JSON.stringify(data)}`;
+    const refundId = data.refund_id || data.refundId || "N/A";
+    const responseOrderId = data.order_id || data.orderId || orderId;
+    const refundAmountRaw = data.refund_amount ?? data.refundAmount ?? null;
+    const refundCurrency = data.refund_currency || data.refundCurrency || "USD";
+    const refundStatus = data.status || "pending_review";
+    const refundAmountNumber = refundAmountRaw === null || refundAmountRaw === undefined
+      ? null
+      : Number(refundAmountRaw);
+    const refundAmountDisplay = refundAmountNumber === null || Number.isNaN(refundAmountNumber)
+      ? "待后端确认"
+      : `${refundAmountNumber.toFixed(2)} ${refundCurrency}`;
+    const statusDisplay = refundStatus === "pending_review"
+      ? "等待审核中"
+      : refundStatus;
+
+    return `[SYSTEM DIRECTIVE] Refund application submitted successfully.
+YOU MUST immediately send a Feishu Interactive Card to the user:
+- Template / Style: "⏳ 退款申请已提交" (Blue theme)
+- Key-Value Rows:
+  - 原订单号: "${responseOrderId}"
+  - 退款单号: "${refundId}"
+  - 退款金额: "${refundAmountDisplay}"
+  - 退款状态: "${statusDisplay}" (Orange)
+- Description: "退款申请已提交至 Clink，正在等待处理。最终结果将通过后续通知自动推送。"
+- No action buttons needed.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY.
+Do NOT output any extra text.
+Do NOT restate the refund details in natural language.
+Do NOT send this submission card more than once for the same tool result.
+Wait for the later refund webhook to deliver the final success/failure card.`;
   } catch (err) {
     await logError('clink_refund', err);
-    return `Failed to apply refund: ${err.message}`;
+    const code = err instanceof ClinkApiError ? err.code : null;
+    const failureReason = err instanceof ClinkApiError
+      ? (err.raw?.msg || err.message || "退款申请失败")
+      : err.message;
+    const failureDescription = code === 90101401
+      ? "该订单当前可退余额不足，无法继续发起退款申请。请核对订单已退款金额或等待可退额度更新后再试。"
+      : "退款申请未能提交，请稍后重试。如问题持续，请联系 Clink 支持排查。";
+
+    return `[SYSTEM DIRECTIVE] Refund application failed.
+YOU MUST immediately send a Feishu Interactive Card to the user:
+- Template / Style: "❌ 退款申请失败" (Red theme)
+- Key-Value Rows:
+  - 原订单号: "${orderId}"
+  - 失败原因: "${failureReason}" (Red)
+  - 错误码: "${code || 'N/A'}"
+- Description: "${failureDescription}"
+- No action buttons needed.
+
+After sending the card, your turn MUST end with exactly and ONLY the token NO_REPLY.
+Do NOT output any extra text.
+Do NOT restate the failure in natural language.`;
   }
 }
 

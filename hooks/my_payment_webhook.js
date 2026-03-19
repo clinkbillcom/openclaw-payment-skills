@@ -334,7 +334,7 @@ ${step1}`
       };
     }
 
-    // ─── Payment or recharge failed ───
+    // ─── Payment failed ───
     case "agent_order.failed": {
       const amt = formatAmount(data);
       const orderId = data.orderId || "N/A";
@@ -343,17 +343,17 @@ ${step1}`
       const failureCode = data.failureCode || "";
       const failureReason = data.failureMessage || failureCode || "支付处理异常";
       const isCharged = status === "charged" || status === "paid";
+      const title = isCharged ? "❌ 支付异常" : "❌ 支付失败";
 
       const failCard = {
         schema: "2.0",
-        header: { title: { content: "❌ 充值失败：建议联系商户支持", tag: "plain_text" }, template: "red" },
+        header: { title: { content: title, tag: "plain_text" }, template: "red" },
         body: { elements: [
-          { tag: "markdown", content: `**支付状态**　<font color="${isCharged ? "green" : "red"}">${isCharged ? `已扣款 ${amt}` : "扣款失败"}</font>\n**充值状态**　<font color="red">失败</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单参考号**　${orderId}` },
+          { tag: "markdown", content: `**支付金额**　${amt}\n**支付状态**　<font color="${isCharged ? "orange" : "red"}">${isCharged ? "已扣款，等待人工处理" : "扣款失败"}</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单参考号**　${orderId}` },
           { tag: "hr" },
           { tag: "markdown", content: isCharged
-              ? "您的银行卡已成功扣款，但商户账户未收到充值。请携带以上订单号联系商户客服处理。"
-              : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。" },
-          { tag: "button", text: { content: "联系支持", tag: "plain_text" }, type: "primary", url: "https://www.modelmax.io" }
+              ? "支付网关侧已记录扣款异常，请携带以上订单号联系商户支持继续处理。"
+              : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。" }
         ]}
       };
 
@@ -365,7 +365,7 @@ ${step1}`
       return {
         kind: "agent",
         name: "Clink",
-        message: `[Clink Webhook] 充值失败回调。
+        message: `[Clink Webhook] 支付失败回调。
 
 事件: order.failed
 订单 ID: ${orderId}
