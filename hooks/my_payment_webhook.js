@@ -142,10 +142,11 @@ function buildRechargeStatusArgs(orderId, sessionId) {
 function toCachedPaymentMethod(data, paymentInstrumentId) {
   return {
     paymentInstrumentId,
-    paymentMethodType: data.paymentMethodType,
-    cardBrand: data.cardBrand,
-    cardLast4: data.cardLast4,
+    paymentMethodType: data.paymentMethodType || data.paymentInstrumentType || data.payment_method_type || data.payment_instrument_type || null,
+    cardBrand: data.cardBrand || data.cardScheme || data.card_brand || data.card_scheme || null,
+    cardLast4: data.cardLast4 || data.cardLastFour || data.card_last4 || data.card_last_four || null,
     issuerBank: data.issuerBank || null,
+    walletAccountTag: data.walletAccountTag || data.wallet?.accountTag || null,
     isDefault: data.isDefault ?? false,
     isDisabled: data.isDisabled ?? false,
     status: data.status || ((data.isDisabled ?? false) ? 'disabled' : 'active'),
@@ -174,9 +175,9 @@ module.exports = async function(ctx) {
     // ─── Card binding completed ───
     case "payment_method.added": {
       await logRequest('payment_method.added', data);
-      const cardDisplay = `${(data.cardBrand || data.paymentMethodType || "Unknow").toUpperCase()} ••••${data.cardLast4 || "****"}`;
-      const email = data.customerEmail || "N/A";
       const cachedMethod = toCachedPaymentMethod(data, data.paymentInstrumentId);
+      const cardDisplay = formatCachedCard(cachedMethod);
+      const email = data.customerEmail || "N/A";
       let shouldSendCompleteCard = true;
 
       // Update cache
@@ -254,8 +255,8 @@ ${exec2}
     // ─── Default payment method changed ───
     case "payment_method.default_change": {
       await logRequest('payment_method.default_change', data);
-      const cardDisplay = `${(data.cardBrand || data.paymentMethodType || "Unknow").toUpperCase()} ••••${data.cardLast4 || "****"}`;
       const cachedMethod = toCachedPaymentMethod(data, data.paymentInstrumentId);
+      const cardDisplay = formatCachedCard(cachedMethod);
 
       // Update cache
       try {
@@ -572,6 +573,9 @@ function formatRefundAmount(data) {
 
 function formatCachedCard(method) {
   const brand = method.cardBrand || method.paymentMethodType || "Unknow";
+  if (method.walletAccountTag) {
+    return `${String(brand).toUpperCase()} ${method.walletAccountTag}`;
+  }
   const last4 = method.cardLast4 || "****";
   return `${String(brand).toUpperCase()} ••••${last4}`;
 }
@@ -586,18 +590,26 @@ function formatCard(paymentInstrumentId, data, cache) {
     }
   }
 
-  if (data.cardBrand || data.cardLast4) {
-    return `${(data.cardBrand || data.paymentMethodType || "Unknow").toUpperCase()} ••••${data.cardLast4 || "****"}`;
+  const walletAccountTag = data.walletAccountTag || data.wallet?.accountTag || null;
+  if (data.cardBrand || data.cardLast4 || walletAccountTag) {
+    const brand = data.cardBrand || data.cardScheme || data.paymentMethodType || data.paymentInstrumentType || "Unknow";
+    if (walletAccountTag) {
+      return `${String(brand).toUpperCase()} ${walletAccountTag}`;
+    }
+    return `${String(brand).toUpperCase()} ••••${data.cardLast4 || data.cardLastFour || "****"}`;
   }
 
   if (data.paymentMethod) {
     const pm = data.paymentMethod;
-    if (pm.cardBrand || pm.cardLast4) {
-      const brand = pm.cardBrand || pm.paymentMethodType || "Unknow";
-      const last4 = pm.cardLast4 || "****";
-      return `${brand.toUpperCase()} ••••${last4}`;
+    if (pm.cardBrand || pm.cardLast4 || pm.walletAccountTag || pm.wallet?.accountTag) {
+      return formatCachedCard({
+        paymentMethodType: pm.paymentMethodType || pm.paymentInstrumentType,
+        cardBrand: pm.cardBrand || pm.cardScheme,
+        cardLast4: pm.cardLast4 || pm.cardLastFour,
+        walletAccountTag: pm.walletAccountTag || pm.wallet?.accountTag,
+      });
     }
-    return `${pm.paymentMethodType || "Unknow"} ${paymentInstrumentId}`.trim();
+    return `${pm.paymentMethodType || pm.paymentInstrumentType || "Unknow"} ${paymentInstrumentId}`.trim();
   }
   return "N/A";
 }

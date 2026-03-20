@@ -100,10 +100,11 @@ async function overwriteCachedBindingMethods(methods) {
     ? methods
         .map((method) => ({
           paymentInstrumentId: method.paymentInstrumentId || null,
-          paymentMethodType: method.paymentMethodType || null,
-          cardBrand: method.cardBrand || null,
-          cardLast4: method.cardLast4 || null,
+          paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
+          cardBrand: method.cardBrand || method.cardScheme || null,
+          cardLast4: method.cardLast4 || method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
+          walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
           isDefault: method.isDefault ?? false,
           isDisabled: method.isDisabled ?? false,
           status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
@@ -121,6 +122,17 @@ async function overwriteCachedBindingMethods(methods) {
 
   await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+}
+
+function formatPaymentMethodDisplay(method) {
+  if (!method) return 'Unknow';
+  const brand = method.cardBrand || method.cardScheme || method.paymentMethodType || method.paymentInstrumentType || "Unknow";
+  const last4 = method.cardLast4 || method.cardLastFour || null;
+  const walletAccountTag = method.walletAccountTag || method.wallet?.accountTag || null;
+  if (walletAccountTag) {
+    return `${String(brand).toUpperCase()} ${walletAccountTag}`;
+  }
+  return `${String(brand).toUpperCase()} ••••${last4 || "****"}`;
 }
 
 function buildMerchantRechargeStatusArgs(orderId, sessionId, cache) {
@@ -369,7 +381,7 @@ After sending the card, your turn MUST end with EXACTLY AND ONLY the token NO_RE
 Extracted Binding Token for future use: ${bindingToken}`;
     } else {
       const defaultCard = methods.find(m => m.isDefault) || methods[0];
-      const cardDisplay = `${defaultCard.cardBrand || defaultCard.paymentMethodType || "Unknow"} ••••${defaultCard.cardLast4 || "****"}`;
+      const cardDisplay = formatPaymentMethodDisplay(defaultCard);
       return `💳 检测到已绑定的支付方式。
 [SYSTEM DIRECTIVE] Payment methods found.
 YOU MUST immediately send a Feishu Interactive Card to the user with the following details:
@@ -438,7 +450,7 @@ async function handle_get_payment_method_modify_link() {
 YOU MUST immediately send a Feishu Interactive Card to the user:
 - Template / Style: "⚙️ 管理支付方式" (Blue theme)
 - Key-Value Rows:
-  - 当前支付方式: "${defaultCard ? `${defaultCard.cardBrand || defaultCard.paymentMethodType || "Unknow"} ••••${defaultCard.cardLast4}` : '未设置'}"
+  - 当前支付方式: "${defaultCard ? formatPaymentMethodDisplay(defaultCard) : '未设置'}"
   - 已绑定数量: "${methods.length} 种"
 - Description: "查看已绑定的支付方式，切换默认卡，或添加新的支付方式。\n\n[👉 点击这里管理支付方式](${modifyUrl})"
 
@@ -476,7 +488,12 @@ async function handle_get_payment_method_detail(args) {
     return `[SYSTEM DIRECTIVE] Payment Method Detail Retrieved.
 YOU MUST send a Feishu Interactive Card to the user with the following details:
 - Template / Style: "💳 检测到已绑定的支付方式" (Green theme)
-- Card: ${data.cardBrand || data.paymentMethodType || "Unknow"} ${data.cardLast4 ? "•••• " + data.cardLast4 : ""}
+- Card: ${formatPaymentMethodDisplay({
+  paymentMethodType: data.paymentMethodType || data.paymentInstrumentType,
+  cardBrand: data.cardBrand || data.cardScheme,
+  cardLast4: data.cardLast4 || data.cardLastFour,
+  walletAccountTag: data.walletAccountTag || data.wallet?.accountTag,
+})}
 - Billing Region: ${data.billingAddressJson?.country || "N/A"}
 
 Raw Data: ${JSON.stringify(data)}`;
@@ -612,7 +629,7 @@ async function handle_clink_pay(args) {
         if (methods.length > 0) {
           const live = methods.find(m => m.isDefault) || methods[0];
           piId = live.paymentInstrumentId;
-          pmType = live.paymentMethodType || pmType;
+          pmType = live.paymentMethodType || live.paymentInstrumentType || pmType;
         } else {
           return `[SYSTEM DIRECTIVE] No valid payment method found.
 Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
