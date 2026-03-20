@@ -87,9 +87,9 @@ Current Payment Methods: ${JSON.stringify(r)}
 Extracted Binding Token for future use: ${t}`}}catch(e){return await oe("get_binding_link",e),`Failed to get binding link: ${e.message}`}}async function PP(){try{let{bindingUrl:e,env:t}=await xn(),r=xs(e,"risk-rules-setup");return`[SYSTEM DIRECTIVE] Risk rules link generated.
 YOU MUST immediately send this exact Feishu Interactive Card JSON to the user:
 \`\`\`json
-${JSON.stringify({schema:"2.0",header:{title:{tag:"plain_text",content:"\u{1F6E1}\uFE0F \u67E5\u770B\u98CE\u63A7\u89C4\u5219"},template:"blue"},body:{elements:[{tag:"markdown",content:`\u98CE\u63A7\u89C4\u5219\u53EF\u9650\u5236\u81EA\u52A8\u5145\u503C\u7684\u91D1\u989D\u548C\u9891\u7387\uFF0C\u5EFA\u8BAE\u914D\u7F6E\u4EE5\u4FDD\u969C\u8D44\u91D1\u5B89\u5168\u3002\u6B64\u6B65\u9AA4\u53EF\u9009\uFF0C\u53EF\u968F\u65F6\u914D\u7F6E\u3002
+${JSON.stringify({schema:"2.0",config:{wide_screen_mode:!0},header:{title:{tag:"plain_text",content:"\u{1F6E1}\uFE0F \u67E5\u770B\u98CE\u63A7\u89C4\u5219"},template:"blue"},body:{elements:[{tag:"div",text:{tag:"lark_md",content:`\u98CE\u63A7\u89C4\u5219\u53EF\u9650\u5236\u81EA\u52A8\u5145\u503C\u7684\u91D1\u989D\u548C\u9891\u7387\uFF0C\u5EFA\u8BAE\u914D\u7F6E\u4EE5\u4FDD\u969C\u8D44\u91D1\u5B89\u5168\u3002\u6B64\u6B65\u9AA4\u53EF\u9009\uFF0C\u53EF\u968F\u65F6\u914D\u7F6E\u3002
 
-[\u{1F449} \u70B9\u51FB\u8FD9\u91CC\u914D\u7F6E\u98CE\u63A7\u89C4\u5219](${r})`}]}})}
+[\u{1F449} \u70B9\u51FB\u8FD9\u91CC\u914D\u7F6E\u98CE\u63A7\u89C4\u5219](${r})`}}]}})}
 \`\`\`
 
 After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`}catch(e){return await oe("get_risk_rules_link",e),`Failed to get risk rules link: ${e.message}`}}async function EP(){try{let{bindingUrl:e,env:t}=await xn(),r=xs(e,"payment-method-setup");return`[SYSTEM DIRECTIVE] Payment method setup link generated.

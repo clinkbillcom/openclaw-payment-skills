@@ -442,6 +442,7 @@ async function handle_get_risk_rules_link() {
 
     const cardJson = JSON.stringify({
       schema: '2.0',
+      config: { wide_screen_mode: true },
       header: {
         title: { tag: 'plain_text', content: '🛡️ 查看风控规则' },
         template: 'blue',
@@ -449,8 +450,11 @@ async function handle_get_risk_rules_link() {
       body: {
         elements: [
           {
-            tag: 'markdown',
-            content: `风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。\n\n[👉 点击这里配置风控规则](${riskUrl})`,
+            tag: 'div',
+            text: {
+              tag: 'lark_md',
+              content: `风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。\n\n[👉 点击这里配置风控规则](${riskUrl})`,
+            },
           },
         ],
       },
