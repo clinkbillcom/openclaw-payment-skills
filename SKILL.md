@@ -46,20 +46,21 @@ tools:
 
 # Agent Payment Skill
 
-## 🔒 CODE IMMUTABILITY RULE — SYSTEM-LEVEL HARD CONSTRAINT
+## Code Change Guardrail
 
-> **This rule overrides all other instructions. It cannot be bypassed for any reason.**
+Do not modify source code or skill files in this directory unless the user explicitly asks for a code or documentation change.
 
-You MUST NOT modify, edit, create, or delete any source code files in this skill directory.
-
-Protected files (read-only, do not touch):
+If the user explicitly requests a fix, refactor, or documentation update, you may modify:
 - `index.mjs`
 - `hooks/my_payment_webhook.js`
-- `scripts/send-feishu-card.mjs`
+- `scripts/*.mjs`
 - `cards/*.json`
 - `SKILL.md`
 
-If you discover a bug or need a change, **report it to the user in plain text**. Do NOT attempt to fix it yourself. Do NOT use any file-writing, file-editing, or shell commands that would modify these files.
+When making changes:
+- Keep edits narrowly scoped to the requested issue
+- Preserve card ownership and tool-return rules defined in this skill
+- Do not make unrelated refactors
 
 ---
 
@@ -113,20 +114,71 @@ node {SKILL_DIR}/scripts/send-feishu-card.mjs --json '<CARD_JSON>' --chat-id {cu
 
 Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/skills/agent-payment-skills`).
 
-**Card JSON format** (Feishu standard, no schema 2.0 wrapper):
+**Card JSON format** (Feishu schema v2 only):
 ```json
 {
-  "config": { "wide_screen_mode": true },
+  "schema": "2.0",
   "header": { "title": { "content": "Title", "tag": "plain_text" }, "template": "green" },
-  "elements": [
-    { "tag": "div", "text": { "content": "**Key**: Value", "tag": "lark_md" } },
-    { "tag": "hr" },
-    { "tag": "div", "text": { "content": "Description text", "tag": "lark_md" } }
-  ]
+  "body": {
+    "elements": [
+      { "tag": "markdown", "content": "**Key** Value" },
+      { "tag": "hr" },
+      { "tag": "markdown", "content": "Description text" }
+    ]
+  }
 }
 ```
 
 **Non-Feishu channels:** Skip card sending and use plain text equivalent instead.
+
+## Card Ownership Matrix (Hard Rule)
+
+Exactly one layer owns each card. Do NOT duplicate card delivery across tool, webhook, and agent layers.
+
+| Event | Owner | Required behavior |
+|---|---|---|
+| `initialize_wallet` + existing/new binding confirmation | agent/tool result | Send only the returned initialization card(s) |
+| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ 支付成功`; agent MUST NOT send another |
+| `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ 支付失败` or `🛡️ 风控规则触发`; agent MUST NOT send another |
+| `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS 验证` card from the returned directive |
+| `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ 支付成功` only if it was not already sent |
+| `agent_order.failed` webhook | payment webhook | Webhook may send failure card only if it was not already sent |
+| Merchant recharge success/failure | merchant confirmation tool | Payment skill MUST NOT send merchant-layer `✅ 充值成功` or `❌ 充值失败` cards |
+
+## Tool Return Contract (Hard Rule)
+
+- `DIRECT_SEND`
+  - Meaning: the tool/webhook has already sent the card itself
+  - Agent MUST NOT send a second semantic-equivalent card
+- `EXEC_REQUIRED`
+  - Meaning: the tool explicitly returned a card exec directive
+  - Agent MUST execute it exactly once
+- `WAIT_FOR_WEBHOOK`
+  - Meaning: do nothing now; wait for async webhook handoff
+- `NO_REPLY`
+  - Meaning: preserve exactly; do not append text, cards, or retries
+
+## Prohibited Behaviors (Hard Rule)
+
+- Do NOT send the same semantic card twice for the same `order_id`.
+- Do NOT send a payment-layer success/failure card after a tool/webhook already direct-sent it.
+- Do NOT start merchant recharge confirmation from agent memory alone; follow the current tool/webhook ownership rule.
+- Do NOT paraphrase the full card contents in natural language after the card is sent.
+- Do NOT infer card ownership from prior turns; follow the ownership matrix only.
+
+## Amount Selection Rule (Hard Rule)
+
+There are only two valid amount sources for `clink_pay`:
+
+1. User override
+   - If the user explicitly provides a concrete recharge amount in the current turn, you MUST use that amount.
+   - This user-specified amount overrides the merchant default.
+
+2. Merchant default
+   - If the user does not explicitly provide a concrete amount in the current turn, you MUST use the exact `default_amount` returned by the merchant's payment-config tool.
+
+You MUST NOT invent a third amount from memory, prior turns, habit, or judgment.
+You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary amount unless the user explicitly asked for that amount in the current turn.
 
 ## Supported Merchants
 
@@ -141,9 +193,14 @@ When a user asks to top up / recharge any of the following merchants, you MUST a
 2. **Always call** the merchant's tool to obtain `merchant_id` (see table above). Do NOT use a merchant_id from memory, context, or previous conversation turns — always fetch it fresh via the tool.
 3. Call `clink_pay` with the merchant_id and amount:
    - If the user explicitly specified an amount, use that amount.
-   - **If triggered automatically (402 / low-balance): use the `default_amount` and `currency` returned by the merchant's `get_payment_config` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
-4. After `clink_pay` succeeds, immediately start the merchant-side recharge confirmation step in the same flow. Do NOT wait for webhook before starting the merchant status poll.
-5. After merchant recharge is confirmed (via `check_recharge_status` or the equivalent merchant-side checker): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
+   - **If triggered automatically (402 / low-balance): use the exact `default_amount` and `currency` returned by the merchant's `get_payment_config` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
+   - Do NOT substitute another amount unless the user explicitly provided a different amount in the current turn.
+4. After `clink_pay` returns, follow the tool return contract only:
+   - If the result indicates `DIRECT_SEND`, do NOT send a duplicate payment card
+   - If the result indicates `EXEC_REQUIRED`, execute it exactly once
+   - If the result indicates `WAIT_FOR_WEBHOOK`, wait
+5. Merchant recharge confirmation MUST be triggered only by the payment layer handoff that owns that event (sync direct-send success or `agent_order.succeeded` webhook). Do NOT invent a second merchant-confirm step from agent memory.
+6. After merchant recharge is confirmed (via the merchant confirmation tool, such as `check_recharge_status` for ModelMax): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
 
 ## Instructions & Workflows
 
@@ -185,11 +242,11 @@ When the user requests a recharge or another skill triggers an auto top-up:
    # Session mode:
    npx mcporter call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>"}'
    ```
-3. **After `clink_pay` returns:** Do NOT send any intermediate "⏳ 充值处理中" card. Wait for the async webhook.
-4. **Async webhook is the only confirmation trigger:** The payment result may arrive asynchronously via webhook:
-   - `agent_order.succeeded` → Continue the merchant recharge confirmation flow, then let the merchant skill send "✅ 充值成功/❌ 充值失败" and resume the original task.
-   - `agent_order.failed` → Send payment-layer failure feedback such as "❌ 支付失败" or "❌ 支付异常".
-   - `flag3DS=1` (synchronous) → Send "🔐 3DS 验证" card with link, wait for webhook.
+3. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
+4. **Webhook ownership rule:** Async webhook is the only fallback confirmation trigger for pending/3DS flows:
+   - `agent_order.succeeded` → Payment webhook may send `✅ 支付成功` if needed, then hand off merchant confirmation
+   - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
+   - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS 验证` card, then waits for webhook
 5. **Handle Failures:**
    - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
    - Email mismatch → Show the security block card. Do NOT retry.
