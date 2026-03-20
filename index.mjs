@@ -440,10 +440,27 @@ async function handle_get_risk_rules_link() {
     const { bindingUrl, env } = await fetchBindingData();
     const riskUrl = buildRedirectUrl(bindingUrl, "risk-rules-setup");
 
+    const cardJson = JSON.stringify({
+      schema: '2.0',
+      header: {
+        title: { tag: 'plain_text', content: '🛡️ 查看风控规则' },
+        template: 'blue',
+      },
+      body: {
+        elements: [
+          {
+            tag: 'markdown',
+            content: `风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。\n\n[👉 点击这里配置风控规则](${riskUrl})`,
+          },
+        ],
+      },
+    });
+
     return `[SYSTEM DIRECTIVE] Risk rules link generated.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🛡️ 查看风控规则" (Blue theme, header h-blue)
-- Description: "风控规则可限制自动充值的金额和频率，建议配置以保障资金安全。此步骤可选，可随时配置。\n\n[👉 点击这里配置风控规则](${riskUrl})"
+YOU MUST immediately send this exact Feishu Interactive Card JSON to the user:
+\`\`\`json
+${cardJson}
+\`\`\`
 
 After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
   } catch (err) {
