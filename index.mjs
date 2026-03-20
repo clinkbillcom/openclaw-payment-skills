@@ -94,6 +94,31 @@ async function readPaymentMethodsCache() {
   }
 }
 
+async function writePaymentMethodsCache(cache) {
+  await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
+  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+}
+
+async function savePendingMerchantConfirmation(args) {
+  if (!args.merchant_confirm_server || !args.merchant_confirm_tool) {
+    return;
+  }
+
+  const cache = await readPaymentMethodsCache() || {};
+  cache.pendingMerchantConfirmation = {
+    server: String(args.merchant_confirm_server).trim(),
+    tool: String(args.merchant_confirm_tool).trim(),
+    args: args.merchant_confirm_args && typeof args.merchant_confirm_args === 'object'
+      ? JSON.parse(JSON.stringify(args.merchant_confirm_args))
+      : {},
+    sessionId: typeof args.sessionId === 'string' && args.sessionId.trim() ? args.sessionId.trim() : null,
+    notifyTargetId: typeof cache.notifyTargetId === 'string' ? cache.notifyTargetId : null,
+    notifyTargetType: cache.notifyTargetType === 'open_id' ? 'open_id' : 'chat_id',
+    createdAt: new Date().toISOString(),
+  };
+  await writePaymentMethodsCache(cache);
+}
+
 async function overwriteCachedBindingMethods(methods) {
   const cache = await readPaymentMethodsCache() || {};
   const normalizedMethods = Array.isArray(methods)
@@ -133,25 +158,6 @@ function formatPaymentMethodDisplay(method) {
     return `${String(brand).toUpperCase()} ${walletAccountTag}`;
   }
   return `${String(brand).toUpperCase()} ••••${last4 || "****"}`;
-}
-
-function buildMerchantRechargeStatusArgs(orderId, sessionId, cache) {
-  const payload = { order_id: orderId };
-  if (typeof sessionId === "string" && sessionId.trim()) {
-    payload.session_id = sessionId.trim();
-  }
-  const notifyTargetId =
-    typeof cache?.notifyTargetId === "string" && cache.notifyTargetId.trim()
-      ? cache.notifyTargetId.trim()
-      : null;
-  if (notifyTargetId) {
-    if (cache.notifyTargetType === "open_id") {
-      payload.open_id = notifyTargetId;
-    } else {
-      payload.chat_id = notifyTargetId;
-    }
-  }
-  return JSON.stringify(payload);
 }
 
 function formatAmountNumber(amount) {
@@ -660,6 +666,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     });
 
     if (data.channelPaymentResponse && data.channelPaymentResponse.flag3DS === 1) {
+      await savePendingMerchantConfirmation(args);
       const cpr = data.channelPaymentResponse;
       const redirectUrl = cpr.action?.redirectUrl || "";
       const psi = data.paySuccessInfo || {};
@@ -673,7 +680,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
       );
       const orderId = psi.orderId || "N/A";
 
-      return `[SYSTEM DIRECTIVE] Payment Requires 3DS verification.
+    return `[SYSTEM DIRECTIVE] Payment Requires 3DS verification.
 The bank requires secondary confirmation. YOU MUST pause the current task and send a Feishu Interactive Card to the user:
 - Template / Style: "🔐 充值触发 3DS 验证" (Blue theme, header h-blue)
 - Key-Value Rows:
@@ -686,6 +693,8 @@ The bank requires secondary confirmation. YOU MUST pause the current task and se
 
 After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents. DO NOT continue until the webhook confirms order.succeeded or order.failed.`;
     }
+
+    await savePendingMerchantConfirmation(args);
 
     return `[SYSTEM DIRECTIVE] Payment submitted successfully. Order is now processing.
 Do NOT send any intermediate "处理中" Feishu card to the user for this state.
@@ -1316,6 +1325,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           amount: { type: "number", description: "Recharge amount" },
           currency: { type: "string", description: "Currency code, e.g. USD (default)" },
           sessionId: { type: "string", description: "Charge session ID from merchant (session mode)" },
+          merchant_confirm_server: { type: "string", description: "Merchant MCP server name to notify after payment/order.succeeded, e.g. modelmax-media" },
+          merchant_confirm_tool: { type: "string", description: "Merchant tool name to call after payment/order.succeeded, e.g. check_recharge_status" },
+          merchant_confirm_args: { type: "object", description: "Optional extra args forwarded to the merchant confirm tool after payment/order.succeeded" },
           paymentInstrumentId: { type: "string" },
           paymentMethodType: { type: "string" }
         },

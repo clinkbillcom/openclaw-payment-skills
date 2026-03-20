@@ -17,7 +17,7 @@
 const fs = require('fs/promises');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 
 const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
@@ -73,6 +73,18 @@ async function writeCache(cache) {
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
+async function clearPendingMerchantConfirmation() {
+  try {
+    const cache = await readCache();
+    if (cache.pendingMerchantConfirmation) {
+      delete cache.pendingMerchantConfirmation;
+      await writeCache(cache);
+    }
+  } catch (err) {
+    await logError('clearPendingMerchantConfirmation', err);
+  }
+}
+
 // Build an exec directive that sends a v2 Feishu card via send-feishu-card.mjs.
 // Uses the stored notify_target_id (resolved at install time) so the exec command
 // contains the actual chat/open ID — no unresolvable {placeholder} at runtime.
@@ -124,19 +136,55 @@ async function sendCardsDirect(context, cards) {
   }
 }
 
-function buildRechargeStatusArgs(orderId, sessionId) {
-  const args = { order_id: orderId };
+function buildMerchantConfirmArgs(orderId, sessionId, context) {
+  const args = context && typeof context.args === 'object' && context.args
+    ? JSON.parse(JSON.stringify(context.args))
+    : {};
+  args.order_id = orderId;
   if (typeof sessionId === 'string' && sessionId.trim()) {
     args.session_id = sessionId.trim();
   }
-  if (_notifyTarget) {
-    if (_notifyFlag === '--open-id') {
-      args.open_id = _notifyTarget;
+  const notifyTargetId =
+    typeof context?.notifyTargetId === 'string' && context.notifyTargetId.trim()
+      ? context.notifyTargetId.trim()
+      : _notifyTarget;
+  const notifyTargetType = context?.notifyTargetType === 'open_id' ? 'open_id' : (_notifyFlag === '--open-id' ? 'open_id' : 'chat_id');
+  if (notifyTargetId) {
+    if (notifyTargetType === 'open_id') {
+      args.open_id = notifyTargetId;
+      delete args.chat_id;
     } else {
-      args.chat_id = _notifyTarget;
+      args.chat_id = notifyTargetId;
+      delete args.open_id;
     }
   }
-  return JSON.stringify(args);
+  return args;
+}
+
+function buildMerchantConfirmCommand(context, args) {
+  return `npx mcporter call ${context.server} ${context.tool} --args '${JSON.stringify(args)}'`;
+}
+
+async function triggerMerchantConfirmation(context, args) {
+  await logRequest('agent_order.succeeded.trigger_merchant_confirmation', { context, args });
+  try {
+    const child = spawn(
+      'mcporter',
+      ['call', context.server, context.tool, '--args', JSON.stringify(args)],
+      {
+        detached: true,
+        stdio: 'ignore',
+      },
+    );
+    child.on('error', (err) => {
+      logError('agent_order.succeeded trigger_merchant_confirmation spawn', err);
+    });
+    child.unref();
+    return true;
+  } catch (err) {
+    await logError('agent_order.succeeded trigger_merchant_confirmation', err);
+    return false;
+  }
 }
 
 function toCachedPaymentMethod(data, paymentInstrumentId) {
@@ -330,15 +378,24 @@ After sending the card, you may add a brief natural-language reply if helpful, b
       };
 
       const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
-      const step1 = sent
-        ? `Step 1: The webhook already sent the "✅ 支付成功" Feishu card directly to the user. Do NOT send it again.`
-        : `Step 1: Direct webhook card delivery failed. Send this Feishu Interactive Card to the user:\n${cardExec(pendingCard)}`;
-      const rechargeStatusArgs = buildRechargeStatusArgs(orderId, data.sessionId || data.session_id || null);
+      const merchantContext = cache.pendingMerchantConfirmation || null;
+      const merchantArgs = merchantContext
+        ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, merchantContext)
+        : null;
 
-      return {
-        kind: "wake",
-        mode: "now",
-        text: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
+      if (sent) {
+        if (!merchantContext) {
+          return null;
+        }
+        const triggered = await triggerMerchantConfirmation(merchantContext, merchantArgs);
+        if (triggered) {
+          await clearPendingMerchantConfirmation();
+          return null;
+        }
+        return {
+          kind: "wake",
+          mode: "now",
+          text: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
 
 事件: order.succeeded
 订单 ID: ${orderId}
@@ -347,25 +404,65 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 客户 ID: ${customerId}
 Session ID: ${sessionId}
 
-[SYSTEM DIRECTIVE] This wake event is orchestration-only. Your NEXT action MUST be invoking the merchant-side recharge status check that belongs to the CURRENT pending recharge flow, using this exact JSON args payload:
-${rechargeStatusArgs}
+[SYSTEM DIRECTIVE] The payment success card has already been sent to the user. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
+\`\`\`
+${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
+\`\`\`
 
 Rules:
-1. Do NOT ask the user any question.
-2. Do NOT explain the webhook.
-3. Do NOT stop after the "✅ 支付成功" card; direct card delivery does NOT complete the flow.
-4. Reuse the SAME merchant skill / merchant API flow that initiated this recharge. Do NOT hardcode or switch to a different merchant integration.
-5. Invoke that merchant-side recharge status checker immediately with the exact args payload above (including session_id when present). If the merchant flow has a dedicated recharge-confirmation tool, call it now.
-6. Only after the merchant recharge-status check returns:
-   - if credited/success: continue the merchant flow, send "✅ 充值成功", and resume the paused upstream task
-   - if failed/timeout: send the failure/timeout result to the user
+1. Do NOT send the payment success card again.
+2. Do NOT ask the user any question.
+3. After the merchant confirms recharge, let the merchant skill continue its own success/failure and task-resume flow.`
+        };
+      }
 
-${step1}`
+      if (!merchantContext) {
+      return {
+        kind: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
+
+事件: order.succeeded
+订单 ID: ${orderId}
+金额: ${amt}
+支付方式: ${card}
+客户 ID: ${customerId}
+Session ID: ${sessionId}
+
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
+${cardExec(pendingCard)}
+
+After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+      };
+      }
+
+      return {
+        kind: "agent",
+        name: "Clink",
+        message: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
+
+事件: order.succeeded
+订单 ID: ${orderId}
+金额: ${amt}
+支付方式: ${card}
+客户 ID: ${customerId}
+Session ID: ${sessionId}
+
+[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately do these steps in order:
+1. Send this Feishu Interactive Card:
+${cardExec(pendingCard)}
+2. Immediately notify the pending merchant skill with this exact command:
+\`\`\`
+${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
+\`\`\`
+
+After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
       };
     }
 
     // ─── Payment failed ───
     case "agent_order.failed": {
+      await clearPendingMerchantConfirmation();
       const amt = formatAmount(data);
       const orderId = data.orderId || "N/A";
       const customerId = data.customerId || "N/A";
