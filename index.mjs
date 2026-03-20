@@ -2,6 +2,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "crypto";
+import { execFileSync } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
@@ -64,6 +65,18 @@ async function updatePaymentEnv(updates) {
 const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
+const RUNTIME_SKILL_DIR = path.dirname(new URL(import.meta.url).pathname);
+const CARD_SENDER = path.join(RUNTIME_SKILL_DIR, 'scripts', 'send-feishu-card.mjs');
+
+function normalizeCache(cache) {
+  const normalized = cache && typeof cache === 'object' ? cache : {};
+  if (!Array.isArray(normalized.paymentMethods)) normalized.paymentMethods = [];
+  if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
+  if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
+    normalized.orderCardStates = {};
+  }
+  return normalized;
+}
 
 async function logRequest(context, payload, response) {
   const entry = {
@@ -84,10 +97,7 @@ async function logError(context, error) {
 async function readPaymentMethodsCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
-    const cache = JSON.parse(content);
-    if (!Array.isArray(cache.paymentMethods)) cache.paymentMethods = [];
-    if (cache.defaultPaymentMethodId === undefined) cache.defaultPaymentMethodId = null;
-    return cache;
+    return normalizeCache(JSON.parse(content));
   } catch (err) {
     if (err.code !== 'ENOENT') await logError('readPaymentMethodsCache', err);
     return null;
@@ -96,7 +106,76 @@ async function readPaymentMethodsCache() {
 
 async function writePaymentMethodsCache(cache) {
   await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+  await fs.writeFile(CACHE_PATH, JSON.stringify(normalizeCache(cache), null, 2), 'utf8');
+}
+
+function normalizeOrderStatus(status) {
+  if (status === undefined || status === null || status === '') return null;
+  return String(status).trim();
+}
+
+function getOrderCardStateKeys(orderId, status, sessionId) {
+  const keys = [];
+  const normalizedStatus = normalizeOrderStatus(status);
+  if (typeof orderId === 'string' && orderId.trim() && normalizedStatus) {
+    keys.push(`order_status:${orderId.trim()}:${normalizedStatus}`);
+  }
+  if (typeof orderId === 'string' && orderId.trim()) keys.push(`order:${orderId.trim()}`);
+  if (typeof sessionId === 'string' && sessionId.trim()) keys.push(`session:${sessionId.trim()}`);
+  return keys;
+}
+
+function getOrderCardState(cache, orderId, status, sessionId) {
+  const normalizedCache = normalizeCache(cache);
+  for (const key of getOrderCardStateKeys(orderId, status, sessionId)) {
+    if (normalizedCache.orderCardStates[key]) {
+      return normalizedCache.orderCardStates[key];
+    }
+  }
+  return null;
+}
+
+async function updateOrderCardState(orderId, status, sessionId, patch) {
+  if (!Object.keys(patch || {}).length) return null;
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  const existing = getOrderCardState(cache, orderId, status, sessionId) || {};
+  const nextState = {
+    ...existing,
+    ...patch,
+    orderId: typeof orderId === 'string' && orderId.trim() ? orderId.trim() : existing.orderId || null,
+    status: normalizeOrderStatus(status) || existing.status || null,
+    sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : existing.sessionId || null,
+    updatedAt: new Date().toISOString(),
+  };
+
+  for (const key of getOrderCardStateKeys(nextState.orderId, nextState.status, nextState.sessionId)) {
+    cache.orderCardStates[key] = nextState;
+  }
+
+  await writePaymentMethodsCache(cache);
+  return nextState;
+}
+
+function getNotifyTarget(cache) {
+  if (typeof cache?.notifyTargetId !== 'string' || !cache.notifyTargetId.trim()) {
+    return null;
+  }
+  return {
+    flag: cache.notifyTargetType === 'open_id' ? '--open-id' : '--chat-id',
+    id: cache.notifyTargetId.trim(),
+  };
+}
+
+function sendCardDirect(target, cardObj) {
+  execFileSync(
+    process.execPath,
+    [CARD_SENDER, '--json', JSON.stringify(cardObj), target.flag, target.id],
+    {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 15000,
+    },
+  );
 }
 
 async function savePendingMerchantConfirmation(args) {
@@ -175,6 +254,92 @@ function formatAmountWithSymbol(amount, currency = "USD", symbol = "") {
   if (formatted === "N/A") return "N/A";
   const resolvedSymbol = symbol || (currency === "USD" ? "$" : "");
   return resolvedSymbol ? `${resolvedSymbol}${formatted}` : `${formatted} ${currency}`;
+}
+
+function buildPaymentSuccessCard({ amountDisplay, cardDisplay, orderId }) {
+  return {
+    schema: "2.0",
+    header: { title: { content: "✅ 支付成功", tag: "plain_text" }, template: "green" },
+    body: { elements: [
+      { tag: "markdown", content: `**支付金额**　${amountDisplay}\n**扣款方式**　${cardDisplay}\n**Clink 订单号**　${orderId || "N/A"}` },
+      { tag: "hr" },
+      { tag: "markdown", content: "已完成扣款，正在等待商户确认到账…" },
+    ]},
+  };
+}
+
+function buildRiskRejectCard({ amountDisplay, declinedCode, message, orderId }) {
+  return {
+    schema: "2.0",
+    header: { title: { content: "🛡️ 风控规则触发：充值被拦截", tag: "plain_text" }, template: "red" },
+    body: { elements: [
+      {
+        tag: "markdown",
+        content:
+          `**充值金额**　${amountDisplay}\n` +
+          `**风控状态**　<font color="red">已拦截</font>\n` +
+          `**触发规则**　<font color="red">${declinedCode || "风控规则"}</font>\n` +
+          `**订单号**　${orderId || "N/A"}`,
+      },
+      { tag: "hr" },
+      {
+        tag: "markdown",
+        content: message || "当前充值请求触发了风控限制，请调整规则后重试。",
+      },
+    ]},
+  };
+}
+
+function buildPaymentFailureCard({ amountDisplay, orderId, failureReason }) {
+  return {
+    schema: "2.0",
+    header: { title: { content: "❌ 支付失败", tag: "plain_text" }, template: "red" },
+    body: { elements: [
+      {
+        tag: "markdown",
+        content:
+          `**支付金额**　${amountDisplay}\n` +
+          `**支付状态**　<font color="red">扣款失败</font>\n` +
+          `**失败原因**　<font color="red">${failureReason || "支付处理异常"}</font>\n` +
+          `**订单号**　${orderId || "N/A"}`,
+      },
+      { tag: "hr" },
+      {
+        tag: "markdown",
+        content: "支付未完成，请检查支付方式或稍后重试。",
+      },
+    ]},
+  };
+}
+
+function resolveChargeCardDisplay({ channelPaymentResponse, paySuccessInfo, fallbackCard, paymentMethodType }) {
+  const card = channelPaymentResponse?.paymentMethodDetail?.card || {};
+  const walletAccountTag =
+    card.walletAccountTag ||
+    channelPaymentResponse?.paymentMethodDetail?.walletAccountTag ||
+    paySuccessInfo?.walletAccountTag ||
+    null;
+  const brand =
+    card.cardBrand ||
+    card.paymentMethodType ||
+    paySuccessInfo?.cardBrand ||
+    paySuccessInfo?.paymentMethodType ||
+    paymentMethodType ||
+    fallbackCard?.cardBrand ||
+    fallbackCard?.paymentMethodType ||
+    "Unknow";
+
+  if (walletAccountTag) {
+    return `${String(brand).toUpperCase()} ${walletAccountTag}`;
+  }
+
+  const last4 =
+    card.last4No ||
+    paySuccessInfo?.cardLast4 ||
+    fallbackCard?.cardLast4 ||
+    fallbackCard?.cardLastFour ||
+    "****";
+  return `${String(brand).toUpperCase()} ••••${last4}`;
 }
 
 // ------------------------------------------------------------------
@@ -665,6 +830,7 @@ async function handle_clink_pay(args) {
 
   let piId = args.paymentInstrumentId;
   let pmType = args.paymentMethodType || "CARD";
+  let defaultCard = null;
 
   if (!piId) {
     try {
@@ -675,6 +841,7 @@ async function handle_clink_pay(args) {
           || cache.paymentMethods[0];
         piId = defaultRaw.paymentInstrumentId;
         pmType = defaultRaw.paymentMethodType || pmType;
+        defaultCard = defaultRaw;
       } else {
         // Cache empty — fall back to live Clink API (e.g. after reinstall)
         const { methods } = await fetchBindingData();
@@ -682,6 +849,7 @@ async function handle_clink_pay(args) {
           const live = methods.find(m => m.isDefault) || methods[0];
           piId = live.paymentInstrumentId;
           pmType = live.paymentMethodType || live.paymentInstrumentType || pmType;
+          defaultCard = live;
         } else {
           return `[SYSTEM DIRECTIVE] No valid payment method found.
 Call get_payment_method_setup_link immediately to prompt the user to bind a card.`;
@@ -711,33 +879,113 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
       body: JSON.stringify(chargeBody)
     });
 
+    const cache = normalizeCache(await readPaymentMethodsCache() || {});
+    const notifyTarget = getNotifyTarget(cache);
+    const cpr = data.channelPaymentResponse || {};
+    const psi = data.paySuccessInfo || {};
+    const status = Number(cpr.status);
+    const orderId = psi.orderId || data.orderId || cpr.orderId || null;
+    const sessionId = args.sessionId || data.sessionId || data.session_id || null;
+    const amountDisplay = formatAmountWithSymbol(
+      psi.amount ?? args.amount,
+      psi.currency || args.currency || "USD",
+      psi.currencySymbol || "",
+    );
+    const cardDisplay = resolveChargeCardDisplay({
+      channelPaymentResponse: cpr,
+      paySuccessInfo: psi,
+      fallbackCard: defaultCard,
+      paymentMethodType: args.paymentMethodType || pmType,
+    });
+
     if (data.channelPaymentResponse && data.channelPaymentResponse.flag3DS === 1) {
       await savePendingMerchantConfirmation(args);
-      const cpr = data.channelPaymentResponse;
       const redirectUrl = cpr.action?.redirectUrl || "";
-      const psi = data.paySuccessInfo || {};
-      const pmd = cpr.paymentMethodDetail?.card || {};
-      const cardDisplay = `${pmd.cardBrand || pmd.paymentMethodType || psi.cardBrand || psi.paymentMethodType || args.paymentMethodType || "Unknow"} ••••${pmd.last4No || psi.cardLast4 || "****"}`;
       const merchantName = psi.merchantName || args.merchant_id || "商户";
-      const amtDisplay = formatAmountWithSymbol(
-        psi.amount ?? args.amount,
-        psi.currency || args.currency || "USD",
-        psi.currencySymbol || "",
-      );
-      const orderId = psi.orderId || "N/A";
 
     return `[SYSTEM DIRECTIVE] Payment Requires 3DS verification.
 The bank requires secondary confirmation. YOU MUST pause the current task and send a Feishu Interactive Card to the user:
 - Template / Style: "🔐 充值触发 3DS 验证" (Blue theme, header h-blue)
 - Key-Value Rows:
-  - 充值金额: "${amtDisplay}"
+  - 充值金额: "${amountDisplay}"
   - 商户: "${merchantName}"
   - 银行: "${cardDisplay} 发卡行"
   - 3DS 状态: "等待验证" (Orange)
-  - 订单号: "${orderId}"
+  - 订单号: "${orderId || 'N/A'}"
 - Description: "银行要求对此次充值进行二次身份确认（3DS），任务已暂停等待您完成验证。\n\n[👉 点击这里完成 3DS 验证](${redirectUrl})"
 
 After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents. DO NOT continue until the webhook confirms agent_order.succeeded or agent_order.failed.`;
+    }
+
+    if (status === 1) {
+      await savePendingMerchantConfirmation(args);
+      const successCard = buildPaymentSuccessCard({
+        amountDisplay,
+        cardDisplay,
+        orderId,
+      });
+
+      try {
+        if (!notifyTarget) {
+          throw new Error('notify target missing');
+        }
+        sendCardDirect(notifyTarget, successCard);
+        await updateOrderCardState(orderId, 1, sessionId, {
+          paymentSuccessCardSent: true,
+          paymentSuccessCardSentAt: new Date().toISOString(),
+          paymentSuccessCardSource: 'sync_charge_response',
+        });
+        return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+The payment success card has already been sent to the user.
+Do NOT send any additional card in this turn.
+Do NOT invoke the merchant-side recharge-status checker in this turn.
+Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
+      } catch (sendErr) {
+        await logError('clink_pay/sync_success_card', sendErr);
+        return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+Direct card delivery failed, so do NOT send any fallback card in this turn.
+Do NOT invoke the merchant-side recharge-status checker in this turn.
+Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
+      }
+    }
+
+    if (status === 3 || status === 4 || status === 6) {
+      const isRiskReject = cpr.code === 'risk_reject' || String(cpr.declinedCode || '').includes('risk.');
+      const failureReason = cpr.message || cpr.declinedCode || '支付处理异常';
+      const failCard = isRiskReject
+        ? buildRiskRejectCard({
+            amountDisplay,
+            declinedCode: cpr.declinedCode || cpr.code,
+            message: cpr.message,
+            orderId,
+          })
+        : buildPaymentFailureCard({
+            amountDisplay,
+            orderId,
+            failureReason,
+          });
+
+      try {
+        if (!notifyTarget) {
+          throw new Error('notify target missing');
+        }
+        sendCardDirect(notifyTarget, failCard);
+        await updateOrderCardState(orderId, status, sessionId, {
+          paymentFailureCardSent: true,
+          paymentFailureCardSentAt: new Date().toISOString(),
+          paymentFailureCardSource: 'sync_charge_response',
+          paymentFailureKind: isRiskReject ? 'risk_reject' : 'terminal_failure',
+        });
+        return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
+The failure card has already been sent to the user.
+Do NOT send any additional card in this turn.
+Do NOT retry automatically.`;
+      } catch (sendErr) {
+        await logError('clink_pay/sync_failure_card', sendErr);
+        return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
+Direct card delivery failed, so do NOT send any fallback card in this turn.
+Do NOT retry automatically.`;
+      }
     }
 
     await savePendingMerchantConfirmation(args);

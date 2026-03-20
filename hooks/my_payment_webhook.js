@@ -24,6 +24,16 @@ const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
 const CARD_SENDER = `${SKILL_DIR}/scripts/send-feishu-card.mjs`;
 
+function normalizeCache(cache) {
+  const normalized = cache && typeof cache === 'object' ? cache : {};
+  if (!Array.isArray(normalized.paymentMethods)) normalized.paymentMethods = [];
+  if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
+  if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
+    normalized.orderCardStates = {};
+  }
+  return normalized;
+}
+
 // Read notify target from cache (stored at install time by install.mjs).
 // Falls back to {current_feishu_chat_id} placeholder if not found.
 let _notifyTarget = null;
@@ -57,20 +67,65 @@ async function logRequest(context, payload) {
 async function readCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
-    const cache = JSON.parse(content);
-    if (!Array.isArray(cache.paymentMethods)) cache.paymentMethods = [];
-    if (cache.defaultPaymentMethodId === undefined) cache.defaultPaymentMethodId = null;
-    return cache;
+    return normalizeCache(JSON.parse(content));
   } catch (err) {
     await logError('readCache', err);
-    return { paymentMethods: [], defaultPaymentMethodId: null, cachedAt: null };
+    return normalizeCache({ cachedAt: null });
   }
 }
 
 async function writeCache(cache) {
   await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
-  cache.cachedAt = new Date().toISOString();
-  await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
+  const normalized = normalizeCache(cache);
+  normalized.cachedAt = new Date().toISOString();
+  await fs.writeFile(CACHE_PATH, JSON.stringify(normalized, null, 2), 'utf8');
+}
+
+function normalizeOrderStatus(status) {
+  if (status === undefined || status === null || status === '') return null;
+  return String(status).trim();
+}
+
+function getOrderCardStateKeys(orderId, status, sessionId) {
+  const keys = [];
+  const normalizedStatus = normalizeOrderStatus(status);
+  if (typeof orderId === 'string' && orderId.trim() && normalizedStatus) {
+    keys.push(`order_status:${orderId.trim()}:${normalizedStatus}`);
+  }
+  if (typeof orderId === 'string' && orderId.trim()) keys.push(`order:${orderId.trim()}`);
+  if (typeof sessionId === 'string' && sessionId.trim()) keys.push(`session:${sessionId.trim()}`);
+  return keys;
+}
+
+function getOrderCardState(cache, orderId, status, sessionId) {
+  const normalized = normalizeCache(cache);
+  for (const key of getOrderCardStateKeys(orderId, status, sessionId)) {
+    if (normalized.orderCardStates[key]) {
+      return normalized.orderCardStates[key];
+    }
+  }
+  return null;
+}
+
+async function updateOrderCardState(orderId, status, sessionId, patch) {
+  if (!Object.keys(patch || {}).length) return null;
+  const cache = await readCache();
+  const existing = getOrderCardState(cache, orderId, status, sessionId) || {};
+  const nextState = {
+    ...existing,
+    ...patch,
+    orderId: typeof orderId === 'string' && orderId.trim() ? orderId.trim() : existing.orderId || null,
+    status: normalizeOrderStatus(status) || existing.status || null,
+    sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : existing.sessionId || null,
+    updatedAt: new Date().toISOString(),
+  };
+
+  for (const key of getOrderCardStateKeys(nextState.orderId, nextState.status, nextState.sessionId)) {
+    cache.orderCardStates[key] = nextState;
+  }
+
+  await writeCache(cache);
+  return nextState;
 }
 
 async function clearPendingMerchantConfirmation() {
@@ -373,9 +428,13 @@ After sending the card, you may add a brief natural-language reply if helpful, b
       const cache = await readCache();
       const paymentInstrumentId = data.paymentInstrumentId || data.paymentMethod?.paymentInstrumentId || null;
       const card = formatCard(paymentInstrumentId, data, cache);
-      const orderId = data.orderId || "N/A";
+      const rawOrderId = data.orderId || null;
+      const orderId = rawOrderId || "N/A";
       const customerId = data.customerId || "N/A";
-      const sessionId = data.sessionId || "无";
+      const sessionId = data.sessionId || data.session_id || null;
+      const sessionDisplay = sessionId || "无";
+      const orderCardState = getOrderCardState(cache, rawOrderId, 1, sessionId);
+      const successCardAlreadySent = !!orderCardState?.paymentSuccessCardSent;
 
       const pendingCard = {
         schema: "2.0",
@@ -387,11 +446,52 @@ After sending the card, you may add a brief natural-language reply if helpful, b
         ]}
       };
 
-      const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
       const merchantContext = cache.pendingMerchantConfirmation || null;
       const merchantArgs = merchantContext
         ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, merchantContext)
         : null;
+
+      if (successCardAlreadySent) {
+        if (!merchantContext) {
+          return null;
+        }
+        const triggered = await triggerMerchantConfirmation(merchantContext, merchantArgs);
+        if (triggered) {
+          await clearPendingMerchantConfirmation();
+          return null;
+        }
+        return {
+          kind: "wake",
+          mode: "now",
+          text: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
+
+事件: agent_order.succeeded
+订单 ID: ${orderId}
+金额: ${amt}
+支付方式: ${card}
+客户 ID: ${customerId}
+Session ID: ${sessionDisplay}
+
+[SYSTEM DIRECTIVE] The payment success card was already sent earlier. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
+\`\`\`
+${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
+\`\`\`
+
+Rules:
+1. Do NOT send the payment success card again.
+2. Do NOT ask the user any question.
+3. After the merchant confirms recharge, let the merchant skill continue its own success/failure and task-resume flow.`
+        };
+      }
+
+      const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
+      if (sent) {
+        await updateOrderCardState(rawOrderId, 1, sessionId, {
+          paymentSuccessCardSent: true,
+          paymentSuccessCardSentAt: new Date().toISOString(),
+          paymentSuccessCardSource: 'webhook',
+        });
+      }
 
       if (sent) {
         if (!merchantContext) {
@@ -412,7 +512,7 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 金额: ${amt}
 支付方式: ${card}
 客户 ID: ${customerId}
-Session ID: ${sessionId}
+Session ID: ${sessionDisplay}
 
 [SYSTEM DIRECTIVE] The payment success card has already been sent to the user. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
 \`\`\`
@@ -437,7 +537,7 @@ Rules:
 金额: ${amt}
 支付方式: ${card}
 客户 ID: ${customerId}
-Session ID: ${sessionId}
+Session ID: ${sessionDisplay}
 
 [SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
 ${cardExec(pendingCard)}
@@ -456,7 +556,7 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 金额: ${amt}
 支付方式: ${card}
 客户 ID: ${customerId}
-Session ID: ${sessionId}
+Session ID: ${sessionDisplay}
 
 [SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately do these steps in order:
 1. Send this Feishu Interactive Card:
@@ -474,11 +574,18 @@ After sending the card, you may add a brief natural-language reply if helpful, b
     case "agent_order.failed": {
       await clearPendingMerchantConfirmation();
       const amt = formatAmount(data);
-      const orderId = data.orderId || "N/A";
+      const rawOrderId = data.orderId || null;
+      const orderId = rawOrderId || "N/A";
       const customerId = data.customerId || "N/A";
+      const sessionId = data.sessionId || data.session_id || null;
       const status = data.status || "failed";
+      const normalizedStatus = normalizeOrderStatus(status);
       const failureCode = data.failureCode || "";
       const failureReason = data.failureMessage || failureCode || "支付处理异常";
+      const orderCardState = getOrderCardState(await readCache(), rawOrderId, normalizedStatus, sessionId);
+      if (orderCardState?.paymentFailureCardSent) {
+        return null;
+      }
       const isCharged = status === "charged" || status === "paid";
       const title = isCharged ? "❌ 支付异常" : "❌ 支付失败";
 
@@ -496,6 +603,12 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 
       const sent = await sendCardsDirect('agent_order.failed', [failCard]);
       if (sent) {
+        await updateOrderCardState(rawOrderId, normalizedStatus, sessionId, {
+          paymentFailureCardSent: true,
+          paymentFailureCardSentAt: new Date().toISOString(),
+          paymentFailureCardSource: 'webhook',
+          paymentFailureKind: `${failureCode}${data.declinedCode || ''}`.includes('risk') ? 'risk_reject' : 'payment_failed',
+        });
         return null;
       }
 
