@@ -108,6 +108,10 @@ function formatExecError(error) {
   return details.join('\n') || error.message;
 }
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 function sendCardDirect(cardObj) {
   if (!_notifyTarget) {
     throw new Error('notify_target_id is missing; cannot send card directly');
@@ -162,20 +166,26 @@ function buildMerchantConfirmArgs(orderId, sessionId, context) {
 }
 
 function buildMerchantConfirmCommand(context, args) {
-  return `npx mcporter call ${context.server} ${context.tool} --args '${JSON.stringify(args)}'`;
+  return [
+    'npx',
+    'mcporter',
+    'call',
+    context.server,
+    context.tool,
+    '--args',
+    JSON.stringify(args),
+  ].map(shellQuote).join(' ');
 }
 
 async function triggerMerchantConfirmation(context, args) {
   await logRequest('agent_order.succeeded.trigger_merchant_confirmation', { context, args });
   try {
-    const child = spawn(
-      'npx',
-      ['mcporter', 'call', context.server, context.tool, '--args', JSON.stringify(args)],
-      {
-        detached: true,
-        stdio: 'ignore',
-      },
-    );
+    const cmd = buildMerchantConfirmCommand(context, args);
+    const child = spawn(cmd, [], {
+      detached: true,
+      stdio: 'ignore',
+      shell: true,
+    });
     child.on('error', (err) => {
       logError('agent_order.succeeded trigger_merchant_confirmation spawn', err);
     });
