@@ -94,7 +94,7 @@ const accounts = feishuConfig?.accounts;
 const defaultAccountId =
   typeof feishuConfig?.defaultAccount === 'string' ? feishuConfig.defaultAccount.trim() : '';
 const account =
-  (defaultAccountId && accounts?.[defaultAccountId]) ??
+  (defaultAccountId ? accounts?.[defaultAccountId] : null) ??
   accounts?.main ??
   accounts?.default ??
   (accounts ? Object.values(accounts)[0] : null) ??
