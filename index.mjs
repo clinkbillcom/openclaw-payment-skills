@@ -180,7 +180,7 @@ function formatAmountWithSymbol(amount, currency = "USD", symbol = "") {
 // ------------------------------------------------------------------
 // API HELPERS
 // ------------------------------------------------------------------
-const BASE_URL = "https://uat-api.clinkbill.com";
+const BASE_URL = "https://api.clinkbill.com";
 
 class ClinkApiError extends Error {
   constructor(code, msg, raw) {
