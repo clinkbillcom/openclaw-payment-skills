@@ -89,14 +89,19 @@ try {
   process.exit();
 }
 
-const accounts = config?.channels?.feishu?.accounts;
-if (!accounts) {
-  console.error('Error: No feishu accounts found in ~/.openclaw/openclaw.json');
-  process.exitCode = 1;
-  process.exit();
-}
-const account = accounts.main ?? Object.values(accounts)[0];
-if (!account?.appId || !account?.appSecret) {
+const feishuConfig = config?.channels?.feishu;
+const accounts = feishuConfig?.accounts;
+const defaultAccountId =
+  typeof feishuConfig?.defaultAccount === 'string' ? feishuConfig.defaultAccount.trim() : '';
+const account =
+  (defaultAccountId && accounts?.[defaultAccountId]) ??
+  accounts?.main ??
+  accounts?.default ??
+  (accounts ? Object.values(accounts)[0] : null) ??
+  feishuConfig;
+const appId = account?.appId ?? feishuConfig?.appId;
+const appSecret = account?.appSecret ?? feishuConfig?.appSecret;
+if (!appId || !appSecret) {
   console.error('Error: Feishu account is missing appId or appSecret');
   process.exitCode = 1;
   process.exit();
@@ -107,7 +112,7 @@ async function getTenantAccessToken() {
   const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: account.appId, app_secret: account.appSecret }),
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
   });
   if (!res.ok) throw new Error(`Auth HTTP ${res.status}: ${res.statusText}`);
   const data = await res.json();
