@@ -319,7 +319,7 @@ function buildPaymentSuccessCard({ amountDisplay, cardDisplay, orderId }) {
   };
 }
 
-function buildRiskRejectCard({ amountDisplay, declinedCode, message, orderId }) {
+function buildRiskRejectCard({ amountDisplay, message, orderId }) {
   return {
     schema: "2.0",
     header: { title: { content: "🛡️ 风控规则触发：充值被拦截", tag: "plain_text" }, template: "red" },
@@ -329,7 +329,7 @@ function buildRiskRejectCard({ amountDisplay, declinedCode, message, orderId }) 
         content:
           `**充值金额**　${amountDisplay}\n` +
           `**风控状态**　<font color="red">已拦截</font>\n` +
-          `**触发规则**　<font color="red">${declinedCode || "风控规则"}</font>\n` +
+          `**触发原因**　<font color="red">${message || "风控规则触发"}</font>\n` +
           `**订单号**　${orderId || "N/A"}`,
       },
       { tag: "hr" },
@@ -1076,7 +1076,6 @@ Wait for the later async webhook to continue the merchant confirmation and origi
       const failCard = isRiskReject
         ? buildRiskRejectCard({
             amountDisplay,
-            declinedCode: cpr.declinedCode || cpr.code,
             message: cpr.message,
             orderId,
           })
