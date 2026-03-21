@@ -138,7 +138,7 @@ Exactly one layer owns each card. Do NOT duplicate card delivery across tool, we
 | Event | Owner | Required behavior |
 |---|---|---|
 | `initialize_wallet` + existing/new binding confirmation | agent/tool result | Send only the returned initialization card(s) |
-| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ 支付成功`; agent MUST NOT send another |
+| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ 支付成功` and trigger merchant confirmation in the same idempotent success path; agent MUST NOT send another or re-trigger merchant confirm |
 | `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ 支付失败` or `🛡️ 风控规则触发`; agent MUST NOT send another |
 | `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS 验证` card from the returned directive |
 | `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ 支付成功` only if it was not already sent |
@@ -199,7 +199,7 @@ When a user asks to top up / recharge any of the following merchants, you MUST a
    - If the result indicates `DIRECT_SEND`, do NOT send a duplicate payment card
    - If the result indicates `EXEC_REQUIRED`, execute it exactly once
    - If the result indicates `WAIT_FOR_WEBHOOK`, wait
-5. Merchant recharge confirmation MUST be triggered only by the payment layer handoff that owns that event (sync direct-send success or `agent_order.succeeded` webhook). Do NOT invent a second merchant-confirm step from agent memory.
+5. Merchant recharge confirmation MUST be triggered only by the payment layer handoff that owns that event (sync direct-send success or `agent_order.succeeded` webhook fallback). For sync `status=1`, payment-success card delivery and merchant-confirm handoff belong to the same idempotent success path. Do NOT invent a second merchant-confirm step from agent memory.
 6. After merchant recharge is confirmed (via the merchant confirmation tool, such as `check_recharge_status` for ModelMax): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
 
 ## Instructions & Workflows
@@ -243,8 +243,8 @@ When the user requests a recharge or another skill triggers an auto top-up:
    npx mcporter call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>"}'
    ```
 3. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
-4. **Webhook ownership rule:** Async webhook is the only fallback confirmation trigger for pending/3DS flows:
-   - `agent_order.succeeded` → Payment webhook may send `✅ 支付成功` if needed, then hand off merchant confirmation
+4. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
+   - `agent_order.succeeded` → Payment webhook may send `✅ 支付成功` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
    - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
    - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS 验证` card, then waits for webhook
 5. **Handle Failures:**

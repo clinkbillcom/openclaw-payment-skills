@@ -2,7 +2,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "crypto";
-import { execFileSync } from "child_process";
+import { execFileSync, spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
@@ -1035,32 +1035,113 @@ After sending the card, you may add a brief natural-language reply if helpful, b
         const sendResult = await withCardStateLock(orderId, 1, sessionId, async () => {
           const latestCache = normalizeCache(await readPaymentMethodsCache() || {});
           const latestState = getOrderCardState(latestCache, orderId, 1, sessionId);
-          if (latestState?.paymentSuccessCardSent) {
-            return 'already_sent';
+          if (!latestState?.paymentSuccessCardSent) {
+            if (!notifyTarget) {
+              throw new Error('notify target missing');
+            }
+            sendCardDirect(notifyTarget, successCard);
+            await updateOrderCardState(orderId, 1, sessionId, {
+              paymentSuccessCardSent: true,
+              paymentSuccessCardSentAt: new Date().toISOString(),
+              paymentSuccessCardSource: 'sync_charge_response',
+            });
           }
-          if (!notifyTarget) {
-            throw new Error('notify target missing');
+          if (latestState?.merchantConfirmationTriggered) {
+            return 'already_completed';
           }
-          sendCardDirect(notifyTarget, successCard);
-          await updateOrderCardState(orderId, 1, sessionId, {
-            paymentSuccessCardSent: true,
-            paymentSuccessCardSentAt: new Date().toISOString(),
-            paymentSuccessCardSource: 'sync_charge_response',
+
+          const effectiveMerchantContext = latestCache.pendingMerchantConfirmation;
+          if (!effectiveMerchantContext?.server || !effectiveMerchantContext?.tool) {
+            return 'completed';
+          }
+
+          const merchantArgs = effectiveMerchantContext.args && typeof effectiveMerchantContext.args === 'object'
+            ? JSON.parse(JSON.stringify(effectiveMerchantContext.args))
+            : {};
+          merchantArgs.order_id = orderId;
+          if (typeof sessionId === 'string' && sessionId.trim()) {
+            merchantArgs.session_id = sessionId.trim();
+          }
+          const notifyTargetId =
+            typeof effectiveMerchantContext.notifyTargetId === 'string' && effectiveMerchantContext.notifyTargetId.trim()
+              ? effectiveMerchantContext.notifyTargetId.trim()
+              : notifyTarget?.id || null;
+          const notifyTargetType = effectiveMerchantContext.notifyTargetType === 'open_id' ? 'open_id' : (notifyTarget?.flag === '--open-id' ? 'open_id' : 'chat_id');
+          if (notifyTargetId) {
+            if (notifyTargetType === 'open_id') {
+              merchantArgs.open_id = notifyTargetId;
+              delete merchantArgs.chat_id;
+            } else {
+              merchantArgs.chat_id = notifyTargetId;
+              delete merchantArgs.open_id;
+            }
+          }
+
+          const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
+          const cmd = [
+            'npx',
+            'mcporter',
+            'call',
+            effectiveMerchantContext.server,
+            effectiveMerchantContext.tool,
+            '--args',
+            JSON.stringify(merchantArgs),
+          ].map(shellQuote).join(' ');
+
+          await logRequest('clink_pay.sync_success.trigger_merchant_confirmation', {
+            context: effectiveMerchantContext,
+            args: merchantArgs,
           });
-          return 'sent';
+
+          try {
+            const child = spawn(cmd, [], {
+              detached: true,
+              stdio: 'ignore',
+              shell: true,
+            });
+            child.on('error', (err) => {
+              logError('clink_pay.sync_success.trigger_merchant_confirmation.spawn', err);
+            });
+            child.unref();
+          } catch (err) {
+            await logError('clink_pay.sync_success.trigger_merchant_confirmation', err);
+            return 'trigger_failed';
+          }
+
+          await updateOrderCardState(orderId, 1, sessionId, {
+            merchantConfirmationTriggered: true,
+            merchantConfirmationTriggeredAt: new Date().toISOString(),
+            merchantConfirmationTriggerSource: 'sync_charge_response',
+          });
+          const cacheAfterTrigger = normalizeCache(await readPaymentMethodsCache() || {});
+          if (cacheAfterTrigger.pendingMerchantConfirmation) {
+            delete cacheAfterTrigger.pendingMerchantConfirmation;
+            await writePaymentMethodsCache(cacheAfterTrigger);
+          }
+          return 'completed';
         });
-        if (sendResult === 'already_sent') {
+
+        if (sendResult === 'trigger_failed') {
+          return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+The payment success card has already been sent to the user.
+Immediate merchant recharge confirmation handoff failed in the background.
+Do NOT send any additional card in this turn.
+Do NOT invoke the merchant-side recharge-status checker again in this turn.
+Wait for the later async webhook to retry the merchant confirmation and original-task resume flow.`;
+        }
+
+        if (sendResult === 'already_completed') {
           return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
 The payment success card was already sent earlier.
+The merchant recharge confirmation handoff was already triggered earlier.
 Do NOT send any additional card in this turn.
-Do NOT invoke the merchant-side recharge-status checker in this turn.
-Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
+Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
         }
+
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
 The payment success card has already been sent to the user.
 Do NOT send any additional card in this turn.
-Do NOT invoke the merchant-side recharge-status checker in this turn.
-Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
+Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
       } catch (sendErr) {
         await logError('clink_pay/sync_success_card', sendErr);
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
@@ -1129,7 +1210,7 @@ Do NOT send any intermediate "处理中" Feishu card to the user for this state.
 Do not send any extra card in this turn. A brief natural-language reply is fine if helpful.
 Do NOT ask the user any question.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
-The merchant-side recharge confirmation and original-task resume must happen only after the later async webhook wake for payment/agent_order.succeeded arrives.`;
+The merchant-side recharge confirmation and original-task resume must be driven by the payment-layer success handoff that owns this order. For pending / 3DS flows, wait for the later async webhook wake for payment/agent_order.succeeded.`;
   } catch (err) {
     await logError('clink_pay', err);
     const code = err instanceof ClinkApiError ? err.code : null;

@@ -502,28 +502,51 @@ After sending the card, you may add a brief natural-language reply if helpful, b
       const successSendResult = await withCardStateLock(rawOrderId, 1, sessionId, async () => {
         const latestCache = await readCache();
         const latestState = getOrderCardState(latestCache, rawOrderId, 1, sessionId);
-        if (latestState?.paymentSuccessCardSent) {
-          return 'already_sent';
+        if (!latestState?.paymentSuccessCardSent) {
+          const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
+          if (!sent) {
+            return 'send_failed';
+          }
+          await updateOrderCardState(rawOrderId, 1, sessionId, {
+            paymentSuccessCardSent: true,
+            paymentSuccessCardSentAt: new Date().toISOString(),
+            paymentSuccessCardSource: 'webhook',
+          });
         }
-        const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
-        if (!sent) {
-          return 'send_failed';
+        if (latestState?.merchantConfirmationTriggered) {
+          return 'already_completed';
+        }
+
+        const effectiveMerchantContext = latestCache.pendingMerchantConfirmation || merchantContext;
+        const effectiveMerchantArgs = effectiveMerchantContext
+          ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, effectiveMerchantContext)
+          : null;
+        if (!effectiveMerchantContext) {
+          return 'completed';
+        }
+        const triggered = await triggerMerchantConfirmation(effectiveMerchantContext, effectiveMerchantArgs);
+        if (!triggered) {
+          return {
+            kind: 'trigger_failed',
+            merchantContext: effectiveMerchantContext,
+            merchantArgs: effectiveMerchantArgs,
+          };
         }
         await updateOrderCardState(rawOrderId, 1, sessionId, {
-          paymentSuccessCardSent: true,
-          paymentSuccessCardSentAt: new Date().toISOString(),
-          paymentSuccessCardSource: 'webhook',
+          merchantConfirmationTriggered: true,
+          merchantConfirmationTriggeredAt: new Date().toISOString(),
+          merchantConfirmationTriggerSource: 'webhook',
         });
-        return 'sent';
+        await clearPendingMerchantConfirmation();
+        return 'completed';
       });
 
-      if (successSendResult === 'already_sent') {
-        if (!merchantContext) {
-          return null;
-        }
-        const triggered = await triggerMerchantConfirmation(merchantContext, merchantArgs);
-        if (triggered) {
-          await clearPendingMerchantConfirmation();
+      if (successSendResult === 'already_completed' || successSendResult === 'completed') {
+        return null;
+      }
+
+      if (successSendResult?.kind === 'trigger_failed') {
+        if (!successSendResult.merchantContext) {
           return null;
         }
         return {
@@ -540,40 +563,7 @@ Session ID: ${sessionDisplay}
 
 [SYSTEM DIRECTIVE] The payment success card was already sent earlier. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
 \`\`\`
-${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
-\`\`\`
-
-Rules:
-1. Do NOT send the payment success card again.
-2. Do NOT ask the user any question.
-          3. After the merchant confirms recharge, let the merchant skill continue its own success/failure and task-resume flow.`
-        };
-      }
-
-      if (successSendResult === 'sent') {
-        if (!merchantContext) {
-          return null;
-        }
-        const triggered = await triggerMerchantConfirmation(merchantContext, merchantArgs);
-        if (triggered) {
-          await clearPendingMerchantConfirmation();
-          return null;
-        }
-        return {
-          kind: "wake",
-          mode: "now",
-          text: `[Clink Webhook] 支付成功回调（扣款完成，等待商户到账确认）。
-
-事件: agent_order.succeeded
-订单 ID: ${orderId}
-金额: ${amt}
-支付方式: ${card}
-客户 ID: ${customerId}
-Session ID: ${sessionDisplay}
-
-[SYSTEM DIRECTIVE] The payment success card has already been sent to the user. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
-\`\`\`
-${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
+${buildMerchantConfirmCommand(successSendResult.merchantContext, successSendResult.merchantArgs)}
 \`\`\`
 
 Rules:
