@@ -26,6 +26,10 @@ const LOG_PATH = path.join(SKILL_DIR, 'error.log');
 const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = `${SKILL_DIR}/scripts/send-message.mjs`;
+const {
+  createNotification,
+  renderNotificationMarkdown,
+} = require(`${SKILL_DIR}/notification-utils.cjs`);
 
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
@@ -276,6 +280,9 @@ function buildNotificationPayload(notification, destination = _notifyDestination
     },
     deliver: true,
   };
+  if (notification?.notification && typeof notification.notification === 'object' && !Array.isArray(notification.notification)) {
+    payload.notification = JSON.parse(JSON.stringify(notification.notification));
+  }
   if (notification?.card) {
     payload.card = notification.card;
   }
@@ -283,11 +290,6 @@ function buildNotificationPayload(notification, destination = _notifyDestination
     payload.text = notification.text.trim();
   }
   return payload;
-}
-
-function notificationExec(notification, destination = _notifyDestination) {
-  const payload = buildNotificationPayload(notification, destination);
-  return `exec: node ${MESSAGE_SENDER} --payload ${shellQuote(JSON.stringify(payload))}`;
 }
 
 function sendNotificationDirect(notification, destination = _notifyDestination) {
@@ -307,10 +309,41 @@ function sendNotificationDirect(notification, destination = _notifyDestination) 
   );
 }
 
+function formatNotificationInstruction(summary, notifications, followUp = []) {
+  const items = Array.isArray(notifications) ? notifications.filter(Boolean) : [notifications].filter(Boolean);
+  const sections = [`[SYSTEM DIRECTIVE] ${summary}`];
+
+  if (items.length > 0) {
+    sections.push(
+      items.length === 1
+        ? 'Send the following user-facing message in Markdown:'
+        : 'Send the following user-facing messages in Markdown, in order:',
+    );
+    sections.push(
+      items
+        .map((notification, index) => {
+          const body = renderNotificationMarkdown(notification);
+          if (items.length === 1) return body;
+          return `Notification ${index + 1}:\n${body}`;
+        })
+        .join('\n\n'),
+    );
+  }
+
+  const normalizedFollowUp = Array.isArray(followUp)
+    ? followUp.map((line) => String(line || '').trim()).filter(Boolean)
+    : [];
+  if (normalizedFollowUp.length > 0) {
+    sections.push(normalizedFollowUp.join('\n'));
+  }
+
+  return sections.join('\n\n');
+}
+
 async function sendCardsDirect(context, cards) {
   try {
     for (const card of cards) {
-      sendNotificationDirect({ card });
+      sendNotificationDirect({ notification: card });
     }
     return true;
   } catch (err) {
@@ -440,32 +473,30 @@ module.exports = async function(ctx) {
         await writeCache(cache);
       } catch (err) { await logError('payment_method.added cache update', err); }
 
-      const successCard = {
-        schema: "2.0",
-        header: { title: { content: "✅ 支付方式绑定成功", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**绑定支付方式**　<font color="green">${cardDisplay}</font>\n**邮箱**　　　　　${email}` }
-        ]}
-      };
+      const successCard = createNotification({
+        title: "✅ 支付方式绑定成功",
+        theme: "green",
+        details: [
+          ["绑定支付方式", cardDisplay],
+          ["邮箱", email],
+        ],
+      });
 
-      const completeCard = {
-        schema: "2.0",
-        header: { title: { content: "🎉 Clink 初始化完成！", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**绑定支付方式**　<font color="green">${cardDisplay} ✓</font>\n**规则状态**　　　<font color="green">已生效</font>` },
-          { tag: "hr" },
-          { tag: "markdown", content: "你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。如需修改支付方式，请告知我。" }
-        ]}
-      };
+      const completeCard = createNotification({
+        title: "🎉 Clink 初始化完成！",
+        theme: "green",
+        details: [
+          ["绑定支付方式", `${cardDisplay} ✓`],
+          ["规则状态", "已生效"],
+        ],
+        paragraphs: ["你现在可以部署自动充值任务。风控规则可选，可随时通过「查看风控规则」配置。如需修改支付方式，请告知我。"],
+      });
 
       const cardsToSend = shouldSendCompleteCard ? [successCard, completeCard] : [successCard];
       const sent = await sendCardsDirect('payment_method.added', cardsToSend);
       if (sent) {
         return null;
       }
-
-      const exec1 = notificationExec({ card: successCard });
-      const exec2 = shouldSendCompleteCard ? notificationExec({ card: completeCard }) : null;
 
       return {
         kind: "agent",
@@ -479,16 +510,13 @@ module.exports = async function(ctx) {
 卡片: ${cardDisplay}
 状态: ${data.status || "active"}
 
-[SYSTEM DIRECTIVE] The user has successfully bound a new payment method.${shouldSendCompleteCard ? " Initialization is now complete." : ""}
-YOU MUST send ${shouldSendCompleteCard ? "TWO" : "ONE"} user notification${shouldSendCompleteCard ? "s" : ""} in order:
-
-Notification 1:
-${exec1}
-
-${exec2 ? `Notification 2:
-${exec2}
-
-` : ""}After sending ${shouldSendCompleteCard ? "both notifications" : "the notification"}, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  `The user has successfully bound a new payment method.${shouldSendCompleteCard ? " Initialization is now complete." : ""}`,
+  shouldSendCompleteCard ? [successCard, completeCard] : successCard,
+  [
+    `After sending ${shouldSendCompleteCard ? "both notifications" : "the notification"}, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`,
+  ],
+)}`
       };
     }
 
@@ -512,15 +540,15 @@ ${exec2}
         await writeCache(cache);
       } catch (err) { await logError('payment_method.default_change cache update', err); }
 
-      const updateCard = {
-        schema: "2.0",
-        header: { title: { content: "✅ 默认支付方式已更新", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**当前默认卡**　<font color="green">${cardDisplay}</font>\n**支付方式 ID**　${data.paymentInstrumentId || "N/A"}` },
-          { tag: "hr" },
-          { tag: "markdown", content: "后续付款将优先使用这张卡。如需继续之前失败的支付，请直接告诉我重新发起。" }
-        ]}
-      };
+      const updateCard = createNotification({
+        title: "✅ 默认支付方式已更新",
+        theme: "green",
+        details: [
+          ["当前默认卡", cardDisplay],
+          ["支付方式 ID", data.paymentInstrumentId || "N/A"],
+        ],
+        paragraphs: ["后续付款将优先使用这张卡。如需继续之前失败的支付，请直接告诉我重新发起。"],
+      });
 
       const sent = await sendCardsDirect('payment_method.default_change', [updateCard]);
       if (sent) {
@@ -537,10 +565,11 @@ ${exec2}
 新默认卡: ${cardDisplay}
 支付方式 ID: ${data.paymentInstrumentId || "N/A"}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: updateCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Direct webhook notification delivery failed.',
+  updateCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
     }
 
@@ -560,15 +589,16 @@ After sending the notification, you may add a brief natural-language reply if he
       const customerId = data.customerId || "N/A";
       const sessionId = data.sessionId || data.session_id || null;
       const sessionDisplay = sessionId || "无";
-      const pendingCard = {
-        schema: "2.0",
-        header: { title: { content: "✅ 支付成功", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**支付金额**　${amt}\n**扣款方式**　${card}\n**Clink 订单号**　${orderId}` },
-          { tag: "hr" },
-          { tag: "markdown", content: "已完成扣款，正在等待商户确认到账…" }
-        ]}
-      };
+      const pendingCard = createNotification({
+        title: "✅ 支付成功",
+        theme: "green",
+        details: [
+          ["支付金额", amt],
+          ["扣款方式", card],
+          ["Clink 订单号", orderId],
+        ],
+        paragraphs: ["已完成扣款，正在等待商户确认到账…"],
+      });
 
       const merchantContext = cache.pendingMerchantConfirmation || null;
       const merchantArgs = merchantContext
@@ -662,10 +692,11 @@ Rules:
 客户 ID: ${customerId}
 Session ID: ${sessionDisplay}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: pendingCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Direct webhook notification delivery failed.',
+  pendingCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
       }
 
@@ -681,9 +712,11 @@ After sending the notification, you may add a brief natural-language reply if he
 客户 ID: ${customerId}
 Session ID: ${sessionDisplay}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately do these steps in order:
-1. Send this user notification:
-${notificationExec({ card: pendingCard })}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. Do these steps in order:
+1. Send the following user-facing message in Markdown:
+
+${renderNotificationMarkdown(pendingCard)}
+
 2. Immediately notify the pending merchant skill with this exact command:
 \`\`\`
 ${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
@@ -707,17 +740,21 @@ After sending the notification, you may add a brief natural-language reply if he
       const failureReason = data.failureMessage || failureCode || "支付处理异常";
       const isCharged = status === "charged" || status === "paid";
       const title = isCharged ? "❌ 支付异常" : "❌ 支付失败";
-      const failCard = {
-        schema: "2.0",
-        header: { title: { content: title, tag: "plain_text" }, template: "red" },
-        body: { elements: [
-          { tag: "markdown", content: `**支付金额**　${amt}\n**支付状态**　<font color="${isCharged ? "orange" : "red"}">${isCharged ? "已扣款，等待人工处理" : "扣款失败"}</font>\n**失败原因**　<font color="red">${failureReason}</font>\n**订单号**　${orderId}` },
-          { tag: "hr" },
-          { tag: "markdown", content: isCharged
-              ? "支付网关侧已记录扣款异常，请携带以上订单号联系商户支持继续处理。"
-              : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。" }
-        ]}
-      };
+      const failCard = createNotification({
+        title,
+        theme: "red",
+        details: [
+          ["支付金额", amt],
+          ["支付状态", isCharged ? "已扣款，等待人工处理" : "扣款失败"],
+          ["失败原因", failureReason],
+          ["订单号", orderId],
+        ],
+        paragraphs: [
+          isCharged
+            ? "支付网关侧已记录扣款异常，请携带以上订单号联系商户支持继续处理。"
+            : "银行卡扣款失败，请检查卡片状态或更换支付方式后重试。如需更换支付方式，请告知我。",
+        ],
+      });
       const failureSendResult = await withCardStateLock(rawOrderId, normalizedStatus, sessionId, async () => {
         const latestCache = await readCache();
         const latestState = getOrderCardState(latestCache, rawOrderId, normalizedStatus, sessionId);
@@ -758,10 +795,11 @@ After sending the notification, you may add a brief natural-language reply if he
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: failCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Direct webhook notification delivery failed.',
+  failCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
     }
 
@@ -774,15 +812,22 @@ After sending the notification, you may add a brief natural-language reply if he
       const eventName = type;
       const isApproved = type === "agent_refund.approved";
 
-      const refundCard = {
-        schema: "2.0",
-        header: { title: { content: isApproved ? "✅ 退款已通过" : "✅ 退款成功", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**退款状态**　<font color="green">成功</font>` },
-          { tag: "hr" },
-          { tag: "markdown", content: isApproved ? "退款申请已审核通过，资金将按发卡行或支付渠道的到账时效原路退回。" : "退款申请已处理成功，资金将按发卡行或支付渠道的到账时效原路退回。" }
-        ]}
-      };
+      const refundCard = createNotification({
+        title: isApproved ? "✅ 退款已通过" : "✅ 退款成功",
+        theme: "green",
+        details: [
+          ["退款金额", amt],
+          ["原订单号", orderId],
+          ["退款单号", refundId],
+          ["退款方式", card],
+          ["退款状态", "成功"],
+        ],
+        paragraphs: [
+          isApproved
+            ? "退款申请已审核通过，资金将按发卡行或支付渠道的到账时效原路退回。"
+            : "退款申请已处理成功，资金将按发卡行或支付渠道的到账时效原路退回。",
+        ],
+      });
 
       const sent = await sendCardsDirect(eventName, [refundCard]);
       if (sent) {
@@ -801,10 +846,11 @@ After sending the notification, you may add a brief natural-language reply if he
 退款方式: ${card}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: refundCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Direct webhook notification delivery failed.',
+  refundCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
     }
 
@@ -819,15 +865,22 @@ After sending the notification, you may add a brief natural-language reply if he
       const eventName = type;
       const isRejected = type === "agent_refund.rejected";
 
-      const refundFailCard = {
-        schema: "2.0",
-        header: { title: { content: isRejected ? "❌ 退款已拒绝" : "❌ 退款失败", tag: "plain_text" }, template: "red" },
-        body: { elements: [
-          { tag: "markdown", content: `**退款金额**　${amt}\n**原订单号**　${orderId}\n**退款单号**　${refundId}\n**退款方式**　${card}\n**失败原因**　<font color="red">${failureReason}</font>` },
-          { tag: "hr" },
-          { tag: "markdown", content: isRejected ? "退款申请未通过审核，请根据失败原因调整后再试或联系 Clink 支持排查。" : "退款申请未能成功处理，请稍后重试或联系 Clink 支持排查。" }
-        ]}
-      };
+      const refundFailCard = createNotification({
+        title: isRejected ? "❌ 退款已拒绝" : "❌ 退款失败",
+        theme: "red",
+        details: [
+          ["退款金额", amt],
+          ["原订单号", orderId],
+          ["退款单号", refundId],
+          ["退款方式", card],
+          ["失败原因", failureReason],
+        ],
+        paragraphs: [
+          isRejected
+            ? "退款申请未通过审核，请根据失败原因调整后再试或联系 Clink 支持排查。"
+            : "退款申请未能成功处理，请稍后重试或联系 Clink 支持排查。",
+        ],
+      });
 
       const sent = await sendCardsDirect(eventName, [refundFailCard]);
       if (sent) {
@@ -847,10 +900,11 @@ After sending the notification, you may add a brief natural-language reply if he
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: refundFailCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Direct webhook notification delivery failed.',
+  refundFailCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
     }
 
@@ -862,15 +916,17 @@ After sending the notification, you may add a brief natural-language reply if he
         await writeCache(cache);
       } catch (err) { await logError('risk_rule.updated cache update', err); }
 
-      const riskCard = {
-        schema: "2.0",
-        header: { title: { content: "🛡️ 风控规则已生效", tag: "plain_text" }, template: "green" },
-        body: { elements: [
-          { tag: "markdown", content: `**单次上限**　${data.singleRechargeLimit ?? "N/A"}\n**每日总额**　${data.dailyTotalLimit ?? "N/A"}\n**每日次数**　${data.dailyMaxCount ?? "N/A"} 次\n**充值间隔**　${data.rechargeInterval ?? "N/A"}` },
-          { tag: "hr" },
-          { tag: "markdown", content: "风控规则已同步生效，后续充值将按此规则执行。" }
-        ]}
-      };
+      const riskCard = createNotification({
+        title: "🛡️ 风控规则已生效",
+        theme: "green",
+        details: [
+          ["单次上限", data.singleRechargeLimit ?? "N/A"],
+          ["每日总额", data.dailyTotalLimit ?? "N/A"],
+          ["每日次数", `${data.dailyMaxCount ?? "N/A"} 次`],
+          ["充值间隔", data.rechargeInterval ?? "N/A"],
+        ],
+        paragraphs: ["风控规则已同步生效，后续充值将按此规则执行。"],
+      });
 
       const sent = await sendCardsDirect('risk_rule.updated', [riskCard]);
       if (sent) {
@@ -890,11 +946,11 @@ After sending the notification, you may add a brief natural-language reply if he
 手动审批阈值: ${data.manualApprovalThreshold ?? "N/A"}
 更新时间: ${data.updatedAt ?? "N/A"}
 
-[SYSTEM DIRECTIVE] Risk rules have been updated and saved to local cache.
-Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
-${notificationExec({ card: riskCard })}
-
-After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
+${formatNotificationInstruction(
+  'Risk rules have been updated and saved to local cache. Direct webhook notification delivery failed.',
+  riskCard,
+  ['After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.'],
+)}`
       };
     }
 

@@ -89,29 +89,27 @@ This skill provides any compatible AI agent with the ability to manage payments 
 This skill includes a unified notification sender:
 
 ```bash
-# Feishu card payload
-node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"feishu","target":{"type":"chat_id","id":"oc_xxx"},"card":{"schema":"2.0","header":{"title":{"content":"Title","tag":"plain_text"},"template":"green"},"body":{"elements":[]}}}'
+# Channel-neutral notification payload
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"feishu","target":{"type":"chat_id","id":"oc_xxx"},"notification":{"title":"Title","theme":"green","details":[["Key","Value"]],"paragraphs":["Description text"],"actions":[{"label":"Open","url":"https://example.com"}]}}'
 
 # Equivalent markdown/text notification for another channel
-node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"telegram","target":{"type":"target_id","id":"12345"},"text":"Notification text"}'
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"telegram","target":{"type":"target_id","id":"12345"},"notification":{"title":"Title","theme":"green","details":[["Key","Value"]],"paragraphs":["Description text"],"actions":[{"label":"Open","url":"https://example.com"}]}}'
 ```
 
 Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/skills/agent-payment-skills`).
 
-When the current channel supports structured cards, you may include a Feishu schema v2 card payload:
+Preferred notification schema:
 ```json
 {
-  "schema": "2.0",
-  "header": { "title": { "content": "Title", "tag": "plain_text" }, "template": "green" },
-  "body": {
-    "elements": [
-      { "tag": "markdown", "content": "**Key** Value" },
-      { "tag": "hr" },
-      { "tag": "markdown", "content": "Description text" }
-    ]
-  }
+  "title": "Title",
+  "theme": "green",
+  "details": [["Key", "Value"]],
+  "paragraphs": ["Description text"],
+  "actions": [{ "label": "Open", "url": "https://example.com" }]
 }
 ```
+
+The sender renders this neutral payload into a Feishu card for Feishu and Markdown/text for other channels.
 
 For non-Feishu channels, `send-message.mjs` renders the card to markdown/text and delivers it through the gateway.
 

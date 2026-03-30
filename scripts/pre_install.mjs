@@ -25,6 +25,7 @@ import os from 'os';
 import crypto from 'crypto';
 import { execFileSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { createNotification } from '../notification-utils.js';
 
 function resolveOpenClawHome() {
   const explicitHome = typeof process.env.OPENCLAW_HOME === 'string' ? process.env.OPENCLAW_HOME.trim() : '';
@@ -41,7 +42,6 @@ const CONFIG_PATH = path.join(OPENCLAW_DIR, 'openclaw.json');
 const MCPORTER_CONFIG_PATH = path.join(OPENCLAW_DIR, 'config', 'mcporter.json');
 const BUNDLE = path.join(SKILL_DIR, 'index.bundle.mjs');
 const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
-const AUTH_CARD = path.join(SKILL_DIR, 'cards', 'auth_request.json');
 
 // --- Parse args ---
 const args = process.argv.slice(2);
@@ -95,6 +95,9 @@ function buildNotificationPayload(notifyDestination, notification) {
     target: notifyDestination.target,
     deliver: true,
   };
+  if (notification?.notification && typeof notification.notification === 'object' && !Array.isArray(notification.notification)) {
+    payload.notification = JSON.parse(JSON.stringify(notification.notification));
+  }
   if (notification?.card) {
     payload.card = notification.card;
   }
@@ -102,10 +105,6 @@ function buildNotificationPayload(notifyDestination, notification) {
     payload.text = notification.text.trim();
   }
   return payload;
-}
-
-async function loadCard(cardPath) {
-  return JSON.parse(await fs.readFile(cardPath, 'utf8'));
 }
 
 async function renderWebhookModule(skillDir) {
@@ -212,16 +211,18 @@ try {
 } catch {}
 
 const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_notify.mjs');
-const postRestartCard = {
-  schema: '2.0',
-  header: { title: { content: '✅ Clink 支付组件已上线', tag: 'plain_text' }, template: 'green' },
-  body: { elements: [
-    { tag: 'markdown', content: `**Webhook 路由**　<font color="green">已就绪 ✓</font>\n**网关状态**　　<font color="green">重启完毕 ✓</font>` },
-    { tag: 'hr' },
-    { tag: 'markdown', content: `🔐 **最后一步：钱包初始化**\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\n\n如需继续使用之前的邮箱：\n\`\`\`\n${userEmail}\n\`\`\`` : ''}` }
-  ]}
-};
-const postRestartPayload = buildNotificationPayload(notifyDestination, { card: postRestartCard });
+const postRestartNotification = createNotification({
+  title: '✅ Clink 支付组件已上线',
+  theme: 'green',
+  details: [
+    ['Webhook 路由', '已就绪 ✓'],
+    ['网关状态', '重启完毕 ✓'],
+  ],
+  paragraphs: [
+    `最后一步：钱包初始化\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\n\n如需继续使用之前的邮箱：\n\`\`\`\n${userEmail}\n\`\`\`` : ''}`,
+  ],
+});
+const postRestartPayload = buildNotificationPayload(notifyDestination, { notification: postRestartNotification });
 
 const notifyCode = `
 import { execFileSync, execSync } from 'child_process';
@@ -278,8 +279,18 @@ console.log('  ✅ Notify process spawned');
 // --- Step 5: Send status notification ---
 console.log('Step 5: Sending status notification...');
 try {
-  const authCard = await loadCard(AUTH_CARD);
-  const authPayload = buildNotificationPayload(notifyDestination, { card: authCard });
+  const authPayload = buildNotificationPayload(notifyDestination, {
+    notification: createNotification({
+      title: '🔌 安装 Clink Payment Skill',
+      theme: 'blue',
+      details: [
+        ['注册 Webhook 回调路由', '已完成 ✓'],
+        ['写入网关配置文件', '已完成 ✓'],
+        ['重启网关进程', '正在重启…'],
+      ],
+      paragraphs: ['网关重启完成后将自动发送下一步提示。'],
+    }),
+  });
   execFileSync(process.execPath, [MESSAGE_SENDER, '--payload', JSON.stringify(authPayload)], { stdio: 'inherit' });
   console.log('  ✅ Status notification sent');
 } catch (e) {

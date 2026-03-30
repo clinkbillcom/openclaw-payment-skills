@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from 'child_process';
 import path from 'path';
+import { renderNotificationFeishuCard, renderNotificationMarkdown } from '../notification-utils.js';
 
 const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const FEISHU_CARD_SENDER = path.join(SCRIPT_DIR, 'send-feishu-card.mjs');
@@ -168,6 +169,13 @@ function buildSimpleFeishuCard(text) {
   };
 }
 
+function resolveNotification(payload) {
+  if (payload.notification && typeof payload.notification === 'object' && !Array.isArray(payload.notification)) {
+    return payload.notification;
+  }
+  return null;
+}
+
 function normalizeTarget(payload) {
   const channel = typeof payload.channel === 'string' && payload.channel.trim()
     ? payload.channel.trim().toLowerCase()
@@ -202,9 +210,12 @@ function sendFeishuCard(payload) {
 }
 
 function sendFeishuText(payload) {
-  const text = typeof payload.text === 'string' && payload.text.trim()
-    ? payload.text.trim()
-    : renderCardToMarkdown(payload.card);
+  const notification = resolveNotification(payload);
+  const text = notification
+    ? renderNotificationMarkdown(notification)
+    : typeof payload.text === 'string' && payload.text.trim()
+      ? payload.text.trim()
+      : renderCardToMarkdown(payload.card);
   if (!text) {
     throw new Error('No text content available for Feishu delivery');
   }
@@ -219,9 +230,12 @@ function sendViaOpenClawMessage(payload) {
   if (channel === 'feishu') {
     throw new Error('Feishu delivery must use the Feishu adapters');
   }
-  const text = typeof payload.text === 'string' && payload.text.trim()
-    ? payload.text.trim()
-    : renderCardToMarkdown(payload.card);
+  const notification = resolveNotification(payload);
+  const text = notification
+    ? renderNotificationMarkdown(notification)
+    : typeof payload.text === 'string' && payload.text.trim()
+      ? payload.text.trim()
+      : renderCardToMarkdown(payload.card);
   if (!text) {
     throw new Error('No text content available for delivery');
   }
@@ -246,6 +260,18 @@ async function main() {
     throw new Error('agent-payment-skills notifications do not support media delivery');
   }
   const channel = typeof payload.channel === 'string' ? payload.channel.trim().toLowerCase() : '';
+  const notification = resolveNotification(payload);
+  if (notification && channel === 'feishu') {
+    sendFeishuCard({
+      ...payload,
+      card: renderNotificationFeishuCard(notification),
+    });
+    return;
+  }
+  if (notification) {
+    sendViaOpenClawMessage(payload);
+    return;
+  }
   if ((payload.card || payload.text) && channel === 'feishu' && payload.card) {
     sendFeishuCard(payload);
     return;
