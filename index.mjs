@@ -11,8 +11,20 @@ import https from "https";
 // ------------------------------------------------------------------
 // CONFIG HELPERS
 // ------------------------------------------------------------------
+function resolveOpenClawHome() {
+  const explicitHome = typeof process.env.OPENCLAW_HOME === 'string' ? process.env.OPENCLAW_HOME.trim() : '';
+  if (explicitHome && explicitHome !== 'undefined') {
+    return explicitHome;
+  }
+  return os.homedir();
+}
+
+const OPENCLAW_HOME = resolveOpenClawHome();
+const OPENCLAW_DIR = path.join(OPENCLAW_HOME, '.openclaw');
+const MCPORTER_CONFIG_PATH = path.join(OPENCLAW_DIR, 'config', 'mcporter.json');
+
 async function getConfigPath() {
-  return process.env.OPENCLAW_CONFIG_PATH || path.join(os.homedir(), '.openclaw', 'openclaw.json');
+  return process.env.OPENCLAW_CONFIG_PATH || path.join(OPENCLAW_DIR, 'openclaw.json');
 }
 
 async function loadConfig() {
@@ -62,13 +74,18 @@ async function updatePaymentEnv(updates) {
 // ------------------------------------------------------------------
 // PAYMENT METHODS CACHE HELPERS
 // ------------------------------------------------------------------
-const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
+const SKILL_DIR = path.dirname(new URL(import.meta.url).pathname);
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
 const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
-const RUNTIME_SKILL_DIR = path.dirname(new URL(import.meta.url).pathname);
-const CARD_SENDER = path.join(RUNTIME_SKILL_DIR, 'scripts', 'send-feishu-card.mjs');
+const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
+
+async function renderWebhookModule(skillDir) {
+  const webhookTemplatePath = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
+  const webhookSource = await fs.readFile(webhookTemplatePath, 'utf8');
+  return webhookSource.split('__AGENT_PAYMENT_SKILL_DIR__').join(JSON.stringify(skillDir));
+}
 
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
@@ -76,6 +93,61 @@ function normalizeCache(cache) {
   if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
+  }
+  if (
+    normalized.notifyDestination &&
+    typeof normalized.notifyDestination === 'object' &&
+    !Array.isArray(normalized.notifyDestination) &&
+    typeof normalized.notifyDestination.channel === 'string' &&
+    normalized.notifyDestination.channel.trim() &&
+    normalized.notifyDestination.target &&
+    typeof normalized.notifyDestination.target === 'object' &&
+    !Array.isArray(normalized.notifyDestination.target) &&
+    typeof normalized.notifyDestination.target.id === 'string' &&
+    normalized.notifyDestination.target.id.trim() &&
+    typeof normalized.notifyDestination.target.type === 'string' &&
+    normalized.notifyDestination.target.type.trim()
+  ) {
+    normalized.notifyDestination = {
+      channel: normalized.notifyDestination.channel.trim().toLowerCase(),
+      target: {
+        type: normalized.notifyDestination.target.type.trim(),
+        id: normalized.notifyDestination.target.id.trim(),
+      },
+    };
+  } else {
+    normalized.notifyDestination = null;
+  }
+  if (
+    normalized.pendingMerchantConfirmation &&
+    typeof normalized.pendingMerchantConfirmation === 'object' &&
+    !Array.isArray(normalized.pendingMerchantConfirmation)
+  ) {
+    const pending = normalized.pendingMerchantConfirmation;
+    if (
+      pending.notifyDestination &&
+      typeof pending.notifyDestination === 'object' &&
+      !Array.isArray(pending.notifyDestination) &&
+      typeof pending.notifyDestination.channel === 'string' &&
+      pending.notifyDestination.channel.trim() &&
+      pending.notifyDestination.target &&
+      typeof pending.notifyDestination.target === 'object' &&
+      !Array.isArray(pending.notifyDestination.target) &&
+      typeof pending.notifyDestination.target.id === 'string' &&
+      pending.notifyDestination.target.id.trim() &&
+      typeof pending.notifyDestination.target.type === 'string' &&
+      pending.notifyDestination.target.type.trim()
+    ) {
+      pending.notifyDestination = {
+        channel: pending.notifyDestination.channel.trim().toLowerCase(),
+        target: {
+          type: pending.notifyDestination.target.type.trim(),
+          id: pending.notifyDestination.target.id.trim(),
+        },
+      };
+    } else {
+      pending.notifyDestination = null;
+    }
   }
   return normalized;
 }
@@ -207,20 +279,55 @@ async function updateOrderCardState(orderId, status, sessionId, patch) {
   return nextState;
 }
 
-function getNotifyTarget(cache) {
-  if (typeof cache?.notifyTargetId !== 'string' || !cache.notifyTargetId.trim()) {
+function getNotifyDestination(cache) {
+  if (!cache?.notifyDestination) {
     return null;
   }
-  return {
-    flag: cache.notifyTargetType === 'open_id' ? '--open-id' : '--chat-id',
-    id: cache.notifyTargetId.trim(),
-  };
+  return cloneJsonValue(cache.notifyDestination);
 }
 
-function sendCardDirect(target, cardObj) {
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+function buildNotificationPayload(notifyDestination, notification) {
+  const channel = typeof notifyDestination?.channel === 'string' && notifyDestination.channel.trim()
+    ? notifyDestination.channel.trim().toLowerCase()
+    : '';
+  const targetType = typeof notifyDestination?.target?.type === 'string' && notifyDestination.target.type.trim()
+    ? notifyDestination.target.type.trim()
+    : '';
+  const targetId = typeof notifyDestination?.target?.id === 'string' && notifyDestination.target.id.trim()
+    ? notifyDestination.target.id.trim()
+    : '';
+  if (!channel || !targetType || !targetId) {
+    throw new Error('notify destination must include channel, target.type, and target.id');
+  }
+  const payload = {
+    channel,
+    target: {
+      type: targetType,
+      id: targetId,
+    },
+    deliver: true,
+  };
+  if (notification?.card) {
+    payload.card = notification.card;
+  }
+  if (typeof notification?.text === 'string' && notification.text.trim()) {
+    payload.text = notification.text.trim();
+  }
+  return payload;
+}
+
+function sendNotificationDirect(notifyDestination, notification) {
+  const payload = buildNotificationPayload(notifyDestination, notification);
+  if (!payload.target?.id) {
+    throw new Error('notify target missing');
+  }
   execFileSync(
     process.execPath,
-    [CARD_SENDER, '--json', JSON.stringify(cardObj), target.flag, target.id],
+    [MESSAGE_SENDER, '--payload', JSON.stringify(payload)],
     {
       encoding: 'utf8',
       stdio: 'pipe',
@@ -229,24 +336,113 @@ function sendCardDirect(target, cardObj) {
   );
 }
 
-async function savePendingMerchantConfirmation(args) {
-  if (!args.merchant_confirm_server || !args.merchant_confirm_tool) {
-    return;
+function cloneJsonValue(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function parseNotifyDestinationArgs(args) {
+  const channel = typeof args?.channel === 'string' && args.channel.trim()
+    ? args.channel.trim().toLowerCase()
+    : '';
+  const chatId = typeof args?.chat_id === 'string' && args.chat_id.trim()
+    ? args.chat_id.trim()
+    : '';
+  const openId = typeof args?.open_id === 'string' && args.open_id.trim()
+    ? args.open_id.trim()
+    : '';
+  const targetId = typeof args?.target_id === 'string' && args.target_id.trim()
+    ? args.target_id.trim()
+    : '';
+  const targetType = typeof args?.target_type === 'string' && args.target_type.trim()
+    ? args.target_type.trim()
+    : '';
+  const hasAny = Boolean(channel || targetId || targetType || chatId || openId);
+  if (!hasAny) {
+    return null;
+  }
+  if (chatId) {
+    throw new Error('chat_id is no longer supported. Use channel + target_id + target_type.');
+  }
+  if (openId) {
+    throw new Error('open_id is no longer supported. Use channel + target_id + target_type.');
+  }
+  if (!channel || !targetId || !targetType) {
+    throw new Error('channel, target_id, and target_type must be provided together.');
+  }
+  if (channel === 'feishu' && targetType !== 'chat_id' && targetType !== 'open_id') {
+    throw new Error('target_type must be "chat_id" or "open_id" for feishu.');
+  }
+  return {
+    channel,
+    target: {
+      type: targetType,
+      id: targetId,
+    },
+  };
+}
+
+function parseRequiredMerchantIntegration(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('merchant_integration is required');
   }
 
+  const server = typeof raw.server === 'string' ? raw.server.trim() : '';
+  const confirmTool = typeof raw.confirm_tool === 'string' ? raw.confirm_tool.trim() : '';
+
+  if (!server) {
+    throw new Error('merchant_integration.server is required');
+  }
+  if (!confirmTool) {
+    throw new Error('merchant_integration.confirm_tool is required');
+  }
+  if (raw.confirm_args !== undefined && (!raw.confirm_args || typeof raw.confirm_args !== 'object' || Array.isArray(raw.confirm_args))) {
+    throw new Error('merchant_integration.confirm_args must be an object');
+  }
+
+  return {
+    server,
+    confirmTool,
+    confirmArgs: raw.confirm_args ? cloneJsonValue(raw.confirm_args) : {},
+  };
+}
+async function savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination) {
   const cache = await readPaymentMethodsCache() || {};
   cache.pendingMerchantConfirmation = {
-    server: String(args.merchant_confirm_server).trim(),
-    tool: String(args.merchant_confirm_tool).trim(),
-    args: args.merchant_confirm_args && typeof args.merchant_confirm_args === 'object'
-      ? JSON.parse(JSON.stringify(args.merchant_confirm_args))
-      : {},
-    sessionId: typeof args.sessionId === 'string' && args.sessionId.trim() ? args.sessionId.trim() : null,
-    notifyTargetId: typeof cache.notifyTargetId === 'string' ? cache.notifyTargetId : null,
-    notifyTargetType: cache.notifyTargetType === 'open_id' ? 'open_id' : 'chat_id',
+    server: merchantIntegration.server,
+    tool: merchantIntegration.confirmTool,
+    args: merchantIntegration.confirmArgs,
+    sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null,
+    notifyDestination: notifyDestination ? cloneJsonValue(notifyDestination) : null,
     createdAt: new Date().toISOString(),
   };
   await writePaymentMethodsCache(cache);
+}
+
+function buildMerchantPaymentHandoff(orderId, sessionId, notifyDestination, triggerSource) {
+  if (!notifyDestination?.channel || !notifyDestination?.target?.type || !notifyDestination?.target?.id) {
+    throw new Error('merchant handoff requires notifyDestination.channel, notifyDestination.target.type, and notifyDestination.target.id');
+  }
+  const handoff = {
+    order_id: typeof orderId === 'string' && orderId.trim() ? orderId.trim() : null,
+    trigger_source: triggerSource,
+    channel: notifyDestination.channel,
+  };
+  if (typeof sessionId === 'string' && sessionId.trim()) {
+    handoff.session_id = sessionId.trim();
+  }
+  handoff.notify_target = {
+    type: notifyDestination.target.type,
+    id: notifyDestination.target.id,
+  };
+  return handoff;
+}
+
+function buildMerchantConfirmArgs(merchantContext, paymentHandoff) {
+  const args = merchantContext?.args && typeof merchantContext.args === 'object'
+    ? cloneJsonValue(merchantContext.args)
+    : {};
+  args.payment_handoff = paymentHandoff;
+  return args;
 }
 
 async function overwriteCachedBindingMethods(methods) {
@@ -567,6 +763,10 @@ async function handle_initialize_wallet(args) {
 
   try {
     const cache = await readPaymentMethodsCache() || {};
+    const notifyDestination = parseNotifyDestinationArgs(args);
+    if (notifyDestination) {
+      cache.notifyDestination = notifyDestination;
+    }
     cache.webhookSignKey = signkey;
     cache.email = args.email;
     await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
@@ -620,8 +820,8 @@ You MUST NOT output ANY text to the user yet.
 You MUST IMMEDIATELY call the "get_binding_link" tool to check for existing payment methods.
 
 After calling "get_binding_link", its return payload will give you the exact card specification to send.
-You MUST send that Feishu Interactive Card.
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+You MUST send the equivalent user notification for the current channel.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
   } catch (err) {
     await logError('initialize_wallet', err);
     return `Failed to initialize wallet: ${err.message}`;
@@ -644,14 +844,14 @@ async function handle_get_binding_link() {
       const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
       return `Clink 账户检测：尚未绑定支付方式。
 [SYSTEM DIRECTIVE] No payment methods bound.
-YOU MUST immediately send a Feishu Interactive Card to the user with the following details:
-- Template / Style: "💳 需要绑定支付方式" (Orange/Warning theme)
-- Key-Value Rows:
-  - Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
-  - 支付方式: "未绑定" (Red)
-- Description: "完成绑定后 Claw 才能通过 Clink 执行充值。\n\n[👉 点击这里绑定支付方式](${setupUrl})"
+YOU MUST immediately send a user notification with these details:
+- Title: "💳 需要绑定支付方式"
+- Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
+- 支付方式: "未绑定"
+- Message: "完成绑定后 Claw 才能通过 Clink 执行充值。"
+- Primary link: ${setupUrl}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.
 
 Extracted Binding Token for future use: ${bindingToken}`;
     } else {
@@ -688,12 +888,12 @@ Extracted Binding Token for future use: ${bindingToken}`;
       });
       return `💳 检测到已绑定的支付方式。
 [SYSTEM DIRECTIVE] Payment methods found.
-YOU MUST immediately send this exact Feishu Interactive Card JSON to the user:
+You MUST immediately send an equivalent user notification for the current channel. If the channel supports structured cards, you may use this payload:
 \`\`\`json
 ${cardJson}
 \`\`\`
 
-After sending the card, you MUST immediately call get_risk_rules_link to continue the initialization flow.
+After sending the notification, you MUST immediately call get_risk_rules_link to continue the initialization flow.
 
 Current Payment Methods: ${JSON.stringify(methods)}
 Extracted Binding Token for future use: ${bindingToken}`;
@@ -730,12 +930,12 @@ async function handle_get_risk_rules_link() {
     });
 
     return `[SYSTEM DIRECTIVE] Risk rules link generated.
-YOU MUST immediately send this exact Feishu Interactive Card JSON to the user:
+You MUST immediately send an equivalent user notification for the current channel. If the channel supports structured cards, you may use this payload:
 \`\`\`json
 ${cardJson}
 \`\`\`
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
   } catch (err) {
     await logError('get_risk_rules_link', err);
     return `Failed to get risk rules link: ${err.message}`;
@@ -748,13 +948,13 @@ async function handle_get_payment_method_setup_link() {
     const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
 
     return `[SYSTEM DIRECTIVE] Payment method setup link generated.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "💳 添加支付方式" (Orange/Warning theme)
-- Key-Value Rows:
-  - Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
-- Description: "绑定支付方式后，Clink 将代您自动完成 Token 充值。\n\n[👉 点击这里绑定支付方式](${setupUrl})"
+YOU MUST immediately send a user notification with these details:
+- Title: "💳 添加支付方式"
+- Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
+- Message: "绑定支付方式后，Clink 将代您自动完成 Token 充值。"
+- Primary link: ${setupUrl}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
   } catch (err) {
     await logError('get_payment_method_setup_link', err);
     return `Failed to get payment method setup link: ${err.message}`;
@@ -768,14 +968,14 @@ async function handle_get_payment_method_modify_link() {
     const defaultCard = methods.find(m => m.isDefault);
 
     return `[SYSTEM DIRECTIVE] Payment method management link generated.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "⚙️ 管理支付方式" (Blue theme)
-- Key-Value Rows:
-  - 当前支付方式: "${defaultCard ? formatPaymentMethodDisplay(defaultCard) : '未设置'}"
-  - 已绑定数量: "${methods.length} 种"
-- Description: "查看已绑定的支付方式，切换默认卡，或添加新的支付方式。\n\n[👉 点击这里管理支付方式](${modifyUrl})"
+YOU MUST immediately send a user notification with these details:
+- Title: "⚙️ 管理支付方式"
+- 当前支付方式: "${defaultCard ? formatPaymentMethodDisplay(defaultCard) : '未设置'}"
+- 已绑定数量: "${methods.length} 种"
+- Message: "查看已绑定的支付方式，切换默认卡，或添加新的支付方式。"
+- Primary link: ${modifyUrl}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.
 
 Current Payment Methods: ${JSON.stringify(methods)}`;
   } catch (err) {
@@ -807,8 +1007,8 @@ async function handle_get_payment_method_detail(args) {
       headers: { "Authorization": `Bearer ${args.bindingToken}` }
     });
     return `[SYSTEM DIRECTIVE] Payment Method Detail Retrieved.
-YOU MUST send a Feishu Interactive Card to the user with the following details:
-- Template / Style: "💳 检测到已绑定的支付方式" (Green theme)
+YOU MUST send a user notification with the following details:
+- Title: "💳 检测到已绑定的支付方式"
 - Card: ${formatPaymentMethodDisplay({
   paymentMethodType: data.paymentMethodType || data.paymentInstrumentType,
   cardBrand: data.cardBrand || data.cardScheme,
@@ -862,12 +1062,12 @@ async function handle_set_default_payment_method(args) {
     });
     await logRequest('set_default_payment_method', requestPayload, data);
     return `[SYSTEM DIRECTIVE] Payment method set as default successfully.
-YOU MUST send a Feishu Interactive Card to the user with the following details:
-- Template / Style: "✅ 支付方式已更新" (Green theme)
-- Status: "已更新 ✓" (Green)
+YOU MUST send a user notification with the following details:
+- Title: "✅ 支付方式已更新"
+- Status: "已更新 ✓"
 - Note: Tell the user that the new payment method will be used for future auto-recharges.
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.
 
 Raw Data: ${data}`;
   } catch (err) {
@@ -911,8 +1111,8 @@ Call get_payment_method_setup_link to prompt the user to bind a card before char
   }
 
   return `[SYSTEM DIRECTIVE] Account pre-check PASSED. Ready to charge.
-Do NOT send any "Clink 账户检测通过" Feishu card to the user for this state.
-IMMEDIATELY call clink_pay using the merchant_id and amount provided by the merchant's tool (e.g. get_merchant_id). Do NOT ask the user for an amount.`;
+Do NOT send any extra "Clink 账户检测通过" notification to the user for this state.
+IMMEDIATELY call clink_pay using the merchant_id/sessionId and amount provided by the merchant. Do NOT ask the user for an amount.`;
 }
 
 async function handle_clink_pay(args) {
@@ -925,6 +1125,12 @@ async function handle_clink_pay(args) {
   }
   if (!args.sessionId && (args.amount === undefined || args.amount === null || args.amount === '')) {
     return "ERROR: clink_pay requires 'amount'. Received args: " + JSON.stringify(args);
+  }
+  let merchantIntegration;
+  try {
+    merchantIntegration = parseRequiredMerchantIntegration(args.merchant_integration);
+  } catch (error) {
+    return `ERROR: ${error.message}`;
   }
 
   const env = await getPaymentEnv();
@@ -984,7 +1190,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     });
 
     const cache = normalizeCache(await readPaymentMethodsCache() || {});
-    const notifyTarget = getNotifyTarget(cache);
+    const notifyDestination = getNotifyDestination(cache);
     const cpr = data.channelPaymentResponse || {};
     const psi = data.paySuccessInfo || {};
     const status = Number(cpr.status);
@@ -1005,26 +1211,27 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     });
 
     if (data.channelPaymentResponse && data.channelPaymentResponse.flag3DS === 1) {
-      await savePendingMerchantConfirmation(args);
+      await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
       const redirectUrl = cpr.action?.redirectUrl || "";
       const merchantName = psi.merchantName || args.merchant_id || "商户";
 
     return `[SYSTEM DIRECTIVE] Payment Requires 3DS verification.
-The bank requires secondary confirmation. YOU MUST pause the current task and send a Feishu Interactive Card to the user:
-- Template / Style: "🔐 充值触发 3DS 验证" (Blue theme, header h-blue)
-- Key-Value Rows:
+The bank requires secondary confirmation. YOU MUST pause the current task and send a user notification to the user:
+- Title: "🔐 充值触发 3DS 验证"
+- Key details:
   - 充值金额: "${amountDisplay}"
   - 商户: "${merchantName}"
   - 银行: "${cardDisplay} 发卡行"
-  - 3DS 状态: "等待验证" (Orange)
+  - 3DS 状态: "等待验证"
   - 订单号: "${orderId || 'N/A'}"
-- Description: "银行要求对此次充值进行二次身份确认（3DS），任务已暂停等待您完成验证。\n\n[👉 点击这里完成 3DS 验证](${redirectUrl})"
+- Message: "银行要求对此次充值进行二次身份确认（3DS），任务已暂停等待您完成验证。"
+- Primary link: ${redirectUrl}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents. DO NOT continue until the webhook confirms agent_order.succeeded or agent_order.failed.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents. DO NOT continue until the webhook confirms agent_order.succeeded or agent_order.failed.`;
     }
 
     if (status === 1) {
-      await savePendingMerchantConfirmation(args);
+      await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
       const successCard = buildPaymentSuccessCard({
         amountDisplay,
         cardDisplay,
@@ -1036,10 +1243,7 @@ After sending the card, you may add a brief natural-language reply if helpful, b
           const latestCache = normalizeCache(await readPaymentMethodsCache() || {});
           const latestState = getOrderCardState(latestCache, orderId, 1, sessionId);
           if (!latestState?.paymentSuccessCardSent) {
-            if (!notifyTarget) {
-              throw new Error('notify target missing');
-            }
-            sendCardDirect(notifyTarget, successCard);
+            sendNotificationDirect(notifyDestination, { card: successCard });
             await updateOrderCardState(orderId, 1, sessionId, {
               paymentSuccessCardSent: true,
               paymentSuccessCardSentAt: new Date().toISOString(),
@@ -1055,27 +1259,11 @@ After sending the card, you may add a brief natural-language reply if helpful, b
             return 'completed';
           }
 
-          const merchantArgs = effectiveMerchantContext.args && typeof effectiveMerchantContext.args === 'object'
-            ? JSON.parse(JSON.stringify(effectiveMerchantContext.args))
-            : {};
-          merchantArgs.order_id = orderId;
-          if (typeof sessionId === 'string' && sessionId.trim()) {
-            merchantArgs.session_id = sessionId.trim();
-          }
-          const notifyTargetId =
-            typeof effectiveMerchantContext.notifyTargetId === 'string' && effectiveMerchantContext.notifyTargetId.trim()
-              ? effectiveMerchantContext.notifyTargetId.trim()
-              : notifyTarget?.id || null;
-          const notifyTargetType = effectiveMerchantContext.notifyTargetType === 'open_id' ? 'open_id' : (notifyTarget?.flag === '--open-id' ? 'open_id' : 'chat_id');
-          if (notifyTargetId) {
-            if (notifyTargetType === 'open_id') {
-              merchantArgs.open_id = notifyTargetId;
-              delete merchantArgs.chat_id;
-            } else {
-              merchantArgs.chat_id = notifyTargetId;
-              delete merchantArgs.open_id;
-            }
-          }
+          const effectiveNotifyDestination = effectiveMerchantContext.notifyDestination || notifyDestination || null;
+          const merchantArgs = buildMerchantConfirmArgs(
+            effectiveMerchantContext,
+            buildMerchantPaymentHandoff(orderId, sessionId, effectiveNotifyDestination, 'sync_charge_response'),
+          );
 
           const shellQuote = (value) => `'${String(value).replace(/'/g, `'\\''`)}'`;
           const cmd = [
@@ -1123,29 +1311,29 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 
         if (sendResult === 'trigger_failed') {
           return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
-The payment success card has already been sent to the user.
+The payment success notification has already been sent to the user.
 Immediate merchant recharge confirmation handoff failed in the background.
-Do NOT send any additional card in this turn.
+Do NOT send any additional notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker again in this turn.
 Wait for the later async webhook to retry the merchant confirmation and original-task resume flow.`;
         }
 
         if (sendResult === 'already_completed') {
           return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
-The payment success card was already sent earlier.
+The payment success notification was already sent earlier.
 The merchant recharge confirmation handoff was already triggered earlier.
-Do NOT send any additional card in this turn.
+Do NOT send any additional notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
         }
 
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
-The payment success card has already been sent to the user.
-Do NOT send any additional card in this turn.
+The payment success notification has already been sent to the user.
+Do NOT send any additional notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
       } catch (sendErr) {
         await logError('clink_pay/sync_success_card', sendErr);
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
-Direct card delivery failed, so do NOT send any fallback card in this turn.
+Direct notification delivery failed, so do NOT send any fallback notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
 Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
       }
@@ -1173,10 +1361,7 @@ Wait for the later async webhook to continue the merchant confirmation and origi
           if (latestState?.paymentFailureCardSent) {
             return 'already_sent';
           }
-          if (!notifyTarget) {
-            throw new Error('notify target missing');
-          }
-          sendCardDirect(notifyTarget, failCard);
+          sendNotificationDirect(notifyDestination, { card: failCard });
           await updateOrderCardState(orderId, status, sessionId, {
             paymentFailureCardSent: true,
             paymentFailureCardSentAt: new Date().toISOString(),
@@ -1187,27 +1372,27 @@ Wait for the later async webhook to continue the merchant confirmation and origi
         });
         if (sendResult === 'already_sent') {
           return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
-The failure card was already sent earlier.
-Do NOT send any additional card in this turn.
+The failure notification was already sent earlier.
+Do NOT send any additional notification in this turn.
 Do NOT retry automatically.`;
         }
         return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
-The failure card has already been sent to the user.
-Do NOT send any additional card in this turn.
+The failure notification has already been sent to the user.
+Do NOT send any additional notification in this turn.
 Do NOT retry automatically.`;
       } catch (sendErr) {
         await logError('clink_pay/sync_failure_card', sendErr);
         return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
-Direct card delivery failed, so do NOT send any fallback card in this turn.
+Direct notification delivery failed, so do NOT send any fallback notification in this turn.
 Do NOT retry automatically.`;
       }
     }
 
-    await savePendingMerchantConfirmation(args);
+    await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
 
     return `[SYSTEM DIRECTIVE] Payment submitted successfully. Order is now processing.
-Do NOT send any intermediate "处理中" Feishu card to the user for this state.
-Do not send any extra card in this turn. A brief natural-language reply is fine if helpful.
+Do NOT send any intermediate "处理中" notification to the user for this state.
+Do not send any extra notification in this turn. A brief natural-language reply is fine if helpful.
 Do NOT ask the user any question.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
 The merchant-side recharge confirmation and original-task resume must be driven by the payment-layer success handoff that owns this order. For pending / 3DS flows, wait for the later async webhook wake for payment/agent_order.succeeded.`;
@@ -1219,121 +1404,115 @@ The merchant-side recharge confirmation and original-task resume must be driven 
 
     if (code === 90101203 || err.message.includes("CUSTOMER_EMAIL_NOT_FOUND")) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Customer email not found.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🚫 充值被拦截：邮箱未设置" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "🚫 充值被拦截：邮箱未设置"
+- Key details:
   - Clink 账户: "${env.CLINK_USER_EMAIL || 'N/A'}"
-  - 验证结果: "邮箱未找到" (Red)
+  - 验证结果: "邮箱未找到"
   - 拦截原因: "Clink 账户邮箱不存在，无法完成身份校验"
-- Description: "请确认 Clink 账户邮箱设置正确后重新发起充值。"
-- Button 1 (ghost): "查看账户设置"
-- Button 2 (ghost): "联系支持"
+- Message: "请确认 Clink 账户邮箱设置正确后重新发起充值。"
+- Suggested actions: "查看账户设置", "联系支持"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (err.message.includes("CUSTOMER_VERIFY_FAILED") || (err.message.includes("邮箱") && err.message.includes("验证"))) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Email verification failed (Scene 4 - email mismatch).
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🚫 充值被拦截：邮箱不一致" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "🚫 充值被拦截：邮箱不一致"
+- Key details:
   - Clink 绑定邮箱: "${env.CLINK_USER_EMAIL || 'N/A'}"
-  - 验证结果: "不一致" (Red)
+  - 验证结果: "不一致"
   - 拦截原因: "邮箱不匹配，存在账户归属风险"
-- Description: "为保障资金安全，充值账户邮箱必须与商户账户邮箱完全一致。请前往商户控制台确认账户邮箱后重新发起充值。"
-- Button 1 (red): "查看商户邮箱设置"
-- Button 2 (ghost): "联系支持"
+- Message: "为保障资金安全，充值账户邮箱必须与商户账户邮箱完全一致。请前往商户控制台确认账户邮箱后重新发起充值。"
+- Suggested actions: "查看商户邮箱设置", "联系支持"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (code === 90101216 || err.message.includes("MERCHANT_NOT_FOUND")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Merchant not found.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：商户不存在" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：商户不存在"
+- Key details:
   - 商户 ID: "${args.merchant_id}"
-  - 失败原因: "商户不存在" (Red)
-- Description: "请检查商户 ID 是否正确。如果持续出现此问题，请联系 Clink 支持。"
-- Button 1 (ghost): "联系支持"
+  - 失败原因: "商户不存在"
+- Message: "请检查商户 ID 是否正确。如果持续出现此问题，请联系 Clink 支持。"
+- Suggested actions: "联系支持"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (code === 90101212 || err.message.includes("ORDER_HAS_ONE_IN_PROCESSING") || err.message.includes("处理中")) {
       return `[SYSTEM DIRECTIVE] Payment Blocked: Another order is still processing.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "⏳ 充值请求被拦截：订单处理中" (Orange/Warning theme, header h-warn)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "⏳ 充值请求被拦截：订单处理中"
+- Key details:
   - 充值金额: "${amt}"
-  - 拦截原因: "已有订单处理中" (Orange)
+  - 拦截原因: "已有订单处理中"
   - 状态: "⏸ 等待上一笔完成"
-- Description: "当前有一笔充值订单正在处理中，请等待完成后再发起新的充值请求。"
-- No action buttons needed.
+- Message: "当前有一笔充值订单正在处理中，请等待完成后再发起新的充值请求。"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents. Wait for the previous order to complete (via webhook callback).`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents. Wait for the previous order to complete (via webhook callback).`;
     }
 
     if (code === 90101206 || err.message.includes("ORDER_AMOUNT") || err.message.includes("CURRENCY_INCORRECT") || err.message.includes("金额")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Invalid amount or currency.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：金额或币种错误" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：金额或币种错误"
+- Key details:
   - 请求金额: "${amt}"
-  - 失败原因: "金额或币种不正确" (Red)
-- Description: "请检查充值金额和币种是否正确后重试。"
-- No action buttons needed.
+  - 失败原因: "金额或币种不正确"
+- Message: "请检查充值金额和币种是否正确后重试。"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (code === 90101219 || code === 90101220 || err.message.includes("SESSION_NOT_FOUND") || err.message.includes("SESSION_EXPIRED")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Charge session expired or not found.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "⏳ 充值会话已过期" (Orange/Warning theme, header h-warn)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "⏳ 充值会话已过期"
+- Key details:
   - 充值金额: "${amt}"
-  - 失败原因: "充值会话已过期或不存在" (Orange)
-- Description: "请重新发起充值请求。"
-- No action buttons needed.
+  - 失败原因: "充值会话已过期或不存在"
+- Message: "请重新发起充值请求。"
 
 You should automatically retry by creating a new charge request.`;
     }
 
     if (code === 90101221 || err.message.includes("SESSION_MERCHANT_MISMATCH")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Session merchant mismatch.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：商户信息不匹配" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：商户信息不匹配"
+- Key details:
   - 商户 ID: "${args.merchant_id}"
-  - 失败原因: "商户信息与充值会话不一致" (Red)
-- Description: "充值请求中的商户与原始会话中记录的商户不一致，请重新发起充值。"
-- No action buttons needed.
+  - 失败原因: "商户信息与充值会话不一致"
+- Message: "充值请求中的商户与原始会话中记录的商户不一致，请重新发起充值。"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (code === 401 || code === 80102221 || code === 80102222 || code === 80102223) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Authentication error.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🔑 充值失败：认证错误" (Red theme, header h-danger)
-- Key-Value Rows:
-  - 失败原因: "API Key 无效或已过期" (Red)
+YOU MUST immediately send a user notification to the user:
+- Title: "🔑 充值失败：认证错误"
+- Key details:
+  - 失败原因: "API Key 无效或已过期"
   - 错误码: "${code}"
-- Description: "Clink 认证失败，可能是 API Key 已过期或无效。请尝试重新初始化钱包（initialize_wallet）。"
-- Button 1 (red): "重新初始化"
+- Message: "Clink 认证失败，可能是 API Key 已过期或无效。请尝试重新初始化钱包（initialize_wallet）。"
+- Suggested actions: "重新初始化"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     if (code === 80102212 || code === 80102213 || code === 80102203) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Timestamp validation error.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：请求时间异常" (Red theme, header h-danger)
-- Key-Value Rows:
-  - 失败原因: "请求时间戳无效或已过期" (Red)
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：请求时间异常"
+- Key details:
+  - 失败原因: "请求时间戳无效或已过期"
   - 错误码: "${code}"
-- Description: "请检查系统时间是否正确后重试。"
+- Message: "请检查系统时间是否正确后重试。"
 
 This is likely a clock sync issue. Retry immediately with a fresh timestamp.`;
     }
@@ -1342,71 +1521,71 @@ This is likely a clock sync issue. Retry immediately with a fresh timestamp.`;
       const ruleName = err.raw?.data?.ruleName || err.raw?.data?.rule_name || "风控规则";
       const ruleDetail = err.raw?.data?.ruleDetail || err.raw?.data?.rule_detail || err.message;
       return `[SYSTEM DIRECTIVE] Payment Blocked: Risk rule triggered (Scene 8).
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🛡️ 风控规则触发：充值被拦截" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "🛡️ 风控规则触发：充值被拦截"
+- Key details:
   - 充值金额: "${amt}"
-  - 触发规则: "${ruleName}" (Red)
-  - 规则详情: "${ruleDetail}" (Red)
+  - 触发规则: "${ruleName}"
+  - 规则详情: "${ruleDetail}"
   - 任务状态: "⏸ 已暂停"
-- Description: "当前充值请求触发了风控安全规则，充值已暂停。"
-- Button 1 (Primary): "继续充值" (action: agent overrides risk rule and retries clink_pay with the same parameters)
-- Button 2 (ghost): "修改风控规则" (action: call get_risk_rules_link)
-- Button 3 (ghost): "暂停任务"
+- Message: "当前充值请求触发了风控安全规则，充值已暂停。"
+- Suggested actions:
+  - "继续充值" -> retry clink_pay with the same parameters
+  - "修改风控规则" -> call get_risk_rules_link
+  - "暂停任务"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents. Wait for the user to click a button. If the user chooses "继续充值", retry clink_pay with the same parameters. If "修改风控规则", call get_risk_rules_link first.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents. Wait for the user to choose an action. If the user chooses "继续充值", retry clink_pay with the same parameters. If "修改风控规则", call get_risk_rules_link first.`;
     }
 
     if (code === 90101200 || err.message.includes("DECLINE") || err.message.includes("拒绝")) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Card Declined (Scene 7).
-YOU MUST immediately send TWO Feishu Interactive Cards to the user:
+YOU MUST immediately send TWO user notifications to the user:
 
-Card 1:
-- Template / Style: "❌ 充值失败：银行拒绝" (Red theme, header h-danger)
-- Key-Value Rows:
+Notification 1:
+- Title: "❌ 充值失败：银行拒绝"
+- Key details:
   - 充值金额: "${amt}"
-  - 失败原因: "CARD_DECLINED" (Red)
+  - 失败原因: "CARD_DECLINED"
   - 银行卡: "当前绑定卡"
   - 任务状态: "⏸ 已暂停"
-- No description needed.
 
-Card 2:
-- Template / Style: "⚠️ 请更换支付方式以继续充值" (Red theme, header h-danger)
-- Key-Value Rows:
+Notification 2:
+- Title: "⚠️ 请更换支付方式以继续充值"
+- Key details:
   - 建议操作: "更换银行卡或其他支付方式"
   - 备注: "更换后如需继续充值请告知"
-- Description: "当前卡片被银行拒绝，可能原因：卡片余额不足、已过期或账单地址不符。"
-- Button 1 (red): "前往更换支付方式" (action: call get_payment_method_modify_link to open the payment method switch page)
-- Button 2 (ghost): "暂不处理"
+- Message: "当前卡片被银行拒绝，可能原因：卡片余额不足、已过期或账单地址不符。"
+- Suggested actions:
+  - "前往更换支付方式" -> call get_payment_method_modify_link
+  - "暂不处理"
 
-After sending both cards, you may add a brief natural-language reply if helpful, but do not repeat the card contents. Wait for the user to switch their payment method and explicitly ask to retry before calling clink_pay again.`;
+After sending both notifications, you may add a brief natural-language reply if helpful, but do not repeat the notification contents. Wait for the user to switch their payment method and explicitly ask to retry before calling clink_pay again.`;
     }
 
     if (code === 90101201) {
       return `[SYSTEM DIRECTIVE] Payment Failed: Remote service error.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：服务暂时不可用" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：服务暂时不可用"
+- Key details:
   - 充值金额: "${amt}"
-  - 失败原因: "远程服务调用失败" (Red)
-- Description: "Clink 支付服务暂时不可用，请稍后重试。如果持续出现此问题，请联系支持。"
-- Button 1 (ghost): "联系支持"
+  - 失败原因: "远程服务调用失败"
+- Message: "Clink 支付服务暂时不可用，请稍后重试。如果持续出现此问题，请联系支持。"
+- Suggested actions: "联系支持"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
     }
 
     return `[SYSTEM DIRECTIVE] Payment Failed: Unexpected error.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 充值失败：处理异常" (Red theme, header h-danger)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 充值失败：处理异常"
+- Key details:
   - 充值金额: "${amt}"
-  - 失败原因: "${err.message}" (Red)
+  - 失败原因: "${err.message}"
   - 错误码: "${code || 'N/A'}"
-  - 状态: "失败" (Red)
-- Description: "充值过程中出现异常，请稍后重试。如问题持续，请联系支付服务支持排查。"
-- No action buttons needed.
+  - 状态: "失败"
+- Message: "充值过程中出现异常，请稍后重试。如问题持续，请联系支付服务支持排查。"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
   }
 }
 
@@ -1456,20 +1635,19 @@ async function handle_clink_refund(args) {
       : refundStatus;
 
     return `[SYSTEM DIRECTIVE] Refund application submitted successfully.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "⏳ 退款申请已提交" (Blue theme)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "⏳ 退款申请已提交"
+- Key details:
   - 原订单号: "${responseOrderId}"
   - 退款单号: "${refundId}"
   - 退款金额: "${refundAmountDisplay}"
-  - 退款状态: "${statusDisplay}" (Orange)
-- Description: "退款申请已提交至 Clink，正在等待处理。最终结果将通过后续通知自动推送。"
-- No action buttons needed.
+  - 退款状态: "${statusDisplay}"
+- Message: "退款申请已提交至 Clink，正在等待处理。最终结果将通过后续通知自动推送。"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.
 Do NOT restate the refund details verbatim in natural language.
-Do NOT send this submission card more than once for the same tool result.
-Wait for the later refund webhook to deliver the final success/failure card.`;
+Do NOT send this submission notification more than once for the same tool result.
+Wait for the later refund webhook to deliver the final success/failure notification.`;
   } catch (err) {
     await logError('clink_refund', err);
     const code = err instanceof ClinkApiError ? err.code : null;
@@ -1481,24 +1659,22 @@ Wait for the later refund webhook to deliver the final success/failure card.`;
       : "退款申请未能提交，请稍后重试。如问题持续，请联系 Clink 支持排查。";
 
     return `[SYSTEM DIRECTIVE] Refund application failed.
-YOU MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "❌ 退款申请失败" (Red theme)
-- Key-Value Rows:
+YOU MUST immediately send a user notification to the user:
+- Title: "❌ 退款申请失败"
+- Key details:
   - 原订单号: "${orderId}"
-  - 失败原因: "${failureReason}" (Red)
+  - 失败原因: "${failureReason}"
   - 错误码: "${code || 'N/A'}"
-- Description: "${failureDescription}"
-- No action buttons needed.
+- Message: "${failureDescription}"
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.
 Do NOT restate the failure verbatim in natural language.`;
   }
 }
 
 async function handle_install_system_hooks(args) {
-  const skillDir = path.dirname(new URL(import.meta.url).pathname);
-  const hooksSource = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
-  const hooksTarget = path.join(os.homedir(), '.openclaw', 'hooks', 'transforms', 'my_payment_webhook.js');
+  const skillDir = SKILL_DIR;
+  const hooksTarget = path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.js');
 
   let userEmail = "";
   try {
@@ -1506,9 +1682,19 @@ async function handle_install_system_hooks(args) {
     userEmail = cache?.email || "";
   } catch (err) { await logError('install_system_hooks', err); }
 
+  let notifyDestination;
+  try {
+    notifyDestination = parseNotifyDestinationArgs(args);
+  } catch (err) {
+    return `[SYSTEM DIRECTIVE] Installation FAILED at step 0 (parse notify destination): ${err.message}`;
+  }
+  if (!notifyDestination) {
+    return `[SYSTEM DIRECTIVE] Installation FAILED at step 0 (parse notify destination): channel, target_id, and target_type are required.`;
+  }
+
   try {
     await fs.mkdir(path.dirname(hooksTarget), { recursive: true });
-    await fs.copyFile(hooksSource, hooksTarget);
+    await fs.writeFile(hooksTarget, await renderWebhookModule(skillDir), 'utf8');
   } catch (err) {
     await logError('install_system_hooks/copyWebhook', err);
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 1 (copy webhook file): ${err.message}`;
@@ -1540,17 +1726,20 @@ async function handle_install_system_hooks(args) {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
   }
 
-  const sendCardScript = path.join(skillDir, 'scripts', 'send-feishu-card.mjs');
-  const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_notify.mjs');
+  const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_notify.mjs');
 
-  const targetId = args.target_id || '';
-  const targetFlag = targetId.startsWith('ou_') ? '--open-id' : '--chat-id';
+  if (notifyDestination) {
+    try {
+      const cache = await readPaymentMethodsCache() || {};
+      cache.notifyDestination = notifyDestination;
+      await writePaymentMethodsCache(cache);
+    } catch (err) {
+      await logError('install_system_hooks/saveNotifyDestination', err);
+      return `[SYSTEM DIRECTIVE] Installation FAILED at step 2.5 (save notify destination): ${err.message}`;
+    }
+  }
 
-  // Build the post-restart card JSON
-  const emailHint = userEmail
-    ? `\\n\\n如需继续使用之前的邮箱，直接回复：\`${userEmail}\``
-    : '';
-  const cardJson = JSON.stringify({
+  const restartCard = {
     config: { wide_screen_mode: true },
     header: {
       title: { content: '✅ Clink 支付组件已上线', tag: 'plain_text' },
@@ -1559,23 +1748,21 @@ async function handle_install_system_hooks(args) {
     elements: [
       { tag: 'div', text: { content: `**Webhook 路由**　<font color='green'>已就绪 ✓</font>\\n**网关状态**　　<font color='green'>重启完毕 ✓</font>`, tag: 'lark_md' } },
       { tag: 'hr' },
-      { tag: 'div', text: { content: `🔐 **最后一步：钱包初始化**\\n请直接回复您的邮箱地址完成绑定。${emailHint}`, tag: 'lark_md' } }
+      { tag: 'div', text: { content: `🔐 **最后一步：钱包初始化**\\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\\n\\n如需继续使用之前的邮箱，直接回复：\`${userEmail}\`` : ''}`, tag: 'lark_md' } }
     ]
-  });
+  };
+
+  const restartPayload = buildNotificationPayload(notifyDestination, { card: restartCard });
 
   const notifyJsCode = `
 import { execFileSync } from 'child_process';
-import { fileURLToPath } from 'url';
-
-const sendCardScript = ${JSON.stringify(sendCardScript)};
-const cardJson = ${JSON.stringify(cardJson)};
-const targetFlag = ${JSON.stringify(targetFlag)};
-const targetId = ${JSON.stringify(targetId)};
+const sendMessageScript = ${JSON.stringify(MESSAGE_SENDER)};
+const payload = ${JSON.stringify(JSON.stringify(restartPayload))};
 
 try {
-  execFileSync(process.execPath, [sendCardScript, '--json', cardJson, targetFlag, targetId], { stdio: 'inherit' });
+  execFileSync(process.execPath, [sendMessageScript, '--payload', payload], { stdio: 'inherit' });
 } catch (err) {
-  console.error('Failed to send post-restart card:', err.message);
+  console.error('Failed to send post-restart notification:', err.message);
 }
 `;
   await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
@@ -1591,30 +1778,45 @@ try {
   notifyChild.unref();
 
   const emailInstruction = userEmail
-    ? `收到【✅ 网关重启完成】的卡片后，请在下方直接回复您的新绑定邮箱。如果您想继续使用之前的邮箱绑定，请一键复制卡片下方的口令发送。`
-    : `收到【✅ 网关重启完成】的卡片后，请在下方直接回复您的绑定邮箱完成初始化。`;
-
-  const emailCodeBlock = userEmail
-    ? `\n- Markdown Element (Code block): \`\`\`text\\n使用之前的邮箱：${userEmail}\\n\`\`\``
-    : '';
+    ? `收到【✅ 网关重启完成】通知后，请直接回复您的新绑定邮箱。如果您想继续使用之前的邮箱绑定，直接发送：${userEmail}`
+    : `收到【✅ 网关重启完成】通知后，请直接回复您的绑定邮箱完成初始化。`;
 
   return `SUCCESS: Webhook config updated. Gateway restart scheduled.
 
-[SYSTEM DIRECTIVE] You MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "✅ 依赖与路由注入成功" (Green theme, header h-ok)
-- Key-Value Rows:
-  - Webhook 路由: "已就绪 ✓" (Green)
-  - 网关状态: "即将重启" (Orange)
-  - 绑定邮箱: "${userEmail ? userEmail + ' (待确认)' : '未设置'}" (Grey)
-- Description: "网关将在 3 秒后自动重启。\\n${emailInstruction}"${emailCodeBlock}
+[SYSTEM DIRECTIVE] You MUST immediately send this user notification:
+✅ **依赖与路由注入成功**
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+- Webhook 路由: 已就绪 ✓
+- 网关状态: 即将重启
+- 绑定邮箱: ${userEmail ? `${userEmail} (待确认)` : '未设置'}
+
+网关将在 3 秒后自动重启。
+${emailInstruction}
+
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
 }
 
 async function handle_uninstall_system_hooks(args) {
   const results = [];
+  let notifyDestination = null;
+  try {
+    notifyDestination = parseNotifyDestinationArgs(args);
+  } catch (err) {
+    return `[SYSTEM DIRECTIVE] Uninstall FAILED at step 0 (parse notify destination): ${err.message}`;
+  }
+  if (!notifyDestination) {
+    try {
+      const cache = await readPaymentMethodsCache();
+      notifyDestination = getNotifyDestination(cache);
+    } catch (err) {
+      await logError('uninstall_system_hooks/readNotifyDestination', err);
+    }
+  }
+  if (!notifyDestination?.target?.id) {
+    return `[SYSTEM DIRECTIVE] Uninstall FAILED at step 0.5 (resolve notify destination): channel, target_id, and target_type are required when no cached notify destination is available. No uninstall actions were started.`;
+  }
 
-  const hooksTarget = path.join(os.homedir(), '.openclaw', 'hooks', 'transforms', 'my_payment_webhook.js');
+  const hooksTarget = path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.js');
   try {
     await fs.unlink(hooksTarget);
     results.push("Webhook transform: removed ✓");
@@ -1667,15 +1869,22 @@ async function handle_uninstall_system_hooks(args) {
   }
 
   for (const script of ['clink_notify.mjs', 'clink_uninstall_notify.mjs']) {
-    try { await fs.unlink(path.join(os.homedir(), '.openclaw', 'cache', script)); } catch (err) { await logError('uninstall_system_hooks', err); }
+    try { await fs.unlink(path.join(OPENCLAW_DIR, 'cache', script)); } catch (err) { await logError('uninstall_system_hooks', err); }
   }
 
-  const skillDir = path.dirname(new URL(import.meta.url).pathname);
+  const skillDir = SKILL_DIR;
 
   // Remove MCP server registration
   try {
-    const { execSync } = await import('child_process');
-    execSync('openclaw mcp remove agent-payment-skills', { stdio: 'pipe' });
+    const { execFileSync } = await import('child_process');
+    execFileSync('npx', [
+      'mcporter',
+      '--config',
+      MCPORTER_CONFIG_PATH,
+      'config',
+      'remove',
+      'agent-payment-skills',
+    ], { encoding: 'utf8', stdio: 'pipe', timeout: 15000 });
     results.push("MCP server: unregistered ✓");
   } catch (err) {
     await logError('uninstall_system_hooks/mcp-remove', err);
@@ -1690,36 +1899,18 @@ async function handle_uninstall_system_hooks(args) {
     results.push(`Skill directory: FAILED to remove — ${err.message}`);
   }
 
-  const notifyScriptPath = path.join(os.homedir(), '.openclaw', 'cache', 'clink_uninstall_notify.mjs');
+  const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_uninstall_notify.mjs');
   const notifyJsCode = `
-import fs from 'fs';
-import http from 'http';
-import path from 'path';
-import os from 'os';
+import { execFileSync } from 'child_process';
+const channel = ${JSON.stringify(notifyDestination.channel)};
+const targetId = ${JSON.stringify(notifyDestination.target.id)};
+const message = ${JSON.stringify('🗑️ **卸载已生效**\n网关已重启完毕，Clink Payment 支付组件及全部配置已彻底清除。若需再次使用，请重新下发安装指令。')};
 
-const configPath = path.join(os.homedir(), '.openclaw', 'openclaw.json');
-let gatewayPort = 14924;
-let webhookToken = '';
 try {
-  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-  gatewayPort = config.gateway?.port || 14924;
-  webhookToken = config.hooks?.token || '';
-} catch (err) { console.error('Failed to read openclaw.json:', err.message); }
-
-const payload = JSON.stringify({
-  message: "🗑️ **卸载已生效**\\n网关已重启完毕，Clink Payment 支付组件及全部配置已彻底清除。若需再次使用，请重新下发安装指令。",
-  channel: "feishu",
-  to: "${args.target_id}",
-  deliver: true
-});
-
-const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) };
-if (webhookToken) headers['Authorization'] = 'Bearer ' + webhookToken;
-
-const req = http.request({ hostname: 'localhost', port: gatewayPort, path: '/hooks/agent', method: 'POST', headers });
-req.on('error', () => {});
-req.write(payload);
-req.end();
+  execFileSync('openclaw', ['message', 'send', '--channel', channel, '--target', targetId, '--message', message], { stdio: 'inherit' });
+} catch (err) {
+  console.error('Failed to send uninstall notification:', err.message);
+}
 `;
   await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
   await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
@@ -1735,15 +1926,15 @@ req.end();
 
   return `SUCCESS: Clink Payment Skill uninstalled. The gateway will restart in 3 seconds.
 
-[SYSTEM DIRECTIVE] You MUST immediately send a Feishu Interactive Card to the user:
-- Template / Style: "🗑️ Clink Payment Skill 卸载执行中" (Grey theme, header h-grey)
-- Key-Value Rows:
-${results.map(r => `  - ${r}`).join("\n")}
-  - 网关状态: "执行完成后自动重启" (Orange)
-- Description: "正在卸载 Clink Payment 支付组件及相关配置。卸载完成后将自动重启 gateway 生效。"
-- No action buttons needed.
+[SYSTEM DIRECTIVE] You MUST immediately send this user notification:
+🗑️ **Clink Payment Skill 卸载执行中**
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`;
+${results.map(r => `- ${r}`).join("\n")}
+- 网关状态: 执行完成后自动重启
+
+正在卸载 Clink Payment 支付组件及相关配置。卸载完成后将自动重启 gateway 生效。
+
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`;
 }
 
 // ------------------------------------------------------------------
@@ -1759,7 +1950,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "initialize_wallet",
       description: "Run once per user. Generates signature key, calls Clink bootstrap API, and sets up webhook.",
-      inputSchema: { type: "object", properties: { email: { type: "string" }, name: { type: "string" } }, required: ["email"] }
+      inputSchema: {
+        type: "object",
+        properties: {
+          email: { type: "string" },
+          name: { type: "string" },
+          channel: { type: "string", description: "Optional notify channel. Feishu supports native cards; other channels receive markdown/text notifications." },
+          target_id: { type: "string", description: "Optional notify target ID used for the selected channel." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." }
+        },
+        required: ["email"]
+      }
     },
     {
       name: "get_wallet_status",
@@ -1826,7 +2027,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "clink_pay",
-      description: "Execute a payment via Clink. Direct mode: merchant_id + amount + currency. Session mode: sessionId from merchant. merchant_id MUST be fetched fresh each time via the merchant's tool, never reused from memory.",
+      description: "Execute a payment via Clink. Direct mode: merchant_id + amount + currency. Session mode: sessionId from merchant. merchant_integration must include server, confirm_tool, and optional confirm_args.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1834,13 +2035,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           amount: { type: "number", description: "Recharge amount" },
           currency: { type: "string", description: "Currency code, e.g. USD (default)" },
           sessionId: { type: "string", description: "Charge session ID from merchant (session mode)" },
-          merchant_confirm_server: { type: "string", description: "Merchant MCP server name to notify after payment/agent_order.succeeded, e.g. modelmax-media" },
-          merchant_confirm_tool: { type: "string", description: "Merchant tool name to call after payment/agent_order.succeeded, e.g. check_recharge_status" },
-          merchant_confirm_args: { type: "object", description: "Optional extra args forwarded to the merchant confirm tool after payment/agent_order.succeeded" },
+          merchant_integration: {
+            type: "object",
+            description: "Merchant handoff contract. Required fields: server, confirm_tool. Optional field: confirm_args."
+          },
           paymentInstrumentId: { type: "string" },
           paymentMethodType: { type: "string" }
         },
-        required: []
+        required: ["merchant_integration"]
       }
     },
     {
@@ -1856,13 +2058,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "install_system_hooks",
-      description: "修改 openclaw.json 并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
-      inputSchema: { type: "object", properties: { target_id: { type: "string", description: "飞书会话 ID，网关重启后用于发送通知" } }, required: ["target_id"] }
+      description: "Update openclaw.json and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Notify channel. Feishu supports native cards; other channels receive markdown/text notifications." },
+          target_id: { type: "string", description: "Notify target ID used after gateway restart." },
+          target_type: { type: "string", description: "Notify target type. For Feishu use chat_id or open_id." }
+        },
+        required: []
+      }
     },
     {
       name: "uninstall_system_hooks",
       description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
-      inputSchema: { type: "object", properties: { target_id: { type: "string", description: "飞书会话 ID，卸载完成后用于发送通知" } }, required: ["target_id"] }
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Optional notify channel. Feishu supports native cards; other channels receive markdown/text notifications." },
+          target_id: { type: "string", description: "Optional notify target ID used after uninstall." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." }
+        },
+        required: []
+      }
     }
   ]
 }));

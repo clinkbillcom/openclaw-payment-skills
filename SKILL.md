@@ -1,12 +1,12 @@
 ---
 name: agent-payment-skills
-description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Cards are sent via exec using the built-in scripts/send-feishu-card.mjs script (no external skill dependency)."
+description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract; Feishu cards remain an optional rendering layer."
 version: "1.0.0"
 metadata:
   openclaw:
     scriptsDir: "scripts"
     tools:
-      card_sender: "scripts/send-feishu-card.mjs"
+      notification_sender: "scripts/send-message.mjs"
       mcp_server: "index.bundle.mjs"
 permissions:
   - network
@@ -37,41 +37,25 @@ tools:
   - name: pre_check_account
     description: Run before clink_pay to verify account readiness (wallet initialized, payment method bound). Displays an account check status card to the user.
   - name: clink_pay
-    description: Execute a payment via Clink. Supports two modes — direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant, amount/currency pre-validated). Used by other skills for auto top-up.
+    description: Execute a payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). merchant_integration must include server, confirm_tool, and optional confirm_args.
   - name: install_system_hooks
-    description: 修改 openclaw.json 并在后台延迟 3 秒重启网关。由安装流程直接触发，无需额外文字授权。
+    description: Update `openclaw.json` and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.
   - name: uninstall_system_hooks
-    description: 卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。
+    description: Uninstall Clink Payment Skill by removing the webhook, config, and skill directory, then restart the gateway in the background after a 3-second delay. Must only be called after explicit text authorization from the user.
 ---
 
 # Agent Payment Skill
 
-## Code Change Guardrail
-
-Do not modify source code or skill files in this directory unless the user explicitly asks for a code or documentation change.
-
-If the user explicitly requests a fix, refactor, or documentation update, you may modify:
-- `index.mjs`
-- `hooks/my_payment_webhook.js`
-- `scripts/*.mjs`
-- `cards/*.json`
-- `SKILL.md`
-
-When making changes:
-- Keep edits narrowly scoped to the requested issue
-- Preserve card ownership and tool-return rules defined in this skill
-- Do not make unrelated refactors
-
 ---
 
-## ⚡ PRIORITY RULE: "开启自动充值" → Install Immediately
+## ⚡ PRIORITY RULE: "Enable Auto Top-Up" → Install Immediately
 
-If the user's message is exactly or closely matches `开启自动充值`, treat it as explicit permission to install this skill immediately.
+If the user's message clearly means "enable auto top-up" in the user's own language, treat it as explicit permission to install this skill immediately.
 
 You MUST:
 1. Run the install workflow in Section 3 at once.
 2. Do NOT ask for additional confirmation.
-3. Do NOT wait for the user to reply `授权安装`.
+3. Do NOT wait for an extra "authorize install" reply.
 4. Do NOT claim success unless `pre_install.mjs` has actually completed successfully.
 
 ---
@@ -89,9 +73,9 @@ This rule covers the post-install flow where the gateway restarts and the user r
 
 ---
 
-## Card Reply Guidance
+## Notification Reply Guidance
 
-After sending a Feishu Interactive Card, you may continue with a short natural-language reply if it helps the user.
+After sending a user notification, you may continue with a short natural-language reply if it helps the user.
 
 Guidelines:
 - Do not resend or paraphrase the entire card.
@@ -100,21 +84,21 @@ Guidelines:
 
 This skill provides any compatible AI agent with the ability to manage payments and top-ups via the Clink platform.
 
-## Sending Feishu Cards
+## Sending Notifications
 
-All cards — whether static (install/uninstall) or dynamic (webhook-triggered, payment status) — are sent via this built-in script:
+This skill includes a unified notification sender:
 
 ```bash
-# Static card from file
-node {SKILL_DIR}/scripts/send-feishu-card.mjs {SKILL_DIR}/cards/auth_request.json --chat-id {current_feishu_chat_id}
+# Feishu card payload
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"feishu","target":{"type":"chat_id","id":"oc_xxx"},"card":{"schema":"2.0","header":{"title":{"content":"Title","tag":"plain_text"},"template":"green"},"body":{"elements":[]}}}'
 
-# Dynamic card (inline JSON constructed from SYSTEM DIRECTIVE spec)
-node {SKILL_DIR}/scripts/send-feishu-card.mjs --json '<CARD_JSON>' --chat-id {current_feishu_chat_id}
+# Equivalent markdown/text notification for another channel
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"telegram","target":{"type":"target_id","id":"12345"},"text":"Notification text"}'
 ```
 
 Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/skills/agent-payment-skills`).
 
-**Card JSON format** (Feishu schema v2 only):
+When the current channel supports structured cards, you may include a Feishu schema v2 card payload:
 ```json
 {
   "schema": "2.0",
@@ -129,7 +113,7 @@ Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/sk
 }
 ```
 
-**Non-Feishu channels:** Skip card sending and use plain text equivalent instead.
+For non-Feishu channels, `send-message.mjs` renders the card to markdown/text and delivers it through the gateway.
 
 ## Card Ownership Matrix (Hard Rule)
 
@@ -138,12 +122,12 @@ Exactly one layer owns each card. Do NOT duplicate card delivery across tool, we
 | Event | Owner | Required behavior |
 |---|---|---|
 | `initialize_wallet` + existing/new binding confirmation | agent/tool result | Send only the returned initialization card(s) |
-| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ 支付成功` and trigger merchant confirmation in the same idempotent success path; agent MUST NOT send another or re-trigger merchant confirm |
-| `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ 支付失败` or `🛡️ 风控规则触发`; agent MUST NOT send another |
-| `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS 验证` card from the returned directive |
-| `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ 支付成功` only if it was not already sent |
+| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ Payment Successful` and trigger merchant confirmation in the same idempotent success path; agent MUST NOT send another or re-trigger merchant confirm |
+| `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ Payment Failed` or `🛡️ Risk Rule Triggered`; agent MUST NOT send another |
+| `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS Verification Required` card from the returned directive |
+| `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ Payment Successful` only if it was not already sent |
 | `agent_order.failed` webhook | payment webhook | Webhook may send failure card only if it was not already sent |
-| Merchant recharge success/failure | merchant confirmation tool | Payment skill MUST NOT send merchant-layer `✅ 充值成功` or `❌ 充值失败` cards |
+| Merchant recharge success/failure | merchant confirmation tool | Payment skill MUST NOT send merchant-layer `✅ Recharge Successful` or `❌ Recharge Failed` cards |
 
 ## Tool Return Contract (Hard Rule)
 
@@ -180,29 +164,74 @@ There are only two valid amount sources for `clink_pay`:
 You MUST NOT invent a third amount from memory, prior turns, habit, or judgment.
 You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary amount unless the user explicitly asked for that amount in the current turn.
 
-## Supported Merchants
+## Merchant Payment Handoff Contract
 
-When a user asks to top up / recharge any of the following merchants, you MUST automatically route the payment through this skill (agent-payment-skills). Do NOT ask the user to pay manually.
+`agent-payment-skills` must remain merchant-agnostic. It must not maintain a centralized supported-merchant list in this prompt.
 
-| Merchant | How to get merchant_id | How to confirm recharge |
-|---|---|---|
-| **ModelMax** | Call `modelmax-media.get_payment_config` | Call `modelmax-media.check_recharge_status` with order_id |
+Every merchant skill that wants to integrate with Clink auto-pay should drive the payment flow itself and call `clink_pay` with fully prepared payment inputs.
 
-**Routing rule**: Any user request like "给 ModelMax 充值", "recharge ModelMax", "top up my ModelMax account", or a 402 response from any supported merchant skill, MUST trigger the following flow:
-1. Call `pre_check_account`
-2. **Always call** the merchant's tool to obtain `merchant_id` (see table above). Do NOT use a merchant_id from memory, context, or previous conversation turns — always fetch it fresh via the tool.
-3. Call `clink_pay` with the merchant_id and amount:
+`merchant_integration` should include:
+- `server`
+- `confirm_tool`
+- optional `confirm_args`
+
+The merchant confirmation tool will receive a structured `payment_handoff` object from the payment layer. That payload includes:
+- `order_id`
+- optional `session_id`
+- `trigger_source`
+- `channel`
+- optional `notify_target`
+
+**Routing rule**: When a merchant skill asks for recharge, auto top-up, or 402 recovery, the merchant skill should:
+1. Call `pre_check_account`.
+2. Prepare fresh payment inputs on the merchant side:
+   - Direct mode: provide `merchant_id`, `default_amount`, and `currency`.
+   - Session mode: provide the fresh `sessionId` produced by the merchant flow.
+3. Call `clink_pay` with the prepared payment inputs plus `merchant_integration`.
    - If the user explicitly specified an amount, use that amount.
-   - **If triggered automatically (402 / low-balance): use the exact `default_amount` and `currency` returned by the merchant's `get_payment_config` tool. Do NOT ask the user. Do NOT pause. Call clink_pay immediately.**
-   - Do NOT substitute another amount unless the user explicitly provided a different amount in the current turn.
+   - If triggered automatically (402 / low-balance) and the user did not override the amount in the current turn, use the exact merchant default.
 4. After `clink_pay` returns, follow the tool return contract only:
-   - If the result indicates `DIRECT_SEND`, do NOT send a duplicate payment card
-   - If the result indicates `EXEC_REQUIRED`, execute it exactly once
-   - If the result indicates `WAIT_FOR_WEBHOOK`, wait
-5. Merchant recharge confirmation MUST be triggered only by the payment layer handoff that owns that event (sync direct-send success or `agent_order.succeeded` webhook fallback). For sync `status=1`, payment-success card delivery and merchant-confirm handoff belong to the same idempotent success path. Do NOT invent a second merchant-confirm step from agent memory.
-6. After merchant recharge is confirmed (via the merchant confirmation tool, such as `check_recharge_status` for ModelMax): **automatically resume the original task** that was interrupted by the insufficient-balance event. Do NOT wait for further user instruction.
+   - If the result indicates `DIRECT_SEND`, do NOT send a duplicate payment card.
+   - If the result indicates `EXEC_REQUIRED`, execute it exactly once.
+   - If the result indicates `WAIT_FOR_WEBHOOK`, wait.
+5. Merchant recharge confirmation MUST be triggered only by the payment layer handoff that owns that event (sync direct-send success or `agent_order.succeeded` webhook fallback). For sync `status=1`, payment-success card delivery and merchant-confirm handoff belong to the same idempotent success path.
+6. After merchant recharge is confirmed by the merchant's declared confirmation tool, automatically resume the interrupted merchant task. Do NOT wait for further user instruction.
+
+`clink_pay` is the low-level payment executor. It should not discover merchant tools, fetch merchant config, guess merchant routing, or own merchant orchestration logic. When it hands success off to the merchant confirmation tool, it sends a structured `payment_handoff` payload instead of ad hoc top-level fields.
+
+## Notify Destination Contract
+
+Async routing metadata is stored in one unified shape:
+
+```json
+{
+  "notifyDestination": {
+    "channel": "feishu",
+    "target": {
+      "type": "chat_id",
+      "id": "oc_xxx"
+    }
+  }
+}
+```
+
+`initialize_wallet`, `install_system_hooks`, and `uninstall_system_hooks` may accept an optional notify destination using:
+- `channel`
+- `target_id`
+- `target_type`
+
+Current scope:
+- `payment_handoff.channel` should mirror the active notify destination channel when one is available.
+- `payment_handoff.notify_target` uses the same `{type,id}` shape across channels. For Feishu, `type` is `chat_id` or `open_id`; for other channels it is usually `target_id`.
+- `initialize_wallet`, `install_system_hooks`, and `uninstall_system_hooks` accept the unified notify destination contract.
 
 ## Instructions & Workflows
+
+Shell examples below assume:
+
+```bash
+MCPORTER_CONFIG_PATH="${OPENCLAW_HOME:-$HOME}/.openclaw/config/mcporter.json"
+```
 
 ### 1. Initialization (Runs once per user)
 When a user installs or uses this skill for the first time:
@@ -210,43 +239,44 @@ When a user installs or uses this skill for the first time:
 2. **Initialize Wallet:** Call `initialize_wallet` with the user's email. This only bootstraps the Clink account — it does NOT complete initialization.
    If calling via shell (do NOT omit --args):
    ```
-   npx mcporter call agent-payment-skills initialize_wallet --args '{"email":"<USER_EMAIL>"}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills initialize_wallet --args '{"email":"<USER_EMAIL>"}'
    ```
+   You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so later async events can route back to the current conversation.
 3. **Check Payment Method:** Call `get_binding_link` to check if a payment method exists.
    If calling via shell:
    ```
-   npx mcporter call agent-payment-skills get_binding_link --args '{}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_binding_link --args '{}'
    ```
    - If none → the user gets a card with a link to bind one. **Wait for the `payment_method.added` webhook callback** before proceeding.
    - If exists → skip to step 4.
 4. **View Risk Rules (Optional):** Call `get_risk_rules_link` to let the user view and optionally configure risk rules. This step is NOT required — initialization is complete once a payment method is bound. Risk rules can be configured at any time.
    If calling via shell:
    ```
-   npx mcporter call agent-payment-skills get_risk_rules_link --args '{}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_risk_rules_link --args '{}'
    ```
-5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or `payment_method.added` webhook received), send the "🎉 Clink 初始化完成！" card. Do NOT wait for risk rules.
+5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or `payment_method.added` webhook received), send the "🎉 Clink Setup Complete!" card. Do NOT wait for risk rules.
 
 ### 2. Execute Payment (Direct or Auto Top-Up)
 When the user requests a recharge or another skill triggers an auto top-up:
-1. **Pre-Check:** Call `pre_check_account` to verify the account is ready. Do NOT send any "🔍 Clink 账户检测通过" card when this check passes.
+1. **Pre-Check:** Call `pre_check_account` to verify the account is ready. Do NOT send any "🔍 Clink Account Check Passed" card when this check passes.
    If calling via shell (do NOT omit --args):
    ```
-   npx mcporter call agent-payment-skills pre_check_account --args '{}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills pre_check_account --args '{}'
    ```
    - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
-2. **Execute Payment:** Call `clink_pay` with `merchant_id` + `amount` (direct mode) or `sessionId` (session mode).
+2. **Execute Payment:** The merchant skill must call `clink_pay` directly with fully prepared payment inputs plus `merchant_integration`.
    If calling via shell (do NOT omit --args, replace placeholders):
    ```
    # Direct mode:
-   npx mcporter call agent-payment-skills clink_pay --args '{"merchant_id":"<MERCHANT_ID>","amount":<AMOUNT>,"currency":"USD"}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"merchant_id":"<MERCHANT_ID>","amount":<AMOUNT>,"currency":"USD","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
    # Session mode:
-   npx mcporter call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>"}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
    ```
 3. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
 4. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
-   - `agent_order.succeeded` → Payment webhook may send `✅ 支付成功` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
+   - `agent_order.succeeded` → Payment webhook may send `✅ Payment Successful` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
    - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
-   - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS 验证` card, then waits for webhook
+   - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS Verification Required` card, then waits for webhook
 5. **Handle Failures:**
    - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
    - Email mismatch → Show the security block card. Do NOT retry.
@@ -255,20 +285,21 @@ When the user requests a recharge or another skill triggers an auto top-up:
 ### 2.5 Payment Method Management
 When the user asks to view or manage their payment methods:
 1. **Show Current Status:** Call `get_binding_link` to display current payment method and email as an informational card.
-2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. Send a "⚙️ 支付方式管理" card with the link.
-3. **Confirm Update:** After the user returns from the external page, send a "✅ 支付方式已更新" card showing:
-   - 当前支付方式: updated ✓
-   - 通知邮箱: confirmed ✓
-   - 风控规则: 保持不变 ✓
+2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. Send a "⚙️ Payment Method Management" card with the link.
+3. **Confirm Update:** After the user returns from the external page, send a "✅ Payment Method Updated" card showing:
+   - Current payment method: updated ✓
+   - Notification email: confirmed ✓
+   - Risk rules: unchanged ✓
 
 ### 3. Post-Installation Setup (Strict Single-Step Workflow)
 
 When the user asks to install this skill, the agent MUST follow this exact workflow:
 
 1. **Run pre-install immediately**
-   Registers MCP, writes config, verifies the route write, spawns the post-restart notify process, and sends the status card in one command:
-   - **Feishu group chat:** `node {SKILL_DIR}/scripts/pre_install.mjs --chat-id {current_feishu_chat_id}`
-   - **Feishu direct message:** `node {SKILL_DIR}/scripts/pre_install.mjs --open-id {current_feishu_open_id}`
+   Registers MCP, writes config, verifies the route write, spawns the post-restart notify process, and sends the status notification in one command:
+   - **Feishu group chat:** `node {SKILL_DIR}/scripts/pre_install.mjs --channel feishu --target-id {current_feishu_chat_id} --target-type chat_id`
+   - **Feishu direct message:** `node {SKILL_DIR}/scripts/pre_install.mjs --channel feishu --target-id {current_feishu_open_id} --target-type open_id`
+   - **Other channels:** `node {SKILL_DIR}/scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>`
 
    This step is mandatory and must not be skipped.
 
@@ -287,10 +318,10 @@ When the user asks to install this skill, the agent MUST follow this exact workf
 
 4. **Truthfulness guardrail**
    The agent MUST NOT say any of the following unless `pre_install.mjs` has actually succeeded in the current session:
-   - `Webhook 路由已就绪`
-   - `安装完成`
-   - `可以进入钱包初始化`
-   - `重启后通知一定已经配置成功`
+   - `Webhook route is ready`
+   - `Installation completed`
+   - `Wallet initialization can begin`
+   - `The post-restart notification is definitely configured successfully`
 
    A delayed card or notify log entry alone is NOT sufficient proof that installation completed correctly.
 
@@ -299,24 +330,40 @@ When the user asks to install this skill, the agent MUST follow this exact workf
 When the user asks to uninstall this skill, the agent MUST follow the same strict workflow:
 
 1. **Send Uninstall Authorization Card**:
-   - **Feishu channel:** Run: `node {SKILL_DIR}/scripts/send-feishu-card.mjs {SKILL_DIR}/cards/uninstall_request.json --chat-id {current_feishu_chat_id}`
-   - **Non-Feishu channel:** Send plain text: "⚠️ 卸载将执行以下不可逆操作：删除 Webhook 拦截器、清除配置、删除目录、重启网关。\n\n请回复 \"确认卸载\" 以确认。"
-   - Do NOT execute any destructive operations yet. After sending the card, you may add a short natural-language reminder that uninstall is waiting for text confirmation.
+   - Send exactly one uninstall authorization notification appropriate for the current channel.
+   - Feishu may use the existing uninstall card payload. Other channels should receive equivalent markdown/text: "⚠️ Uninstall will perform the following irreversible actions: remove the webhook interceptor, clear configuration, delete the skill directory, and restart the gateway.\n\nReply with \"Confirm uninstall\" to proceed."
+   - Do NOT execute any destructive operations yet. After sending the notification, you may add a short natural-language reminder that uninstall is waiting for text confirmation.
 
 2. **Wait for Text Approval**:
-   Pause execution. **Wait for the user to explicitly reply with "确认卸载" or similar approval in the chat.**
+   Pause execution. **Wait for the user to explicitly reply with "Confirm uninstall" or similar approval in the chat.**
 
 3. **Execute Uninstall**:
-   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with `target_id` set to the current chat's open_id (same as install). Do NOT manually run `openclaw mcp remove`, edit `openclaw.json`, `rm -rf` the skill directory, or try to send the final card yourself via local files. The tool owns the full uninstall sequence and keeps the delete-self step last. This tool will:
+   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with the current notify destination if available (`channel`, `target_id`, `target_type`). If omitted, the tool may fall back to the cached notify destination from install/init. Do NOT manually run `mcporter config remove`, edit `openclaw.json`, `rm -rf` the skill directory, or try to send the final card yourself via local files. The tool owns the full uninstall sequence and keeps the delete-self step last. This tool will:
    - Remove `my_payment_webhook.js` from `~/.openclaw/hooks/transforms/`.
    - Remove the `hooks/clink/payment` route mapping from `openclaw.json` `hooks.mappings`.
    - Remove Clink skill config (`skills.entries["agent-payment-skills"]`) from `openclaw.json`.
-   - Unregister the MCP server: `openclaw mcp remove agent-payment-skills`.
+   - Unregister the MCP server from `mcporter --config "$MCPORTER_CONFIG_PATH"`.
    - Remove the skill directory.
    - Schedule an async gateway restart (3-second delay, non-blocking).
 
 4. **Final Confirmation**:
-   The tool will return immediately. You MUST send an "🗑️ Clink Payment Skill 卸载执行中" card to the user stating that uninstall is in progress and the gateway will automatically restart after the uninstall completes.
+   The tool will return immediately. You MUST send a "🗑️ Clink Payment Skill Uninstall In Progress" notification to the user stating that uninstall is in progress and the gateway will automatically restart after the uninstall completes.
+
+## Code Change Guardrail
+
+Do not modify source code or skill files in this directory unless the user explicitly asks for a code or documentation change.
+
+If the user explicitly requests a fix, refactor, or documentation update, you may modify:
+- `index.mjs`
+- `hooks/my_payment_webhook.js`
+- `scripts/*.mjs`
+- `cards/*.json`
+- `SKILL.md`
+
+When making changes:
+- Keep edits narrowly scoped to the requested issue
+- Preserve card ownership and tool-return rules defined in this skill
+- Do not make unrelated refactors
 
 ## API References
 - API Documentation: `https://docs.clinkbill.com/`

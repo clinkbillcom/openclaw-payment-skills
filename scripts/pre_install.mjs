@@ -4,16 +4,17 @@
  * No npm dependencies — only Node.js built-ins.
  *
  * Usage:
- *   node pre_install.mjs --chat-id oc_xxx
- *   node pre_install.mjs --open-id ou_xxx
+ *   node pre_install.mjs --channel feishu --target-id oc_xxx --target-type chat_id
+ *   node pre_install.mjs --channel feishu --target-id ou_xxx --target-type open_id
+ *   node pre_install.mjs --channel telegram --target-id 12345 --target-type target_id
  *
  * What it does (all in one):
- *   1. Registers the MCP server via npx mcporter config add (or mcp add as fallback)
- *   2. Stores notifyTargetId in clink.config.json
+ *   1. Registers the MCP server via npx mcporter --config <path> config add
+ *   2. Stores notifyDestination in clink.config.json
  *   3. Copies hooks/my_payment_webhook.js → ~/.openclaw/hooks/transforms/
  *   4. Injects webhook mapping into ~/.openclaw/openclaw.json and verifies
- *   5. Writes + spawns background notify process (polls for gateway, then sends post-restart card)
- *   6. Sends the status card
+ *   5. Writes + spawns background notify process (polls for gateway, then sends post-restart notification)
+ *   6. Sends the status notification
  *
  * After this script exits, the agent only needs to run: openclaw gateway restart
  */
@@ -22,31 +23,102 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
-import { execFileSync, execSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 
+function resolveOpenClawHome() {
+  const explicitHome = typeof process.env.OPENCLAW_HOME === 'string' ? process.env.OPENCLAW_HOME.trim() : '';
+  if (explicitHome && explicitHome !== 'undefined') {
+    return explicitHome;
+  }
+  return os.homedir();
+}
+
 const SKILL_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const OPENCLAW_DIR = path.join(os.homedir(), '.openclaw');
+const OPENCLAW_HOME = resolveOpenClawHome();
+const OPENCLAW_DIR = path.join(OPENCLAW_HOME, '.openclaw');
 const CONFIG_PATH = path.join(OPENCLAW_DIR, 'openclaw.json');
+const MCPORTER_CONFIG_PATH = path.join(OPENCLAW_DIR, 'config', 'mcporter.json');
 const BUNDLE = path.join(SKILL_DIR, 'index.bundle.mjs');
-const SEND_CARD = path.join(SKILL_DIR, 'scripts', 'send-feishu-card.mjs');
+const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
 const AUTH_CARD = path.join(SKILL_DIR, 'cards', 'auth_request.json');
 
 // --- Parse args ---
 const args = process.argv.slice(2);
-let chatId = null;
-let openId = null;
-for (let i = 0; i < args.length; i++) {
-  if ((args[i] === '--chat-id' || args[i] === '--open-id') && args[i + 1]) {
-    if (args[i] === '--chat-id') chatId = args[++i];
-    else openId = args[++i];
-  }
-}
-const targetId = chatId ?? openId;
-const targetFlag = openId ? '--open-id' : '--chat-id';
 
-if (!targetId) {
-  console.error('Error: --chat-id or --open-id is required');
+function parseNotifyDestination(argv) {
+  let channel = '';
+  let targetId = '';
+  let targetType = '';
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) {
+      continue;
+    }
+    if (arg === '--channel') {
+      channel = value.trim().toLowerCase();
+      i++;
+      continue;
+    }
+    if (arg === '--target-id') {
+      targetId = value.trim();
+      i++;
+      continue;
+    }
+    if (arg === '--target-type') {
+      targetType = value.trim();
+      i++;
+      continue;
+    }
+  }
+
+  if (!channel && !targetId && !targetType) {
+    throw new Error('A notify target is required. Use --channel, --target-id, and --target-type.');
+  }
+  if (!channel || !targetId || !targetType) {
+    throw new Error('--channel, --target-id, and --target-type must be provided together.');
+  }
+  if (channel === 'feishu' && targetType !== 'chat_id' && targetType !== 'open_id') {
+    throw new Error('--target-type must be "chat_id" or "open_id" when --channel feishu is used.');
+  }
+  return {
+    channel,
+    target: { type: targetType, id: targetId },
+  };
+}
+
+function buildNotificationPayload(notifyDestination, notification) {
+  const payload = {
+    channel: notifyDestination.channel,
+    target: notifyDestination.target,
+    deliver: true,
+  };
+  if (notification?.card) {
+    payload.card = notification.card;
+  }
+  if (typeof notification?.text === 'string' && notification.text.trim()) {
+    payload.text = notification.text.trim();
+  }
+  return payload;
+}
+
+async function loadCard(cardPath) {
+  return JSON.parse(await fs.readFile(cardPath, 'utf8'));
+}
+
+async function renderWebhookModule(skillDir) {
+  const webhookTemplatePath = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
+  const webhookSource = await fs.readFile(webhookTemplatePath, 'utf8');
+  return webhookSource.split('__AGENT_PAYMENT_SKILL_DIR__').join(JSON.stringify(skillDir));
+}
+
+let notifyDestination;
+try {
+  notifyDestination = parseNotifyDestination(args);
+} catch (error) {
+  console.error(`Error: ${error.message}`);
   process.exit(1);
 }
 
@@ -67,34 +139,37 @@ async function saveConfig(config) {
 // --- Step 1: Register MCP server ---
 console.log('Step 1: Registering MCP server...');
 try {
-  execSync(`npx mcporter config add agent-payment-skills "node ${BUNDLE}"`, {
-    stdio: 'inherit',
-    shell: true,
-  });
+  execFileSync('npx', [
+    'mcporter',
+    '--config',
+    MCPORTER_CONFIG_PATH,
+    'config',
+    'add',
+    'agent-payment-skills',
+    `node ${BUNDLE}`,
+  ], { stdio: 'inherit' });
   console.log('  ✅ Registered via npx mcporter');
 } catch (e2) {
   console.warn('  ⚠️  MCP registration skipped (will be active after gateway restart):', e2.message);
 }
 
-// --- Store target_id in clink.config.json so webhook can resolve chat_id at runtime ---
+// --- Store notify destination in clink.config.json so webhook can resolve the current target at runtime ---
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 try {
   let cache = {};
   try { cache = JSON.parse(await fs.readFile(CACHE_PATH, 'utf8')); } catch {}
-  cache.notifyTargetId = targetId;
-  cache.notifyTargetType = openId ? 'open_id' : 'chat_id';
+  cache.notifyDestination = notifyDestination;
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
-  console.log(`  ✅ Saved notify target: ${targetId}`);
+  console.log(`  ✅ Saved notify target: ${notifyDestination.channel}/${notifyDestination.target.type}/${notifyDestination.target.id}`);
 } catch (e) {
-  console.warn('  ⚠️  Could not save target_id to cache:', e.message);
+  console.warn('  ⚠️  Could not save notify destination to cache:', e.message);
 }
 
 // --- Step 2: Copy webhook file ---
 console.log('Step 2: Installing webhook transform...');
-const webhookSrc = path.join(SKILL_DIR, 'hooks', 'my_payment_webhook.js');
 const webhookDst = path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.js');
 await fs.mkdir(path.dirname(webhookDst), { recursive: true });
-await fs.copyFile(webhookSrc, webhookDst);
+await fs.writeFile(webhookDst, await renderWebhookModule(SKILL_DIR), 'utf8');
 console.log('  ✅ Webhook copied');
 
 // --- Step 3: Inject config ---
@@ -137,7 +212,7 @@ try {
 } catch {}
 
 const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_notify.mjs');
-const postRestartCard = JSON.stringify({
+const postRestartCard = {
   schema: '2.0',
   header: { title: { content: '✅ Clink 支付组件已上线', tag: 'plain_text' }, template: 'green' },
   body: { elements: [
@@ -145,16 +220,15 @@ const postRestartCard = JSON.stringify({
     { tag: 'hr' },
     { tag: 'markdown', content: `🔐 **最后一步：钱包初始化**\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\n\n如需继续使用之前的邮箱：\n\`\`\`\n${userEmail}\n\`\`\`` : ''}` }
   ]}
-});
+};
+const postRestartPayload = buildNotificationPayload(notifyDestination, { card: postRestartCard });
 
 const notifyCode = `
 import { execFileSync, execSync } from 'child_process';
 import { appendFile } from 'fs/promises';
 
-const sendCard = ${JSON.stringify(SEND_CARD)};
-const card = ${JSON.stringify(postRestartCard)};
-const flag = ${JSON.stringify(targetFlag)};
-const id = ${JSON.stringify(targetId)};
+const sendMessage = ${JSON.stringify(MESSAGE_SENDER)};
+const payload = ${JSON.stringify(JSON.stringify(postRestartPayload))};
 const log = ${JSON.stringify(path.join(SKILL_DIR, 'error.log'))};
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -185,8 +259,8 @@ while (!isGatewayUp() && waited < MAX_WAIT_MS) {
 }
 
 try {
-  execFileSync(process.execPath, [sendCard, '--json', card, flag, id], { stdio: 'pipe' });
-  await appendFile(log, '[' + new Date().toISOString() + '] [notify] post-restart card sent ok (waited ' + waited + 'ms)\\n');
+  execFileSync(process.execPath, [sendMessage, '--payload', payload], { stdio: 'pipe' });
+  await appendFile(log, '[' + new Date().toISOString() + '] [notify] post-restart notification sent ok (waited ' + waited + 'ms)\\n');
 } catch (e) {
   await appendFile(log, '[' + new Date().toISOString() + '] [notify] FAILED: ' + e.message + '\\n');
 }
@@ -201,13 +275,15 @@ const notifyChild = spawn(process.execPath, [notifyScriptPath], {
 notifyChild.unref();
 console.log('  ✅ Notify process spawned');
 
-// --- Step 5: Send status card ---
-console.log('Step 5: Sending status card...');
+// --- Step 5: Send status notification ---
+console.log('Step 5: Sending status notification...');
 try {
-  execFileSync(process.execPath, [SEND_CARD, AUTH_CARD, targetFlag, targetId], { stdio: 'inherit' });
-  console.log('  ✅ Status card sent');
+  const authCard = await loadCard(AUTH_CARD);
+  const authPayload = buildNotificationPayload(notifyDestination, { card: authCard });
+  execFileSync(process.execPath, [MESSAGE_SENDER, '--payload', JSON.stringify(authPayload)], { stdio: 'inherit' });
+  console.log('  ✅ Status notification sent');
 } catch (e) {
-  console.warn('  ⚠️  Could not send status card:', e.message);
+  console.warn('  ⚠️  Could not send status notification:', e.message);
 }
 
 console.log('\nPre-install complete. Now run: openclaw gateway restart');

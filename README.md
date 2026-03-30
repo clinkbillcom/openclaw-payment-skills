@@ -44,7 +44,7 @@ After installation, the agent will guide you through the remaining setup.
 git clone https://github.com/clinkbillcom/agent-payment-skills.git
 cd agent-payment-skills
 npm install
-npx mcporter config add agent-payment-skills "node $(pwd)/index.bundle.mjs"
+npx mcporter --config "${OPENCLAW_HOME:-$HOME}/.openclaw/config/mcporter.json" config add agent-payment-skills "node $(pwd)/index.bundle.mjs"
 ```
 
 ---

@@ -15,16 +15,17 @@
 //   10. risk_rule.updated — risk rules changed
 
 const fs = require('fs/promises');
-const os = require('os');
 const path = require('path');
 const { execFileSync, spawn } = require('child_process');
 
-const SKILL_DIR = path.join(os.homedir(), '.openclaw', 'workspace', 'skills', 'agent-payment-skills');
+const SKILL_DIR = typeof __AGENT_PAYMENT_SKILL_DIR__ === 'string'
+  ? __AGENT_PAYMENT_SKILL_DIR__
+  : path.resolve(__dirname, '..');
 const CACHE_PATH = path.join(SKILL_DIR, 'clink.config.json');
 const LOG_PATH = path.join(SKILL_DIR, 'error.log');
 const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
-const CARD_SENDER = `${SKILL_DIR}/scripts/send-feishu-card.mjs`;
+const MESSAGE_SENDER = `${SKILL_DIR}/scripts/send-message.mjs`;
 
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
@@ -33,19 +34,69 @@ function normalizeCache(cache) {
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
   }
+  if (
+    normalized.notifyDestination &&
+    typeof normalized.notifyDestination === 'object' &&
+    !Array.isArray(normalized.notifyDestination) &&
+    typeof normalized.notifyDestination.channel === 'string' &&
+    normalized.notifyDestination.channel.trim() &&
+    normalized.notifyDestination.target &&
+    typeof normalized.notifyDestination.target === 'object' &&
+    !Array.isArray(normalized.notifyDestination.target) &&
+    typeof normalized.notifyDestination.target.id === 'string' &&
+    normalized.notifyDestination.target.id.trim() &&
+    typeof normalized.notifyDestination.target.type === 'string' &&
+    normalized.notifyDestination.target.type.trim()
+  ) {
+    normalized.notifyDestination = {
+      channel: normalized.notifyDestination.channel.trim().toLowerCase(),
+      target: {
+        type: normalized.notifyDestination.target.type.trim(),
+        id: normalized.notifyDestination.target.id.trim(),
+      },
+    };
+  } else {
+    normalized.notifyDestination = null;
+  }
+  if (
+    normalized.pendingMerchantConfirmation &&
+    typeof normalized.pendingMerchantConfirmation === 'object' &&
+    !Array.isArray(normalized.pendingMerchantConfirmation)
+  ) {
+    const pending = normalized.pendingMerchantConfirmation;
+    if (
+      pending.notifyDestination &&
+      typeof pending.notifyDestination === 'object' &&
+      !Array.isArray(pending.notifyDestination) &&
+      typeof pending.notifyDestination.channel === 'string' &&
+      pending.notifyDestination.channel.trim() &&
+      pending.notifyDestination.target &&
+      typeof pending.notifyDestination.target === 'object' &&
+      !Array.isArray(pending.notifyDestination.target) &&
+      typeof pending.notifyDestination.target.id === 'string' &&
+      pending.notifyDestination.target.id.trim() &&
+      typeof pending.notifyDestination.target.type === 'string' &&
+      pending.notifyDestination.target.type.trim()
+    ) {
+      pending.notifyDestination = {
+        channel: pending.notifyDestination.channel.trim().toLowerCase(),
+        target: {
+          type: pending.notifyDestination.target.type.trim(),
+          id: pending.notifyDestination.target.id.trim(),
+        },
+      };
+    } else {
+      pending.notifyDestination = null;
+    }
+  }
   return normalized;
 }
 
-// Read notify target from cache (stored at install time by install.mjs).
-// Falls back to {current_feishu_chat_id} placeholder if not found.
-let _notifyTarget = null;
-let _notifyFlag = '--chat-id';
+// Read notify destination from cache (stored at install time).
+let _notifyDestination = null;
 try {
-  const cache = JSON.parse(require('fs').readFileSync(CACHE_PATH, 'utf8'));
-  if (cache.notifyTargetId) {
-    _notifyTarget = cache.notifyTargetId;
-    _notifyFlag = cache.notifyTargetType === 'open_id' ? '--open-id' : '--chat-id';
-  }
+  const cache = normalizeCache(JSON.parse(require('fs').readFileSync(CACHE_PATH, 'utf8')));
+  _notifyDestination = cache.notifyDestination || null;
 } catch {}
 
 async function logError(context, error) {
@@ -191,20 +242,6 @@ async function clearPendingMerchantConfirmation() {
   }
 }
 
-// Build an exec directive that sends a v2 Feishu card via send-feishu-card.mjs.
-// Uses the stored notify_target_id (resolved at install time) so the exec command
-// contains the actual chat/open ID — no unresolvable {placeholder} at runtime.
-// Note: JSON.stringify produces double-quoted strings, so no single-quote collision
-// with the outer shell wrapping. HTML attributes must use double quotes (color="green")
-// not single quotes to avoid breaking the shell command.
-function cardExec(cardObj) {
-  const json = JSON.stringify(cardObj);
-  const target = _notifyTarget
-    ? `${_notifyFlag} ${_notifyTarget}`
-    : `--chat-id {current_feishu_chat_id}`;
-  return `exec: node ${CARD_SENDER} --json '${json}' ${target}`;
-}
-
 function formatExecError(error) {
   if (!(error instanceof Error)) return String(error);
   const details = [];
@@ -218,14 +255,50 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-function sendCardDirect(cardObj) {
-  if (!_notifyTarget) {
-    throw new Error('notify_target_id is missing; cannot send card directly');
+function buildNotificationPayload(notification, destination = _notifyDestination) {
+  const channel = typeof destination?.channel === 'string' && destination.channel.trim()
+    ? destination.channel.trim().toLowerCase()
+    : '';
+  const targetType = typeof destination?.target?.type === 'string' && destination.target.type.trim()
+    ? destination.target.type.trim()
+    : '';
+  const targetId = typeof destination?.target?.id === 'string' && destination.target.id.trim()
+    ? destination.target.id.trim()
+    : '';
+  if (!channel || !targetType || !targetId) {
+    throw new Error('notify destination must include channel, target.type, and target.id');
+  }
+  const payload = {
+    channel,
+    target: {
+      type: targetType,
+      id: targetId,
+    },
+    deliver: true,
+  };
+  if (notification?.card) {
+    payload.card = notification.card;
+  }
+  if (typeof notification?.text === 'string' && notification.text.trim()) {
+    payload.text = notification.text.trim();
+  }
+  return payload;
+}
+
+function notificationExec(notification, destination = _notifyDestination) {
+  const payload = buildNotificationPayload(notification, destination);
+  return `exec: node ${MESSAGE_SENDER} --payload ${shellQuote(JSON.stringify(payload))}`;
+}
+
+function sendNotificationDirect(notification, destination = _notifyDestination) {
+  const payload = buildNotificationPayload(notification, destination);
+  if (!payload.target?.id) {
+    throw new Error('notify destination is missing; cannot send notification directly');
   }
 
   execFileSync(
     process.execPath,
-    [CARD_SENDER, '--json', JSON.stringify(cardObj), _notifyFlag, _notifyTarget],
+    [MESSAGE_SENDER, '--payload', JSON.stringify(payload)],
     {
       encoding: 'utf8',
       stdio: 'pipe',
@@ -237,37 +310,40 @@ function sendCardDirect(cardObj) {
 async function sendCardsDirect(context, cards) {
   try {
     for (const card of cards) {
-      sendCardDirect(card);
+      sendNotificationDirect({ card });
     }
     return true;
   } catch (err) {
-    await logError(`${context} direct card send`, formatExecError(err));
+    await logError(`${context} direct notification send`, formatExecError(err));
     return false;
   }
 }
 
-function buildMerchantConfirmArgs(orderId, sessionId, context) {
+function buildMerchantPaymentHandoff(orderId, sessionId, context, triggerSource) {
+  const notifyDestination = context?.notifyDestination || _notifyDestination || null;
+  if (!notifyDestination?.channel || !notifyDestination?.target?.type || !notifyDestination?.target?.id) {
+    throw new Error('merchant handoff requires notifyDestination.channel, notifyDestination.target.type, and notifyDestination.target.id');
+  }
+  const handoff = {
+    order_id: orderId,
+    trigger_source: triggerSource,
+    channel: notifyDestination.channel,
+  };
+  if (typeof sessionId === 'string' && sessionId.trim()) {
+    handoff.session_id = sessionId.trim();
+  }
+  handoff.notify_target = {
+    type: notifyDestination.target.type,
+    id: notifyDestination.target.id,
+  };
+  return handoff;
+}
+
+function buildMerchantConfirmArgs(orderId, sessionId, context, triggerSource) {
   const args = context && typeof context.args === 'object' && context.args
     ? JSON.parse(JSON.stringify(context.args))
     : {};
-  args.order_id = orderId;
-  if (typeof sessionId === 'string' && sessionId.trim()) {
-    args.session_id = sessionId.trim();
-  }
-  const notifyTargetId =
-    typeof context?.notifyTargetId === 'string' && context.notifyTargetId.trim()
-      ? context.notifyTargetId.trim()
-      : _notifyTarget;
-  const notifyTargetType = context?.notifyTargetType === 'open_id' ? 'open_id' : (_notifyFlag === '--open-id' ? 'open_id' : 'chat_id');
-  if (notifyTargetId) {
-    if (notifyTargetType === 'open_id') {
-      args.open_id = notifyTargetId;
-      delete args.chat_id;
-    } else {
-      args.chat_id = notifyTargetId;
-      delete args.open_id;
-    }
-  }
+  args.payment_handoff = buildMerchantPaymentHandoff(orderId, sessionId, context, triggerSource);
   return args;
 }
 
@@ -388,8 +464,8 @@ module.exports = async function(ctx) {
         return null;
       }
 
-      const exec1 = cardExec(successCard);
-      const exec2 = shouldSendCompleteCard ? cardExec(completeCard) : null;
+      const exec1 = notificationExec({ card: successCard });
+      const exec2 = shouldSendCompleteCard ? notificationExec({ card: completeCard }) : null;
 
       return {
         kind: "agent",
@@ -404,15 +480,15 @@ module.exports = async function(ctx) {
 状态: ${data.status || "active"}
 
 [SYSTEM DIRECTIVE] The user has successfully bound a new payment method.${shouldSendCompleteCard ? " Initialization is now complete." : ""}
-YOU MUST send ${shouldSendCompleteCard ? "TWO" : "ONE"} Feishu Interactive Card${shouldSendCompleteCard ? "s" : ""} in order:
+YOU MUST send ${shouldSendCompleteCard ? "TWO" : "ONE"} user notification${shouldSendCompleteCard ? "s" : ""} in order:
 
-Card 1:
+Notification 1:
 ${exec1}
 
-${exec2 ? `Card 2:
+${exec2 ? `Notification 2:
 ${exec2}
 
-` : ""}After sending ${shouldSendCompleteCard ? "both cards" : "the card"}, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+` : ""}After sending ${shouldSendCompleteCard ? "both notifications" : "the notification"}, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -461,10 +537,10 @@ ${exec2}
 新默认卡: ${cardDisplay}
 支付方式 ID: ${data.paymentInstrumentId || "N/A"}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(updateCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: updateCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -496,7 +572,7 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 
       const merchantContext = cache.pendingMerchantConfirmation || null;
       const merchantArgs = merchantContext
-        ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, merchantContext)
+        ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, merchantContext, 'webhook')
         : null;
 
       const successSendResult = await withCardStateLock(rawOrderId, 1, sessionId, async () => {
@@ -519,7 +595,7 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 
         const effectiveMerchantContext = latestCache.pendingMerchantConfirmation || merchantContext;
         const effectiveMerchantArgs = effectiveMerchantContext
-          ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, effectiveMerchantContext)
+          ? buildMerchantConfirmArgs(orderId, data.sessionId || data.session_id || null, effectiveMerchantContext, 'webhook')
           : null;
         if (!effectiveMerchantContext) {
           return 'completed';
@@ -561,13 +637,13 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 客户 ID: ${customerId}
 Session ID: ${sessionDisplay}
 
-[SYSTEM DIRECTIVE] The payment success card was already sent earlier. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
+[SYSTEM DIRECTIVE] The payment success notification was already sent earlier. Your NEXT action MUST be notifying the pending merchant skill to confirm recharge with this exact command:
 \`\`\`
 ${buildMerchantConfirmCommand(successSendResult.merchantContext, successSendResult.merchantArgs)}
 \`\`\`
 
 Rules:
-1. Do NOT send the payment success card again.
+1. Do NOT send the payment success notification again.
 2. Do NOT ask the user any question.
           3. After the merchant confirms recharge, let the merchant skill continue its own success/failure and task-resume flow.`
         };
@@ -586,10 +662,10 @@ Rules:
 客户 ID: ${customerId}
 Session ID: ${sessionDisplay}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(pendingCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: pendingCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
       }
 
@@ -605,15 +681,15 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 客户 ID: ${customerId}
 Session ID: ${sessionDisplay}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately do these steps in order:
-1. Send this Feishu Interactive Card:
-${cardExec(pendingCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately do these steps in order:
+1. Send this user notification:
+${notificationExec({ card: pendingCard })}
 2. Immediately notify the pending merchant skill with this exact command:
 \`\`\`
 ${buildMerchantConfirmCommand(merchantContext, merchantArgs)}
 \`\`\`
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -682,10 +758,10 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(failCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: failCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -725,10 +801,10 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 退款方式: ${card}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(refundCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: refundCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -771,10 +847,10 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 失败原因: ${failureReason}
 客户 ID: ${customerId}
 
-[SYSTEM DIRECTIVE] Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(refundFailCard)}
+[SYSTEM DIRECTIVE] Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: refundFailCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
@@ -815,10 +891,10 @@ After sending the card, you may add a brief natural-language reply if helpful, b
 更新时间: ${data.updatedAt ?? "N/A"}
 
 [SYSTEM DIRECTIVE] Risk rules have been updated and saved to local cache.
-Direct webhook card delivery failed. YOU MUST immediately send this Feishu Interactive Card:
-${cardExec(riskCard)}
+Direct webhook notification delivery failed. YOU MUST immediately send this user notification:
+${notificationExec({ card: riskCard })}
 
-After sending the card, you may add a brief natural-language reply if helpful, but do not repeat the card contents.`
+After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.`
       };
     }
 
