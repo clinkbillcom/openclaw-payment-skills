@@ -1,5 +1,7 @@
 # 商户 Skill 集成 Payment Skill 指南
 
+[English Version](merchant-skill-payment-integration-v1.0.0-en.md) | 简体中文
+
 ## 文档版本
 
 - 文档版本：`v1.0.0`
@@ -131,6 +133,48 @@ Agent 不负责：
 - 必须幂等
 - 必须能处理重复调用
 - 必须区分 `pending`、`paid`、`failed`
+
+严格结果类型建议：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "credited": { "type": "boolean" },
+    "status": { "type": "string", "enum": ["pending", "paid", "failed"] },
+    "merchant_order_id": { "type": "string" },
+    "message": { "type": "string" },
+    "retryable": { "type": "boolean" }
+  },
+  "required": ["credited", "status"],
+  "additionalProperties": true
+}
+```
+
+字段约束：
+
+- `credited`
+  - 类型必须是 `boolean`
+  - `true` 表示商户侧已经到账
+  - `false` 表示尚未到账或已确认失败
+- `status`
+  - 类型必须是 `string`
+  - 只允许：`pending`、`paid`、`failed`
+- `merchant_order_id`
+  - 可选
+  - 建议返回商户侧订单号，便于日志和排障
+- `message`
+  - 可选
+  - 给 Agent 的简短说明，不要用它替代结构化状态
+- `retryable`
+  - 可选
+  - 仅在 `status=failed` 时用于说明是否值得后续重试
+
+禁止返回：
+
+- 只有自然语言，没有结构化字段
+- `status: "success"`、`"done"`、`"ok"` 这类非约定值
+- 把到账状态塞进 `message`，但不返回 `credited` / `status`
 
 ## 4. 商户 Skill 的 Agent 提示词必须写清楚什么
 
@@ -418,6 +462,18 @@ modelmax-media.check_recharge_status
 
 - 宣布商户侧支付/充值成功
 - 恢复原先被中断的主任务
+
+如果商户返回：
+
+```json
+{
+  "credited": false,
+  "status": "pending",
+  "message": "Merchant ledger not updated yet"
+}
+```
+
+则 Agent 必须把它当作“尚未到账”，而不是失败或成功。
 
 ## 11. 接入检查清单
 

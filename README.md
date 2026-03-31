@@ -130,7 +130,8 @@ This is especially useful for recharge-based skills such as media generation ser
 
 ## Developer Docs
 
-- [Merchant Skill Integration Guide for Payment Skill (v1.0.0)](docs/merchant-skill-payment-integration-v1.0.0.md)
+- [Merchant Skill Integration Guide for Payment Skill (English, v1.0.0)](docs/merchant-skill-payment-integration-v1.0.0-en.md)
+- [商户 Skill 集成 Payment Skill 指南（中文，v1.0.0）](docs/merchant-skill-payment-integration-v1.0.0.md)
 
 ---
 

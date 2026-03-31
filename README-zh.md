@@ -130,7 +130,8 @@ npx mcporter config add agent-payment-skills "node $(pwd)/index.bundle.mjs"
 
 ## 开发者文档
 
-- [商户 Skill 集成 Payment Skill 指南（v1.0.0）](docs/merchant-skill-payment-integration-v1.0.0.md)
+- [商户 Skill 集成 Payment Skill 指南（中文，v1.0.0）](docs/merchant-skill-payment-integration-v1.0.0.md)
+- [Merchant Skill Integration Guide for Payment Skill (English, v1.0.0)](docs/merchant-skill-payment-integration-v1.0.0-en.md)
 
 ---
 
