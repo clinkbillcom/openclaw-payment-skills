@@ -83,6 +83,27 @@ const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
 
+function resolveOpenClawExecutable() {
+  const explicit = typeof process.env.OPENCLAW_BIN === 'string' ? process.env.OPENCLAW_BIN.trim() : '';
+  if (explicit && explicit !== 'undefined') {
+    return explicit;
+  }
+  try {
+    const resolved = execFileSync('which', ['openclaw'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    }).trim();
+    return resolved || 'openclaw';
+  } catch {
+    return 'openclaw';
+  }
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
 async function renderWebhookModule(skillDir) {
   const webhookTemplatePath = path.join(skillDir, 'hooks', 'my_payment_webhook.js');
   const webhookSource = await fs.readFile(webhookTemplatePath, 'utf8');
@@ -288,10 +309,6 @@ function getNotifyDestination(cache) {
   return cloneJsonValue(cache.notifyDestination);
 }
 
-function shellQuote(value) {
-  return `'${String(value).replace(/'/g, `'\\''`)}'`;
-}
-
 function buildNotificationPayload(notifyDestination, notification) {
   const channel = typeof notifyDestination?.channel === 'string' && notifyDestination.channel.trim()
     ? notifyDestination.channel.trim().toLowerCase()
@@ -342,6 +359,7 @@ function sendNotificationDirect(notifyDestination, notification) {
 }
 
 function buildPostRestartNotifyScript({
+  openclawBin,
   sendMessageScript,
   payload,
   logPath,
@@ -354,12 +372,15 @@ function buildPostRestartNotifyScript({
 }) {
   return `
 import { execFileSync } from 'child_process';
-import { appendFile } from 'fs/promises';
+import { appendFile, mkdir } from 'fs/promises';
+import path from 'path';
 
+const openclawBin = ${JSON.stringify(openclawBin)};
 const sendMessageScript = ${JSON.stringify(sendMessageScript)};
 const payload = ${JSON.stringify(JSON.stringify(payload))};
 const logPath = ${JSON.stringify(logPath)};
 const initialDelayMs = ${JSON.stringify(initialDelayMs)};
+const maxWaitForDownMs = ${JSON.stringify(maxWaitForDownMs)};
 const maxWaitForUpMs = ${JSON.stringify(maxWaitForUpMs)};
 const pollMs = ${JSON.stringify(pollMs)};
 const sendRetries = ${JSON.stringify(sendRetries)};
@@ -371,56 +392,131 @@ function sleep(ms) {
 
 async function logLine(message) {
   try {
+    await mkdir(path.dirname(logPath), { recursive: true });
     await appendFile(logPath, '[' + new Date().toISOString() + '] [restart-notify] ' + message + '\\n');
   } catch {}
 }
 
-function getGatewayPid() {
+function probeGatewayPid() {
   try {
-    const out = execFileSync('openclaw', ['gateway', 'status', '--require-rpc', '--json'], {
+    const out = execFileSync(openclawBin, ['gateway', 'status', '--require-rpc', '--json'], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 5000,
     });
     const parsed = JSON.parse(out);
     if (parsed && parsed.service && parsed.service.runtime && parsed.service.runtime.pid) {
-      return parsed.service.runtime.pid;
+      return { pid: parsed.service.runtime.pid, error: '' };
     }
-    return null;
-  } catch {
-    return null;
+    return { pid: null, error: 'gateway status did not include runtime pid' };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const stderr =
+      typeof err?.stderr === 'string'
+        ? err.stderr.trim()
+        : Buffer.isBuffer(err?.stderr)
+          ? err.stderr.toString('utf8').trim()
+          : '';
+    const stdout =
+      typeof err?.stdout === 'string'
+        ? err.stdout.trim()
+        : Buffer.isBuffer(err?.stdout)
+          ? err.stdout.toString('utf8').trim()
+          : '';
+    return {
+      pid: null,
+      error: [message, stderr && 'stderr: ' + stderr, stdout && 'stdout: ' + stdout]
+        .filter(Boolean)
+        .join(' | '),
+    };
   }
+}
+
+function formatExecError(err) {
+  const message = err instanceof Error ? err.message : String(err);
+  const stderr =
+    typeof err?.stderr === 'string'
+      ? err.stderr.trim()
+      : Buffer.isBuffer(err?.stderr)
+        ? err.stderr.toString('utf8').trim()
+        : '';
+  const stdout =
+    typeof err?.stdout === 'string'
+      ? err.stdout.trim()
+      : Buffer.isBuffer(err?.stdout)
+        ? err.stdout.toString('utf8').trim()
+        : '';
+  const status = typeof err?.status === 'number' ? 'status: ' + err.status : '';
+  return [message, status, stderr && 'stderr: ' + stderr, stdout && 'stdout: ' + stdout]
+    .filter(Boolean)
+    .join(' | ');
+}
+
+async function waitForInitialPid(maxAttempts) {
+  let lastError = '';
+  for (let i = 0; i < maxAttempts; i++) {
+    const { pid, error } = probeGatewayPid();
+    if (pid) {
+      return { pid, error: lastError };
+    }
+    if (error) {
+      lastError = error;
+    }
+    await sleep(pollMs);
+  }
+  return { pid: null, error: lastError };
 }
 
 await sleep(initialDelayMs);
 
-let initialPid = null;
-for (let i = 0; i < 5; i++) {
-  initialPid = getGatewayPid();
-  if (initialPid) {
-    break;
-  }
-  await sleep(pollMs);
-}
+const initialProbe = await waitForInitialPid(5);
+const initialPid = initialProbe.pid;
 
 if (!initialPid) {
-  await logLine('Could not determine initial gateway PID, continuing anyway...');
+  await logLine('rpc readiness probe did not return an initial PID; continuing without baseline.' + (initialProbe.error ? ' last_error=' + initialProbe.error : ''));
 }
 
-let waited = 0;
-let isRestarted = false;
-while (waited <= maxWaitForUpMs) {
-  const currentPid = getGatewayPid();
-  if (currentPid && currentPid !== initialPid) {
-    isRestarted = true;
+let waitedDown = 0;
+if (initialPid) {
+  let observedDown = false;
+  let lastDownError = '';
+  while (waitedDown <= maxWaitForDownMs) {
+    const { pid, error } = probeGatewayPid();
+    if (error) {
+      lastDownError = error;
+    }
+    if (!pid || pid !== initialPid) {
+      observedDown = true;
+      break;
+    }
+    await sleep(pollMs);
+    waitedDown += pollMs;
+  }
+
+  if (!observedDown) {
+    await logLine('gateway down timeout after ' + maxWaitForDownMs + 'ms' + (lastDownError ? ' | last_error=' + lastDownError : ''));
+    process.exit(1);
+  }
+}
+
+let waitedUp = 0;
+let restartedPid = null;
+let lastUpError = '';
+while (waitedUp <= maxWaitForUpMs) {
+  const { pid, error } = probeGatewayPid();
+  if (error) {
+    lastUpError = error;
+  }
+  if (pid && (!initialPid || pid !== initialPid)) {
+    restartedPid = pid;
     break;
   }
   await sleep(pollMs);
-  waited += pollMs;
+  waitedUp += pollMs;
 }
 
-if (!isRestarted) {
-  await logLine('Gateway did not restart or become healthy before timeout (' + maxWaitForUpMs + 'ms)');
+if (!restartedPid) {
+  await logLine('gateway up timeout after ' + maxWaitForUpMs + 'ms' + (lastUpError ? ' | rpc readiness failed: ' + lastUpError : ''));
   process.exit(1);
 }
 
@@ -433,8 +529,7 @@ for (let attempt = 1; attempt <= sendRetries; attempt++) {
     await logLine('post-restart notification sent on attempt ' + attempt + ' (down_wait=' + waitedDown + 'ms up_wait=' + waitedUp + 'ms)');
     process.exit(0);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    await logLine('send attempt ' + attempt + ' failed: ' + message);
+    await logLine('send-message failed on attempt ' + attempt + ': ' + formatExecError(err));
     if (attempt < sendRetries) {
       await sleep(sendRetryDelayMs);
     }
@@ -2062,6 +2157,7 @@ async function handle_install_system_hooks(args) {
   }
 
   const notifyJsCode = buildPostRestartNotifyScript({
+    openclawBin: resolveOpenClawExecutable(),
     sendMessageScript: MESSAGE_SENDER,
     payload: restartPayload,
     logPath: LOG_PATH,
@@ -2074,11 +2170,12 @@ async function handle_install_system_hooks(args) {
 
   const { spawn } = await import('child_process');
   const nodeBin = process.execPath;
+  const openclawBin = resolveOpenClawExecutable();
 
-  const restartChild = spawn('sh', ['-c', 'sleep 3 && openclaw gateway restart'], { detached: true, stdio: 'ignore' });
+  const restartChild = spawn('sh', ['-c', `sleep 3 && ${shellQuote(openclawBin)} gateway restart`], { detached: true, stdio: 'ignore' });
   restartChild.unref();
 
-  const notifyChild = spawn('sh', ['-c', `sleep 15 && ${nodeBin} ${notifyScriptPath}`], { detached: true, stdio: 'ignore' });
+  const notifyChild = spawn(nodeBin, [notifyScriptPath], { detached: true, stdio: 'ignore' });
   notifyChild.unref();
 
   const emailInstruction = userEmail
