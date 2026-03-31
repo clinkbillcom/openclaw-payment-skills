@@ -75,7 +75,7 @@ The agent must not:
 - send a second semantically equivalent card after the payment skill already sent one
 - declare merchant-side success before merchant credit is actually confirmed
 
-## 3. Minimum Tools the Merchant Skill Must Provide
+## 3. Tools the Merchant Skill Must Provide
 
 ### 3.1 `get_payment_config`
 
@@ -97,7 +97,7 @@ Requirements:
 
 - call it fresh before every payment
 - never reuse `merchant_id` from memory
-- return the latest default amount if the merchant's default policy changes
+- return the latest default amount if the merchant's default payment policy changes
 
 ### 3.2 `check_recharge_status`
 
@@ -144,13 +144,10 @@ Strict result type:
   "type": "object",
   "properties": {
     "credited": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["pending", "paid", "failed"] },
-    "merchant_order_id": { "type": "string" },
-    "message": { "type": "string" },
-    "retryable": { "type": "boolean" }
+    "status": { "type": "string", "enum": ["pending", "paid", "failed"] }
   },
   "required": ["credited", "status"],
-  "additionalProperties": true
+  "additionalProperties": false
 }
 ```
 
@@ -163,21 +160,12 @@ Field constraints:
 - `status`
   - must be a `string`
   - allowed values are only: `pending`, `paid`, `failed`
-- `merchant_order_id`
-  - optional
-  - recommended for merchant-side tracing and debugging
-- `message`
-  - optional
-  - short explanation for the agent; it must not replace the structured status fields
-- `retryable`
-  - optional
-  - mainly useful when `status=failed` to indicate whether retry may make sense later
 
 Do not return:
 
 - only natural language with no structured fields
 - non-contract values like `status: "success"`, `"done"`, or `"ok"`
-- a human explanation in `message` while omitting `credited` / `status`
+- any fields other than `credited` and `status`
 
 ## 4. What Must Be Written into the Merchant Skill Prompt
 
@@ -471,8 +459,7 @@ If the merchant returns:
 ```json
 {
   "credited": false,
-  "status": "pending",
-  "message": "Merchant ledger not updated yet"
+  "status": "pending"
 }
 ```
 

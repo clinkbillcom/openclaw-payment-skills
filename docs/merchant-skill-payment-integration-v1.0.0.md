@@ -72,7 +72,7 @@ Agent 不负责：
 - 在 payment skill 已经发卡后再补一张等价卡片
 - 在商户确认到账前擅自宣布商户侧成功
 
-## 3. 商户 Skill 最少需要提供的工具
+## 3. 商户 Skill 需要提供的工具
 
 ### 3.1 `get_payment_config`
 
@@ -141,13 +141,10 @@ Agent 不负责：
   "type": "object",
   "properties": {
     "credited": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["pending", "paid", "failed"] },
-    "merchant_order_id": { "type": "string" },
-    "message": { "type": "string" },
-    "retryable": { "type": "boolean" }
+    "status": { "type": "string", "enum": ["pending", "paid", "failed"] }
   },
   "required": ["credited", "status"],
-  "additionalProperties": true
+  "additionalProperties": false
 }
 ```
 
@@ -160,21 +157,12 @@ Agent 不负责：
 - `status`
   - 类型必须是 `string`
   - 只允许：`pending`、`paid`、`failed`
-- `merchant_order_id`
-  - 可选
-  - 建议返回商户侧订单号，便于日志和排障
-- `message`
-  - 可选
-  - 给 Agent 的简短说明，不要用它替代结构化状态
-- `retryable`
-  - 可选
-  - 仅在 `status=failed` 时用于说明是否值得后续重试
 
 禁止返回：
 
 - 只有自然语言，没有结构化字段
 - `status: "success"`、`"done"`、`"ok"` 这类非约定值
-- 把到账状态塞进 `message`，但不返回 `credited` / `status`
+- `credited`、`status` 之外的额外字段
 
 ## 4. 商户 Skill 的 Agent 提示词必须写清楚什么
 
@@ -468,8 +456,7 @@ modelmax-media.check_recharge_status
 ```json
 {
   "credited": false,
-  "status": "pending",
-  "message": "Merchant ledger not updated yet"
+  "status": "pending"
 }
 ```
 
