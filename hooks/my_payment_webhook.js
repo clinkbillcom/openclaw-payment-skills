@@ -96,11 +96,37 @@ function normalizeCache(cache) {
   return normalized;
 }
 
+function getPendingNotifyDestination(cache) {
+  const pendingNotifyDestination = normalizeCache(cache).pendingMerchantConfirmation?.notifyDestination || null;
+  return pendingNotifyDestination ? JSON.parse(JSON.stringify(pendingNotifyDestination)) : null;
+}
+
+function getNotifyDestination(cache, preferred = null) {
+  const normalizedPreferred = preferred && typeof preferred === 'object'
+    ? normalizeCache({ notifyDestination: preferred }).notifyDestination
+    : null;
+  if (normalizedPreferred) {
+    return JSON.parse(JSON.stringify(normalizedPreferred));
+  }
+
+  const normalizedCache = normalizeCache(cache);
+  if (normalizedCache.notifyDestination) {
+    return JSON.parse(JSON.stringify(normalizedCache.notifyDestination));
+  }
+
+  const pendingNotifyDestination = getPendingNotifyDestination(normalizedCache);
+  if (pendingNotifyDestination) {
+    return pendingNotifyDestination;
+  }
+
+  return _notifyDestination ? JSON.parse(JSON.stringify(_notifyDestination)) : null;
+}
+
 // Read notify destination from cache (stored at install time).
 let _notifyDestination = null;
 try {
   const cache = normalizeCache(JSON.parse(require('fs').readFileSync(CACHE_PATH, 'utf8')));
-  _notifyDestination = cache.notifyDestination || null;
+  _notifyDestination = getNotifyDestination(cache);
 } catch {}
 
 async function logError(context, error) {
@@ -124,7 +150,12 @@ async function logRequest(context, payload) {
 async function readCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
-    return normalizeCache(JSON.parse(content));
+    const cache = normalizeCache(JSON.parse(content));
+    const notifyDestination = getNotifyDestination(cache);
+    if (notifyDestination) {
+      _notifyDestination = notifyDestination;
+    }
+    return cache;
   } catch (err) {
     await logError('readCache', err);
     return normalizeCache({ cachedAt: null });
@@ -340,10 +371,14 @@ function formatNotificationInstruction(summary, notifications, followUp = []) {
   return sections.join('\n\n');
 }
 
-async function sendCardsDirect(context, cards) {
+async function sendCardsDirect(context, cards, destination = null) {
   try {
+    const effectiveDestination = destination || getNotifyDestination(await readCache());
+    if (effectiveDestination) {
+      _notifyDestination = effectiveDestination;
+    }
     for (const card of cards) {
-      sendNotificationDirect({ notification: card });
+      sendNotificationDirect({ notification: card }, effectiveDestination);
     }
     return true;
   } catch (err) {
@@ -353,7 +388,7 @@ async function sendCardsDirect(context, cards) {
 }
 
 function buildMerchantPaymentHandoff(orderId, sessionId, context, triggerSource) {
-  const notifyDestination = context?.notifyDestination || _notifyDestination || null;
+  const notifyDestination = getNotifyDestination(null, context?.notifyDestination);
   if (!notifyDestination?.channel || !notifyDestination?.target?.type || !notifyDestination?.target?.id) {
     throw new Error('merchant handoff requires notifyDestination.channel, notifyDestination.target.type, and notifyDestination.target.id');
   }
@@ -496,7 +531,7 @@ module.exports = async function(ctx) {
       });
 
       const cardsToSend = shouldSendCompleteCard ? [successCard, completeCard] : [successCard];
-      const sent = await sendCardsDirect('payment_method.added', cardsToSend);
+      const sent = await sendCardsDirect('payment_method.added', cardsToSend, getNotifyDestination(await readCache()));
       if (sent) {
         return null;
       }
@@ -553,7 +588,7 @@ ${formatNotificationInstruction(
         paragraphs: ["后续付款将优先使用这张卡。如需继续之前失败的支付，请直接告诉我重新发起。"],
       });
 
-      const sent = await sendCardsDirect('payment_method.default_change', [updateCard]);
+      const sent = await sendCardsDirect('payment_method.default_change', [updateCard], getNotifyDestination(await readCache()));
       if (sent) {
         return null;
       }
@@ -611,8 +646,9 @@ ${formatNotificationInstruction(
       const successSendResult = await withCardStateLock(rawOrderId, 1, sessionId, async () => {
         const latestCache = await readCache();
         const latestState = getOrderCardState(latestCache, rawOrderId, 1, sessionId);
+        const notifyDestination = getNotifyDestination(latestCache, merchantContext?.notifyDestination);
         if (!latestState?.paymentSuccessCardSent) {
-          const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard]);
+          const sent = await sendCardsDirect('agent_order.succeeded', [pendingCard], notifyDestination);
           if (!sent) {
             return 'send_failed';
           }
@@ -761,10 +797,11 @@ After sending the notification, you may add a brief natural-language reply if he
       const failureSendResult = await withCardStateLock(rawOrderId, normalizedStatus, sessionId, async () => {
         const latestCache = await readCache();
         const latestState = getOrderCardState(latestCache, rawOrderId, normalizedStatus, sessionId);
+        const notifyDestination = getNotifyDestination(latestCache);
         if (latestState?.paymentFailureCardSent) {
           return 'already_sent';
         }
-        const sent = await sendCardsDirect('agent_order.failed', [failCard]);
+        const sent = await sendCardsDirect('agent_order.failed', [failCard], notifyDestination);
         if (!sent) {
           return 'send_failed';
         }
@@ -832,7 +869,7 @@ ${formatNotificationInstruction(
         ],
       });
 
-      const sent = await sendCardsDirect(eventName, [refundCard]);
+      const sent = await sendCardsDirect(eventName, [refundCard], getNotifyDestination(cache));
       if (sent) {
         return null;
       }
@@ -885,7 +922,7 @@ ${formatNotificationInstruction(
         ],
       });
 
-      const sent = await sendCardsDirect(eventName, [refundFailCard]);
+      const sent = await sendCardsDirect(eventName, [refundFailCard], getNotifyDestination(cache));
       if (sent) {
         return null;
       }
@@ -931,7 +968,7 @@ ${formatNotificationInstruction(
         paragraphs: ["风控规则已同步生效，后续充值将按此规则执行。"],
       });
 
-      const sent = await sendCardsDirect('risk_rule.updated', [riskCard]);
+      const sent = await sendCardsDirect('risk_rule.updated', [riskCard], getNotifyDestination(await readCache()));
       if (sent) {
         return null;
       }

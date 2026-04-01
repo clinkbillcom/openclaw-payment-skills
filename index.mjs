@@ -210,6 +210,18 @@ function normalizeCache(cache) {
   return normalized;
 }
 
+function normalizeNotifyDestinationValue(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return null;
+  }
+  return normalizeCache({ notifyDestination: cloneJsonValue(value) }).notifyDestination;
+}
+
+function getPendingNotifyDestination(cache) {
+  const pendingNotifyDestination = normalizeCache(cache).pendingMerchantConfirmation?.notifyDestination || null;
+  return pendingNotifyDestination ? cloneJsonValue(pendingNotifyDestination) : null;
+}
+
 async function logRequest(context, payload, response) {
   const entry = {
     time: new Date().toISOString(),
@@ -354,10 +366,11 @@ async function updateOrderCardState(orderId, status, sessionId, patch) {
 }
 
 function getNotifyDestination(cache) {
-  if (!cache?.notifyDestination) {
-    return null;
+  const normalizedCache = normalizeCache(cache);
+  if (normalizedCache.notifyDestination) {
+    return cloneJsonValue(normalizedCache.notifyDestination);
   }
-  return cloneJsonValue(cache.notifyDestination);
+  return getPendingNotifyDestination(normalizedCache);
 }
 
 function buildNotificationPayload(notifyDestination, notification) {
@@ -649,28 +662,56 @@ function parseNotifyDestinationArgs(args) {
     ? args.target_type.trim()
     : '';
   const hasAny = Boolean(channel || targetId || targetType || chatId || openId);
-  if (!hasAny) {
-    return null;
+  if (hasAny) {
+    if (chatId) {
+      throw new Error('chat_id is no longer supported. Use channel + target_id + target_type.');
+    }
+    if (openId) {
+      throw new Error('open_id is no longer supported. Use channel + target_id + target_type.');
+    }
+    if (!channel || !targetId || !targetType) {
+      throw new Error('channel, target_id, and target_type must be provided together.');
+    }
+    if (channel === 'feishu' && targetType !== 'chat_id' && targetType !== 'open_id') {
+      throw new Error('target_type must be "chat_id" or "open_id" for feishu.');
+    }
+    return {
+      channel,
+      target: {
+        type: targetType,
+        id: targetId,
+      },
+    };
   }
-  if (chatId) {
-    throw new Error('chat_id is no longer supported. Use channel + target_id + target_type.');
+
+  const directCandidate = normalizeNotifyDestinationValue(
+    args?.notifyDestination || args?.notify_destination || null,
+  );
+  if (directCandidate) {
+    return directCandidate;
   }
-  if (openId) {
-    throw new Error('open_id is no longer supported. Use channel + target_id + target_type.');
+
+  const nestedChannel = typeof args?.notify_channel === 'string' && args.notify_channel.trim()
+    ? args.notify_channel.trim().toLowerCase()
+    : '';
+  const nestedTarget = args?.notifyTarget || args?.notify_target || null;
+  const nestedCandidate = normalizeNotifyDestinationValue({
+    channel: nestedChannel || channel,
+    target: nestedTarget,
+  });
+  if (nestedCandidate) {
+    return nestedCandidate;
   }
-  if (!channel || !targetId || !targetType) {
-    throw new Error('channel, target_id, and target_type must be provided together.');
+
+  const handoffCandidate = normalizeNotifyDestinationValue({
+    channel: args?.payment_handoff?.channel,
+    target: args?.payment_handoff?.notify_target,
+  });
+  if (handoffCandidate) {
+    return handoffCandidate;
   }
-  if (channel === 'feishu' && targetType !== 'chat_id' && targetType !== 'open_id') {
-    throw new Error('target_type must be "chat_id" or "open_id" for feishu.');
-  }
-  return {
-    channel,
-    target: {
-      type: targetType,
-      id: targetId,
-    },
-  };
+
+  return null;
 }
 
 function parseRequiredMerchantIntegration(raw) {
@@ -699,12 +740,13 @@ function parseRequiredMerchantIntegration(raw) {
 }
 async function savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination) {
   const cache = await readPaymentMethodsCache() || {};
+  const resolvedNotifyDestination = notifyDestination || getNotifyDestination(cache);
   cache.pendingMerchantConfirmation = {
     server: merchantIntegration.server,
     tool: merchantIntegration.confirmTool,
     args: merchantIntegration.confirmArgs,
     sessionId: typeof sessionId === 'string' && sessionId.trim() ? sessionId.trim() : null,
-    notifyDestination: notifyDestination ? cloneJsonValue(notifyDestination) : null,
+    notifyDestination: resolvedNotifyDestination ? cloneJsonValue(resolvedNotifyDestination) : null,
     createdAt: new Date().toISOString(),
   };
   await writePaymentMethodsCache(cache);
@@ -1519,6 +1561,22 @@ async function handle_clink_pay(args) {
     return `ERROR: ${error.message}`;
   }
 
+  let requestNotifyDestination = null;
+  try {
+    requestNotifyDestination = parseNotifyDestinationArgs(args);
+  } catch (error) {
+    return `ERROR: ${error.message}`;
+  }
+  if (requestNotifyDestination) {
+    try {
+      const cache = normalizeCache(await readPaymentMethodsCache() || {});
+      cache.notifyDestination = requestNotifyDestination;
+      await writePaymentMethodsCache(cache);
+    } catch (error) {
+      await logError('clink_pay/saveNotifyDestination', error);
+    }
+  }
+
   const env = await getPaymentEnv();
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return "Wallet not initialized. Please run initialize_wallet first.";
@@ -1634,8 +1692,9 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
         const sendResult = await withCardStateLock(orderId, 1, sessionId, async () => {
           const latestCache = normalizeCache(await readPaymentMethodsCache() || {});
           const latestState = getOrderCardState(latestCache, orderId, 1, sessionId);
+          const latestNotifyDestination = getNotifyDestination(latestCache) || notifyDestination || requestNotifyDestination || null;
           if (!latestState?.paymentSuccessCardSent) {
-            sendNotificationDirect(notifyDestination, { notification: successNotification });
+            sendNotificationDirect(latestNotifyDestination, { notification: successNotification });
             await updateOrderCardState(orderId, 1, sessionId, {
               paymentSuccessCardSent: true,
               paymentSuccessCardSentAt: new Date().toISOString(),
@@ -1651,7 +1710,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
             return 'completed';
           }
 
-          const effectiveNotifyDestination = effectiveMerchantContext.notifyDestination || notifyDestination || null;
+          const effectiveNotifyDestination = effectiveMerchantContext.notifyDestination || latestNotifyDestination || null;
           const merchantArgs = buildMerchantConfirmArgs(
             effectiveMerchantContext,
             buildMerchantPaymentHandoff(orderId, sessionId, effectiveNotifyDestination, 'sync_charge_response'),
@@ -1764,10 +1823,11 @@ Wait for the later async webhook to continue the merchant confirmation and origi
         const sendResult = await withCardStateLock(orderId, status, sessionId, async () => {
           const latestCache = normalizeCache(await readPaymentMethodsCache() || {});
           const latestState = getOrderCardState(latestCache, orderId, status, sessionId);
+          const latestNotifyDestination = getNotifyDestination(latestCache) || notifyDestination || requestNotifyDestination || null;
           if (latestState?.paymentFailureCardSent) {
             return 'already_sent';
           }
-          sendNotificationDirect(notifyDestination, { notification: failNotification });
+          sendNotificationDirect(latestNotifyDestination, { notification: failNotification });
           await updateOrderCardState(orderId, status, sessionId, {
             paymentFailureCardSent: true,
             paymentFailureCardSentAt: new Date().toISOString(),
@@ -2079,6 +2139,17 @@ The merchant-side recharge confirmation and original-task resume must be driven 
 async function handle_clink_refund(args) {
   if (!args || typeof args !== 'object') {
     return "ERROR: clink_refund requires an args object. Missing: orderId.";
+  }
+
+  try {
+    const requestNotifyDestination = parseNotifyDestinationArgs(args);
+    if (requestNotifyDestination) {
+      const cache = normalizeCache(await readPaymentMethodsCache() || {});
+      cache.notifyDestination = requestNotifyDestination;
+      await writePaymentMethodsCache(cache);
+    }
+  } catch (error) {
+    return `ERROR: ${error.message}`;
   }
 
   const orderId = typeof args.orderId === 'string' ? args.orderId.trim() : '';
@@ -2538,7 +2609,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
             description: "Merchant handoff contract. Required fields: server, confirm_tool. Optional field: confirm_args."
           },
           paymentInstrumentId: { type: "string" },
-          paymentMethodType: { type: "string" }
+          paymentMethodType: { type: "string" },
+          channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination." },
+          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." }
         },
         required: ["merchant_integration"]
       }
@@ -2549,7 +2623,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: "object",
         properties: {
-          orderId: { type: "string", description: "Clink order ID to refund in full" }
+          orderId: { type: "string", description: "Clink order ID to refund in full" },
+          channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination." },
+          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." }
         },
         required: ["orderId"]
       }
