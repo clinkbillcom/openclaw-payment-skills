@@ -74,6 +74,33 @@ export function renderNotificationMarkdown(notification) {
   return sections.join('\n\n').trim();
 }
 
+export function renderNotificationPlainText(notification) {
+  const normalized = createNotification(notification || {});
+  const sections = [];
+
+  if (normalized.title) {
+    sections.push(normalized.title);
+  }
+
+  if (normalized.details.length > 0) {
+    sections.push(normalized.details.map((detail) => `${detail.label}: ${detail.value}`).join('\n'));
+  }
+
+  if (normalized.paragraphs.length > 0) {
+    sections.push(normalized.paragraphs.join('\n\n'));
+  }
+
+  if (normalized.actions.length > 0) {
+    sections.push(
+      normalized.actions
+        .map((action) => (action.url ? `${action.label}: ${action.url}` : action.label))
+        .join('\n'),
+    );
+  }
+
+  return sections.join('\n\n').trim();
+}
+
 export function renderNotificationFeishuCard(notification) {
   const normalized = createNotification(notification || {});
   const elements = [];

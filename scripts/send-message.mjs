@@ -1,10 +1,34 @@
 #!/usr/bin/env node
 import { execFileSync } from 'child_process';
+import fs from 'fs';
 import path from 'path';
-import { renderNotificationFeishuCard, renderNotificationMarkdown } from '../notification-utils.js';
+import {
+  renderNotificationFeishuCard,
+  renderNotificationMarkdown,
+  renderNotificationPlainText,
+} from '../notification-utils.js';
 
 const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const FEISHU_CARD_SENDER = path.join(SCRIPT_DIR, 'send-feishu-card.mjs');
+const LOG_PATH = path.join(SCRIPT_DIR, '..', 'error.log');
+
+function logScriptError(context, error) {
+  const parts = [
+    `[${new Date().toISOString()}] [${context}]`,
+    error instanceof Error ? error.stack || error.message : String(error),
+  ];
+  if (error && typeof error === 'object') {
+    if (typeof error.stdout === 'string' && error.stdout.trim()) {
+      parts.push(`stdout: ${error.stdout.trim()}`);
+    }
+    if (typeof error.stderr === 'string' && error.stderr.trim()) {
+      parts.push(`stderr: ${error.stderr.trim()}`);
+    }
+  }
+  try {
+    fs.appendFileSync(LOG_PATH, `${parts.join('\n')}\n`, 'utf8');
+  } catch {}
+}
 
 function parseArgs(argv) {
   let payloadJson = '';
@@ -148,32 +172,24 @@ function renderCardToMarkdown(card) {
   return sections.join('\n\n').trim();
 }
 
-function buildSimpleFeishuCard(text) {
-  return {
-    schema: '2.0',
-    header: {
-      title: {
-        content: '通知',
-        tag: 'plain_text',
-      },
-      template: 'blue',
-    },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: String(text || '').trim(),
-        },
-      ],
-    },
-  };
-}
-
 function resolveNotification(payload) {
   if (payload.notification && typeof payload.notification === 'object' && !Array.isArray(payload.notification)) {
     return payload.notification;
   }
   return null;
+}
+
+function resolveText(payload, { plainText = false } = {}) {
+  const notification = resolveNotification(payload);
+  if (notification) {
+    return plainText
+      ? renderNotificationPlainText(notification)
+      : renderNotificationMarkdown(notification);
+  }
+  if (typeof payload.text === 'string' && payload.text.trim()) {
+    return payload.text.trim();
+  }
+  return renderCardToMarkdown(payload.card);
 }
 
 function normalizeTarget(payload) {
@@ -210,38 +226,34 @@ function sendFeishuCard(payload) {
 }
 
 function sendFeishuText(payload) {
-  const notification = resolveNotification(payload);
-  const text = notification
-    ? renderNotificationMarkdown(notification)
-    : typeof payload.text === 'string' && payload.text.trim()
-      ? payload.text.trim()
-      : renderCardToMarkdown(payload.card);
+  const text = resolveText(payload, { plainText: true });
   if (!text) {
     throw new Error('No text content available for Feishu delivery');
   }
-  sendFeishuCard({
+  sendViaOpenClawMessage({
     ...payload,
-    card: buildSimpleFeishuCard(text),
+    notification: undefined,
+    card: undefined,
+    text,
   });
 }
 
 function sendViaOpenClawMessage(payload) {
-  const { channel, targetId } = normalizeTarget(payload);
-  if (channel === 'feishu') {
-    throw new Error('Feishu delivery must use the Feishu adapters');
-  }
-  const notification = resolveNotification(payload);
-  const text = notification
-    ? renderNotificationMarkdown(notification)
-    : typeof payload.text === 'string' && payload.text.trim()
-      ? payload.text.trim()
-      : renderCardToMarkdown(payload.card);
+  const { channel, targetId, targetType } = normalizeTarget(payload);
+  const text = resolveText(payload);
   if (!text) {
     throw new Error('No text content available for delivery');
   }
+  const target = channel === 'feishu'
+    ? targetType === 'chat_id'
+      ? `group:${targetId}`
+      : targetType === 'open_id'
+        ? `user:${targetId}`
+        : targetId
+    : targetId;
   execFileSync(
     'openclaw',
-    ['message', 'send', '--channel', channel, '--target', targetId, '--message', text],
+    ['message', 'send', '--channel', channel, '--target', target, '--message', text],
     {
       encoding: 'utf8',
       stdio: 'pipe',
@@ -284,6 +296,7 @@ async function main() {
 }
 
 main().catch((error) => {
+  logScriptError('scripts/send-message', error);
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
 });

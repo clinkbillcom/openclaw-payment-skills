@@ -191,6 +191,22 @@ async function logError(context, error) {
   try { await fs.appendFile(LOG_PATH, line, 'utf8'); } catch {}
 }
 
+async function logNotificationFallback(context, { cache, notification, reason }) {
+  const notifyDestination = getNotifyDestination(cache);
+  await logRequest(`${context}/fallback`, {
+    reason,
+    notificationTitle: typeof notification?.title === 'string' ? notification.title : '',
+    hasNotifyDestination: Boolean(notifyDestination),
+    notifyDestination: notifyDestination ? {
+      channel: typeof notifyDestination.channel === 'string' ? notifyDestination.channel : '',
+      targetType: typeof notifyDestination?.target?.type === 'string' ? notifyDestination.target.type : '',
+      hasTargetId: Boolean(notifyDestination?.target?.id),
+    } : null,
+  }, {
+    fallback: 'instruction_markdown',
+  });
+}
+
 async function readPaymentMethodsCache() {
   try {
     const content = await fs.readFile(CACHE_PATH, 'utf8');
@@ -1074,6 +1090,7 @@ async function handle_get_binding_link() {
         paragraphs: ["完成绑定后 Claw 才能通过 Clink 执行充值。"],
         actions: [{ label: "立即绑定支付方式", url: setupUrl }],
       });
+      let fallbackReason = 'missing_notify_destination';
       if (notifyDestination) {
         try {
           sendNotificationDirect(notifyDestination, { notification });
@@ -1082,9 +1099,11 @@ Wait for the payment_method.added webhook before continuing initialization.
 
 Extracted Binding Token for future use: ${bindingToken}`;
         } catch (err) {
+          fallbackReason = 'direct_send_failed';
           await logError('get_binding_link/direct_send_unbound', err);
         }
       }
+      await logNotificationFallback('get_binding_link/unbound', { cache, notification, reason: fallbackReason });
       return `Clink 账户检测：尚未绑定支付方式。
 ${formatNotificationInstruction({
   summary: 'No payment methods bound.',
@@ -1108,6 +1127,7 @@ ${formatNotificationInstruction({
         ],
         paragraphs: ["已有有效支付方式，无需重新绑卡。继续检测风控规则…"],
       });
+      let fallbackReason = 'missing_notify_destination';
       if (notifyDestination) {
         try {
           sendNotificationDirect(notifyDestination, { notification });
@@ -1117,9 +1137,11 @@ You MUST immediately call get_risk_rules_link to continue the initialization flo
 Current Payment Methods: ${JSON.stringify(methods)}
 Extracted Binding Token for future use: ${bindingToken}`;
         } catch (err) {
+          fallbackReason = 'direct_send_failed';
           await logError('get_binding_link/direct_send_bound', err);
         }
       }
+      await logNotificationFallback('get_binding_link/bound', { cache, notification, reason: fallbackReason });
       return `💳 检测到已绑定的支付方式。
 ${formatNotificationInstruction({
   summary: 'Payment methods found.',
@@ -1152,6 +1174,7 @@ async function handle_get_risk_rules_link() {
     });
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
@@ -1159,10 +1182,12 @@ async function handle_get_risk_rules_link() {
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Risk rules link generated.
 The notification has been sent. Do NOT send another card.`;
       } catch (err) {
+        fallbackReason = 'direct_send_failed';
         await logError('get_risk_rules_link/direct_send', err);
       }
     }
 
+    await logNotificationFallback('get_risk_rules_link', { cache, notification, reason: fallbackReason });
     return formatNotificationInstruction({
       summary: 'Risk rules link generated.',
       notifications: notification,
@@ -1189,6 +1214,7 @@ async function handle_get_payment_method_setup_link() {
     });
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
@@ -1196,10 +1222,12 @@ async function handle_get_payment_method_setup_link() {
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Payment method setup link generated.
 The notification has been sent. Do NOT send another card.`;
       } catch (err) {
+        fallbackReason = 'direct_send_failed';
         await logError('get_payment_method_setup_link/direct_send', err);
       }
     }
 
+    await logNotificationFallback('get_payment_method_setup_link', { cache, notification, reason: fallbackReason });
     return formatNotificationInstruction({
       summary: 'Payment method setup link generated.',
       notifications: notification,
@@ -1230,6 +1258,7 @@ async function handle_get_payment_method_modify_link() {
     });
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
@@ -1239,10 +1268,12 @@ The notification has been sent. Do NOT send another card.
 
 Current Payment Methods: ${JSON.stringify(methods)}`;
       } catch (err) {
+        fallbackReason = 'direct_send_failed';
         await logError('get_payment_method_modify_link/direct_send', err);
       }
     }
 
+    await logNotificationFallback('get_payment_method_modify_link', { cache, notification, reason: fallbackReason });
     return formatNotificationInstruction({
       summary: 'Payment method management link generated.',
       notifications: notification,
