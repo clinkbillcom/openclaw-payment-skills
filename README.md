@@ -55,7 +55,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` already registers the MCP server, configures the webhook route, schedules the gateway restart, and queues the post-restart success notification. Do not run a second manual `openclaw gateway restart` after it succeeds.
+`pre_install.mjs` already registers the MCP server, configures the webhook route, schedules the gateway restart, and sends the install success notification immediately. Do not run a second manual `openclaw gateway restart` after it succeeds.
 
 ---
 

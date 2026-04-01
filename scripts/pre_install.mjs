@@ -13,10 +13,10 @@
  *   2. Stores notifyDestination in clink.config.json
  *   3. Copies hooks/my_payment_webhook.js → ~/.openclaw/hooks/transforms/
  *   4. Injects webhook mapping into ~/.openclaw/openclaw.json and verifies
- *   5. Writes + spawns background notify process (polls for gateway, then sends post-restart notification)
- *   6. Sends the status notification
+ *   5. Schedules the gateway restart in the background
+ *   6. Sends the install success notification immediately
  *
- * After this script exits, the agent only needs to run: openclaw gateway restart
+ * After this script exits, the gateway restart is already scheduled in the background.
  */
 
 import fs from 'fs/promises';
@@ -265,240 +265,35 @@ if (!webhookFileOk) {
 console.log('  ✅ Config updated and verified');
 console.log('  ✅ Webhook route:', CLINK_PATH, '→ my_payment_webhook.js');
 
-// --- Step 4: Write + spawn post-restart notify process ---
-console.log('Step 4: Spawning post-restart notify process...');
-
-let userEmail = '';
-try {
-  const cache = JSON.parse(await fs.readFile(CACHE_PATH, 'utf8'));
-  userEmail = cache?.email || '';
-} catch {}
-
-const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_notify.mjs');
+// --- Step 4: Schedule background restart ---
+console.log('Step 4: Scheduling gateway restart...');
 const OPENCLAW_BIN = resolveOpenClawExecutable();
-const INITIAL_GATEWAY_PROBE = probeGatewayRuntimePid(OPENCLAW_BIN);
-const postRestartNotification = createNotification({
-  title: '✅ Clink 支付组件已上线',
-  theme: 'green',
-  details: [
-    ['Webhook 路由', '已就绪 ✓'],
-    ['网关状态', '重启完毕 ✓'],
-  ],
-  paragraphs: [
-    `最后一步：钱包初始化\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\n\n如需继续使用之前的邮箱：\n\`\`\`\n${userEmail}\n\`\`\`` : ''}`,
-  ],
-});
-const postRestartPayload = buildNotificationPayload(notifyDestination, { notification: postRestartNotification });
-
-const notifyCode = `
-import { execFileSync } from 'child_process';
-import { appendFile, mkdir } from 'fs/promises';
-import path from 'path';
-
-const openclawBin = ${JSON.stringify(OPENCLAW_BIN)};
-const sendMessageScript = ${JSON.stringify(MESSAGE_SENDER)};
-const payload = ${JSON.stringify(JSON.stringify(postRestartPayload))};
-const logPath = ${JSON.stringify(path.join(SKILL_DIR, 'error.log'))};
-const providedInitialPid = ${JSON.stringify(INITIAL_GATEWAY_PROBE.pid)};
-const initialDelayMs = 1000;
-const maxWaitForDownMs = 60000;
-const maxWaitForUpMs = 120000;
-const pollMs = 500;
-const sendRetries = 3;
-const sendRetryDelayMs = 3000;
-
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function logLine(message) {
-  try {
-    await mkdir(path.dirname(logPath), { recursive: true });
-    await appendFile(logPath, '[' + new Date().toISOString() + '] [restart-notify] ' + message + '\\n');
-  } catch {}
-}
-
-function probeGatewayPid() {
-  try {
-    const out = execFileSync(openclawBin, ['gateway', 'status', '--require-rpc', '--json'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 5000,
-    });
-    const parsed = JSON.parse(out);
-    if (parsed && parsed.service && parsed.service.runtime && parsed.service.runtime.pid) {
-      return { pid: parsed.service.runtime.pid, error: '' };
-    }
-    return { pid: null, error: 'gateway status did not include runtime pid' };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    const stderr =
-      typeof err?.stderr === 'string'
-        ? err.stderr.trim()
-        : Buffer.isBuffer(err?.stderr)
-          ? err.stderr.toString('utf8').trim()
-          : '';
-    const stdout =
-      typeof err?.stdout === 'string'
-        ? err.stdout.trim()
-        : Buffer.isBuffer(err?.stdout)
-          ? err.stdout.toString('utf8').trim()
-          : '';
-    return {
-      pid: null,
-      error: [message, stderr && 'stderr: ' + stderr, stdout && 'stdout: ' + stdout]
-        .filter(Boolean)
-        .join(' | '),
-    };
-  }
-}
-
-function formatExecError(err) {
-  const message = err instanceof Error ? err.message : String(err);
-  const stderr =
-    typeof err?.stderr === 'string'
-      ? err.stderr.trim()
-      : Buffer.isBuffer(err?.stderr)
-        ? err.stderr.toString('utf8').trim()
-        : '';
-  const stdout =
-    typeof err?.stdout === 'string'
-      ? err.stdout.trim()
-      : Buffer.isBuffer(err?.stdout)
-        ? err.stdout.toString('utf8').trim()
-        : '';
-  const status = typeof err?.status === 'number' ? 'status: ' + err.status : '';
-  return [message, status, stderr && 'stderr: ' + stderr, stdout && 'stdout: ' + stdout]
-    .filter(Boolean)
-    .join(' | ');
-}
-
-async function waitForInitialPid(maxAttempts) {
-  let lastError = '';
-  for (let i = 0; i < maxAttempts; i++) {
-    const { pid, error } = probeGatewayPid();
-    if (pid) {
-      return { pid, error: lastError };
-    }
-    if (error) {
-      lastError = error;
-    }
-    await sleep(pollMs);
-  }
-  return { pid: null, error: lastError };
-}
-
-await sleep(initialDelayMs);
-
-const initialProbe = providedInitialPid
-  ? { pid: providedInitialPid, error: '' }
-  : await waitForInitialPid(5);
-const initialPid = initialProbe.pid;
-
-if (!initialPid) {
-  await logLine('rpc readiness probe did not return an initial PID; continuing without baseline.' + (initialProbe.error ? ' last_error=' + initialProbe.error : ''));
-} else if (providedInitialPid) {
-  await logLine('using provided baseline pid ' + initialPid);
-}
-
-let waitedDown = 0;
-if (initialPid) {
-  let observedDown = false;
-  let lastDownError = '';
-  while (waitedDown <= maxWaitForDownMs) {
-    const { pid, error } = probeGatewayPid();
-    if (error) {
-      lastDownError = error;
-    }
-    if (!pid || pid !== initialPid) {
-      observedDown = true;
-      break;
-    }
-    await sleep(pollMs);
-    waitedDown += pollMs;
-  }
-
-  if (!observedDown) {
-    await logLine('gateway down timeout after ' + maxWaitForDownMs + 'ms' + (lastDownError ? ' | last_error=' + lastDownError : ''));
-    process.exit(1);
-  }
-}
-
-let waitedUp = 0;
-let restartedPid = null;
-let lastUpError = '';
-while (waitedUp <= maxWaitForUpMs) {
-  const { pid, error } = probeGatewayPid();
-  if (error) {
-    lastUpError = error;
-  }
-  if (pid && (!initialPid || pid !== initialPid)) {
-    restartedPid = pid;
-    break;
-  }
-  await sleep(pollMs);
-  waitedUp += pollMs;
-}
-
-if (!restartedPid) {
-  await logLine('gateway up timeout after ' + maxWaitForUpMs + 'ms' + (lastUpError ? ' | rpc readiness failed: ' + lastUpError : ''));
-  process.exit(1);
-}
-
-for (let attempt = 1; attempt <= sendRetries; attempt++) {
-  try {
-    execFileSync(process.execPath, [sendMessageScript, '--payload', payload], {
-      stdio: 'pipe',
-      timeout: 15000,
-    });
-    await logLine('post-restart notification sent on attempt ' + attempt + ' (down_wait=' + waitedDown + 'ms up_wait=' + waitedUp + 'ms)');
-    process.exit(0);
-  } catch (err) {
-    await logLine('send-message failed on attempt ' + attempt + ': ' + formatExecError(err));
-    if (attempt < sendRetries) {
-      await sleep(sendRetryDelayMs);
-    }
-  }
-}
-
-process.exit(1);
-`;
-
-await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
-await fs.writeFile(notifyScriptPath, notifyCode, 'utf8');
-
 const restartChild = spawn('sh', ['-c', `sleep 3 && ${shellQuote(OPENCLAW_BIN)} gateway restart`], {
   detached: true,
   stdio: 'ignore',
 });
 restartChild.unref();
-
-const notifyChild = spawn(process.execPath, [notifyScriptPath], {
-  detached: true,
-  stdio: 'ignore',
-});
-notifyChild.unref();
-console.log('  ✅ Notify process spawned');
 console.log('  ✅ Gateway restart scheduled');
 
-// --- Step 5: Send status notification ---
-console.log('Step 5: Sending status notification...');
+// --- Step 5: Send install notification ---
+console.log('Step 5: Sending install notification...');
 try {
   const authPayload = buildNotificationPayload(notifyDestination, {
     notification: createNotification({
-      title: '🔌 安装 Clink Payment Skill',
-      theme: 'blue',
+      title: '✅ Clink Payment Skill 安装成功',
+      theme: 'green',
       details: [
-        ['注册 Webhook 回调路由', '已完成 ✓'],
-        ['写入网关配置文件', '已完成 ✓'],
-        ['重启网关进程', '正在重启…'],
+        ['Webhook 路由', '已就绪 ✓'],
+        ['网关重启', '后台处理中 ✓'],
       ],
-      paragraphs: ['网关重启完成后将自动发送下一步提示。'],
+      paragraphs: ['请直接回复您的邮箱地址完成钱包初始化。若网关仍在重启中，稍候几秒后重试即可。'],
     }),
   });
   execFileSync(process.execPath, [MESSAGE_SENDER, '--payload', JSON.stringify(authPayload)], { stdio: 'inherit' });
-  console.log('  ✅ Status notification sent');
+  console.log('  ✅ Install notification sent');
 } catch (e) {
-  console.warn('  ⚠️  Could not send status notification:', e.message);
-  await logInstallError(`status notification failed: ${e.message}`);
+  console.warn('  ⚠️  Could not send install notification:', e.message);
+  await logInstallError(`install notification failed: ${e.message}`);
 }
 
 console.log('\nPre-install complete. Gateway restart has been scheduled automatically.');

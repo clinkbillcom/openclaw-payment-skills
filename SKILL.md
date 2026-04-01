@@ -61,7 +61,7 @@ You MUST:
 ## Install Authorization Rule (Hard Rule)
 
 - User requests to install this skill counts as installation authorization.
-- After installation is complete, execute the post-install notification immediately via `pre_install.mjs` or `send-message.mjs`.
+- After installation is complete, execute the install success notification immediately via `pre_install.mjs` or `send-message.mjs`.
 - Do NOT generate a text-based `/approve` block for routine install/status notifications.
 
 ---
@@ -307,14 +307,14 @@ When the user asks to install this skill, follow `README.md` / `README-zh.md` on
 - Do not substitute a partial MCP-only setup for the documented install flow.
 - Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
 - `pre_install.mjs` already schedules the gateway restart in the background; do not trigger a second manual restart after it succeeds.
-- If the post-restart initialization notification does not arrive, check the skill `error.log` for `[pre-install]` or `[restart-notify]` entries before claiming installation succeeded.
+- Installation success is notified immediately; do not wait for or promise a later restart-success card.
 
 **Truthfulness guardrail**
    The agent MUST NOT say any of the following unless `pre_install.mjs` has actually succeeded in the current session:
    - `Webhook route is ready`
    - `Installation completed`
    - `Wallet initialization can begin`
-   - `The post-restart notification is definitely configured successfully`
+   - `A later restart-success card is definitely configured successfully`
 
    A delayed card or notify log entry alone is NOT sufficient proof that installation completed correctly.
 

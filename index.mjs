@@ -2225,8 +2225,6 @@ async function handle_install_system_hooks(args) {
     return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
   }
 
-  const notifyScriptPath = path.join(OPENCLAW_DIR, 'cache', 'clink_notify.mjs');
-
   if (notifyDestination) {
     try {
       const cache = await readPaymentMethodsCache() || {};
@@ -2238,29 +2236,16 @@ async function handle_install_system_hooks(args) {
     }
   }
 
-  const restartNotification = createNotification({
-    title: '✅ Clink 支付组件已上线',
+  const statusNotification = createNotification({
+    title: '✅ Clink Payment Skill 安装成功',
     theme: 'green',
     details: [
       ['Webhook 路由', '已就绪 ✓'],
-      ['网关状态', '重启完毕 ✓'],
+      ['网关重启', '后台处理中 ✓'],
     ],
     paragraphs: [
-      `最后一步：钱包初始化\n请直接回复您的邮箱地址完成绑定。${userEmail ? `\n\n如需继续使用之前的邮箱，直接回复：\`${userEmail}\`` : ''}`,
+      `请直接回复您的邮箱地址完成钱包初始化。${userEmail ? `\n\n如需继续使用之前的邮箱，直接回复：\`${userEmail}\`` : ''}\n\n若网关仍在重启中，稍候几秒后重试即可。`,
     ],
-  });
-
-  const restartPayload = buildNotificationPayload(notifyDestination, { notification: restartNotification });
-
-  const statusNotification = createNotification({
-    title: '🔌 安装 Clink Payment Skill',
-    theme: 'blue',
-    details: [
-      ['注册 Webhook 回调路由', '已完成 ✓'],
-      ['写入网关配置文件', '已完成 ✓'],
-      ['重启网关进程', '正在重启…'],
-    ],
-    paragraphs: ['网关重启完成后将自动发送下一步提示。'],
   });
 
   let statusNotificationSent = false;
@@ -2273,38 +2258,16 @@ async function handle_install_system_hooks(args) {
     await logError('install_system_hooks/sendInitialNotification', err);
   }
 
-  const openclawBin = resolveOpenClawExecutable();
-  const initialGatewayProbe = probeGatewayRuntimePid(openclawBin);
-  const notifyJsCode = buildPostRestartNotifyScript({
-    openclawBin,
-    sendMessageScript: MESSAGE_SENDER,
-    payload: restartPayload,
-    logPath: LOG_PATH,
-    initialPid: initialGatewayProbe.pid,
-    initialDelayMs: 1000,
-    maxWaitForDownMs: 60000,
-    maxWaitForUpMs: 120000,
-  });
-  await fs.mkdir(path.dirname(notifyScriptPath), { recursive: true });
-  await fs.writeFile(notifyScriptPath, notifyJsCode, 'utf8');
-
   const { spawn } = await import('child_process');
-  const nodeBin = process.execPath;
+  const openclawBin = resolveOpenClawExecutable();
 
   const restartChild = spawn('sh', ['-c', `sleep 3 && ${shellQuote(openclawBin)} gateway restart`], { detached: true, stdio: 'ignore' });
   restartChild.unref();
 
-  const notifyChild = spawn(nodeBin, [notifyScriptPath], { detached: true, stdio: 'ignore' });
-  notifyChild.unref();
-
-  const emailInstruction = userEmail
-    ? `收到【✅ 网关重启完成】通知后，请直接回复您的新绑定邮箱。如果您想继续使用之前的邮箱绑定，直接发送：${userEmail}`
-    : `收到【✅ 网关重启完成】通知后，请直接回复您的绑定邮箱完成初始化。`;
-
   if (statusNotificationSent) {
     return `DIRECT_SEND: Installation bootstrap completed. Gateway restart scheduled.
 
-[SYSTEM DIRECTIVE] The installation status notification was already sent directly. Do NOT send it again. Wait for the post-restart notification to guide the user through wallet initialization.`;
+[SYSTEM DIRECTIVE] The installation success notification was already sent directly. Do NOT send it again. The user may reply with their email immediately; if the gateway is still restarting, they can retry a few seconds later.`;
   }
 
   return `SUCCESS: Webhook config updated. Gateway restart scheduled.

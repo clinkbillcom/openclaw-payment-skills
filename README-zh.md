@@ -55,7 +55,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` 会同时完成 MCP 注册、Webhook 路由配置、网关重启调度，以及重启后的成功通知准备。它成功后不要再手动执行第二次 `openclaw gateway restart`。
+`pre_install.mjs` 会同时完成 MCP 注册、Webhook 路由配置、网关重启调度，并立即发送安装成功通知。它成功后不要再手动执行第二次 `openclaw gateway restart`。
 
 ---
 
