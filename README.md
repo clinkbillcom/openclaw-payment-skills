@@ -23,7 +23,7 @@ Examples:
 - `Bind my payment method`
 - `Check my payment setup`
 - `Recharge ModelMax with 10 USD`
-- `Enable auto top-up`
+- `Enable Clink payment auto top-up`
 - `Show my risk rules`
 
 ---
@@ -105,7 +105,7 @@ Supported payment method flows may include cards, PayPal, Cash App, and other me
 
 ### Auto Top-Up
 
-- `Enable auto top-up`
+- `Enable Clink payment auto top-up`
 - `Use this card for future auto top-ups`
 
 ### Risk Rules

@@ -23,7 +23,7 @@ Agent Payment Skills 可以通过 Clink 为 OpenClaw Agent 增加钱包初始化
 - `帮我绑定支付方式`
 - `检查一下我的支付配置`
 - `给 ModelMax 充值 10 美元`
-- `开启自动充值`
+- `开启 Clink 支付自动充值`
 - `查看我的风控规则`
 
 ---
@@ -105,7 +105,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-typ
 
 ### 自动充值
 
-- `开启自动充值`
+- `开启 Clink 支付自动充值`
 - `以后自动充值都用这张卡`
 
 ### 风控规则

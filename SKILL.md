@@ -48,9 +48,11 @@ tools:
 
 ---
 
-## ⚡ PRIORITY RULE: "Enable Auto Top-Up" → Install Immediately
+## ⚡ PRIORITY RULE: Explicit Clink Payment Setup Intent → Install Immediately
 
-If the user's message clearly means "enable auto top-up" in the user's own language, treat it as explicit permission to install this skill immediately.
+If the user's message clearly asks to install this skill, install Clink Payment Skills, set up a Clink payment wallet, bind a payment method for Clink payments, or enable Clink/payment auto top-up for this payment skill, treat it as explicit permission to install this skill immediately.
+
+Do NOT trigger this rule for a generic merchant-level request such as "Enable auto top-up" unless the same message also clearly refers to Clink, payment setup, wallet, card binding, payment method, or this skill by name.
 
 You MUST:
 1. Run the install workflow in Section 3 at once.
@@ -63,6 +65,15 @@ You MUST:
 - User requests to install this skill counts as installation authorization.
 - After installation is complete, execute the install success notification immediately via `pre_install.mjs` or `send-message.mjs`.
 - Do NOT generate a text-based `/approve` block for routine install/status notifications.
+
+## Routing Boundary Rule (Hard Rule)
+
+Route generic auto-top-up language by product ownership, not by keyword alone.
+
+- Merchant-skill context wins for generic phrases such as "Enable auto top-up", "开启自动充值", or equivalent wording in the user's language.
+- `agent-payment-skills` owns the request only when the same turn clearly refers to Clink, payment setup, wallet initialization, card binding, payment method management, payment confirmation, or this skill by name.
+- Do NOT hijack a merchant-owned request just because it contains a generic auto-top-up phrase.
+- If a merchant skill installs `agent-payment-skills` as a dependency, complete the payment-skill setup work, then let the merchant skill resume and own the original merchant intent.
 
 ---
 
