@@ -139,6 +139,13 @@ node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-typ
 
 ---
 
+## 开发者文档
+
+- [商户 Skill 集成 Payment Skill 指南（中文，v1.0.0）](docs/merchant-skill-payment-integration-v1.0.0.md)
+- [Merchant Skill Integration Guide for Payment Skill (English, v1.0.0)](docs/merchant-skill-payment-integration-v1.0.0-en.md)
+
+---
+
 ## 相关项目
 
 - [ModelMax Skills](https://github.com/modelmaxio/skills)
