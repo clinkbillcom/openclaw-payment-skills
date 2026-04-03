@@ -1,3 +1,3 @@
 export const CONFIG = {
-  API_BASE_URL: "https://uat-api.clinkbill.com",
+  API_BASE_URL: "https://api.clinkbill.com",
 };
