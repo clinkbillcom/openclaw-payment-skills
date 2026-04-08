@@ -166,31 +166,63 @@ function buildTelegramHeaderLines(model) {
   return sections.filter(Boolean);
 }
 
+function isTelegramChineseLocale(locale) {
+  return coerceString(locale).toLowerCase().startsWith('zh');
+}
+
+function getTelegramSectionLabels(locale) {
+  return isTelegramChineseLocale(locale)
+    ? {
+      facts: '📌 关键信息',
+      details: '📝 说明',
+      actions: '👉 下一步',
+      footer: 'ℹ️ 补充信息',
+    }
+    : {
+      facts: '📌 Highlights',
+      details: '📝 Details',
+      actions: '👉 Next Steps',
+      footer: 'ℹ️ More Info',
+    };
+}
+
+function buildTelegramSection(title, content) {
+  const text = coerceString(content);
+  if (!text) return '';
+  return `**${title}**\n${text}`;
+}
+
 function buildTelegramBodySections(model) {
+  const labels = getTelegramSectionLabels(model.locale);
   const sections = [];
   if (model.facts.length > 0) {
-    sections.push(
+    sections.push(buildTelegramSection(
+      labels.facts,
       model.facts
-        .map((fact) => `**${fact.label}** ${fact.value}`.trim())
+        .map((fact) => `• **${fact.label}** ${fact.value}`.trim())
         .join('\n'),
-    );
+    ));
   }
   if (model.sections.length > 0) {
-    sections.push(model.sections.map((section) => section.text).join('\n\n'));
+    sections.push(buildTelegramSection(
+      labels.details,
+      model.sections.map((section) => section.text).join('\n\n'),
+    ));
   }
   if (model.actions.length > 0) {
-    sections.push(
+    sections.push(buildTelegramSection(
+      labels.actions,
       model.actions
         .map((action) => (
           action.type === 'url' && action.url
-            ? `- [${action.label}](${action.url})`
-            : `- ${action.label}`
+            ? `• [${action.label}](${action.url})`
+            : `• ${action.label}`
         ))
         .join('\n'),
-    );
+    ));
   }
   if (model.footer) {
-    sections.push(model.footer);
+    sections.push(buildTelegramSection(labels.footer, model.footer));
   }
   return sections.filter(Boolean);
 }
