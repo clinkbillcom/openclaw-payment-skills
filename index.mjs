@@ -87,6 +87,10 @@ const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
 const MERCHANT_CONFIRMATION_RUNNER = path.join(SKILL_DIR, 'scripts', 'run-merchant-confirmation.mjs');
+const POLL_FALLBACK_SCRIPT = path.join(SKILL_DIR, 'scripts', 'poll-fallback.mjs');
+const POLL_START_DELAY_MS = 30_000;
+const POLL_INTERVAL_MS = 5_000;
+const POLL_TIMEOUT_MS = 120_000;
 
 function resolveOpenClawExecutable() {
   const explicit = typeof process.env.OPENCLAW_BIN === 'string' ? process.env.OPENCLAW_BIN.trim() : '';
@@ -154,6 +158,10 @@ function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
   if (!Array.isArray(normalized.paymentMethods)) normalized.paymentMethods = [];
   if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
+  if (normalized.webhookAvailable === undefined) normalized.webhookAvailable = null;
+  if (!normalized.asyncOperations || typeof normalized.asyncOperations !== 'object') {
+    normalized.asyncOperations = {};
+  }
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
   }
@@ -219,6 +227,57 @@ function normalizeCache(cache) {
     }
   }
   return normalized;
+}
+
+function normalizePaymentMethods(methods) {
+  return Array.isArray(methods)
+    ? methods
+        .map((method) => ({
+          paymentInstrumentId: method.paymentInstrumentId || null,
+          paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
+          cardBrand: method.cardBrand || method.cardScheme || null,
+          cardLast4: method.cardLast4 || method.cardLastFour || null,
+          issuerBank: method.issuerBank || null,
+          walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
+          isDefault: method.isDefault ?? false,
+          isDisabled: method.isDisabled ?? false,
+          status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
+        }))
+        .filter((method) => typeof method.paymentInstrumentId === "string" && method.paymentInstrumentId.trim())
+    : [];
+}
+
+function normalizeRuleSettings(settings) {
+  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+    return null;
+  }
+  const normalizeNumberString = (value) => {
+    if (value === undefined || value === null || value === '') return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? numeric.toFixed(2) : String(value);
+  };
+  const normalizeInteger = (value) => {
+    if (value === undefined || value === null || value === '') return null;
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? String(Math.trunc(numeric)) : String(value);
+  };
+  const normalizeBoolean = (value) => {
+    if (value === undefined || value === null) return null;
+    return Boolean(value);
+  };
+  const normalizeString = (value) => {
+    if (value === undefined || value === null || value === '') return null;
+    return String(value).trim();
+  };
+  return {
+    singleRechargeLimit: normalizeNumberString(settings.singleRechargeLimit),
+    dailyTotalLimit: normalizeNumberString(settings.dailyTotalLimit),
+    dailyMaxCount: normalizeInteger(settings.dailyMaxCount),
+    rechargeInterval: normalizeString(settings.rechargeInterval),
+    manualApprovalThreshold: normalizeNumberString(settings.manualApprovalThreshold),
+    manualApprovalEnabled: normalizeBoolean(settings.manualApprovalEnabled),
+    autoSuspendEnabled: normalizeBoolean(settings.autoSuspendEnabled),
+  };
 }
 
 function normalizeNotifyDestinationValue(value) {
@@ -290,6 +349,97 @@ async function readPaymentMethodsCache() {
 async function writePaymentMethodsCache(cache) {
   await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
   await fs.writeFile(CACHE_PATH, JSON.stringify(normalizeCache(cache), null, 2), 'utf8');
+}
+
+function isWebhookAvailable(cache) {
+  return normalizeCache(cache).webhookAvailable !== false;
+}
+
+function isTerminalAsyncOperationStatus(status) {
+  return status === 'succeeded' || status === 'failed' || status === 'timeout' || status === 'cancelled';
+}
+
+function isAsyncOperationExpired(operation, now = Date.now()) {
+  const expireAt = Number(operation?.expireAt || 0);
+  return Number.isFinite(expireAt) && expireAt > 0 && now >= expireAt;
+}
+
+function getActiveAsyncOperation(cache, type) {
+  const normalized = normalizeCache(cache);
+  for (const operation of Object.values(normalized.asyncOperations || {})) {
+    if (operation?.type !== type) continue;
+    if (isTerminalAsyncOperationStatus(operation.status)) continue;
+    if (isAsyncOperationExpired(operation)) continue;
+    return operation;
+  }
+  return null;
+}
+
+function createAsyncOperationId(type) {
+  return `${String(type)}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+}
+
+function buildAsyncOperation(type, snapshotBefore, notifyDestination) {
+  const now = Date.now();
+  return {
+    id: createAsyncOperationId(type),
+    type,
+    status: 'pending',
+    createdAt: now,
+    firstPollAt: now + POLL_START_DELAY_MS,
+    expireAt: now + POLL_TIMEOUT_MS,
+    pollIntervalMs: POLL_INTERVAL_MS,
+    retryCount: 0,
+    snapshotBefore: cloneJsonValue(snapshotBefore),
+    notifyDestination: notifyDestination ? cloneJsonValue(notifyDestination) : null,
+    lastError: '',
+    resultPayload: null,
+  };
+}
+
+function spawnPollFallbackProcessor(operationId) {
+  const child = spawn(process.execPath, [POLL_FALLBACK_SCRIPT, '--operation-id', operationId], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.unref();
+}
+
+async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestination = null) {
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  if (isWebhookAvailable(cache)) {
+    return null;
+  }
+
+  const activeOperation = getActiveAsyncOperation(cache, type);
+  if (activeOperation) {
+    await logRequest('poll_fallback/reuse_operation', {
+      operationId: activeOperation.id,
+      type,
+    }, { reused: true });
+    return activeOperation;
+  }
+
+  const operation = buildAsyncOperation(type, snapshotBefore, notifyDestination || getNotifyDestination(cache));
+  cache.asyncOperations[operation.id] = operation;
+  await writePaymentMethodsCache(cache);
+  spawnPollFallbackProcessor(operation.id);
+  await logRequest('poll_fallback/create_operation', {
+    operationId: operation.id,
+    type,
+    firstPollAt: operation.firstPollAt,
+    expireAt: operation.expireAt,
+  }, { scheduled: true });
+  return operation;
+}
+
+async function schedulePollFallbackOperationSafely(type, snapshotBefore, notifyDestination = null) {
+  try {
+    return await schedulePollFallbackOperation(type, snapshotBefore, notifyDestination);
+  } catch (error) {
+    await logError(`poll_fallback/${type}`, error);
+    return null;
+  }
 }
 
 function buildCardStateLockName(orderId, status, sessionId) {
@@ -818,21 +968,7 @@ function buildMerchantConfirmArgs(merchantContext, paymentHandoff) {
 
 async function overwriteCachedBindingMethods(methods) {
   const cache = await readPaymentMethodsCache() || {};
-  const normalizedMethods = Array.isArray(methods)
-    ? methods
-        .map((method) => ({
-          paymentInstrumentId: method.paymentInstrumentId || null,
-          paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
-          cardBrand: method.cardBrand || method.cardScheme || null,
-          cardLast4: method.cardLast4 || method.cardLastFour || null,
-          issuerBank: method.issuerBank || null,
-          walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
-          isDefault: method.isDefault ?? false,
-          isDisabled: method.isDisabled ?? false,
-          status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
-        }))
-        .filter((method) => typeof method.paymentInstrumentId === "string" && method.paymentInstrumentId.trim())
-    : [];
+  const normalizedMethods = normalizePaymentMethods(methods);
   const defaultMethod =
     normalizedMethods.find((method) => method.isDefault) ||
     normalizedMethods[0] ||
@@ -1160,6 +1296,11 @@ async function handle_initialize_wallet(args) {
       const cache = await readPaymentMethodsCache() || {};
       cache.customerId = data.customerId;
       cache.customerAPIKey = data.customerAPIKey;
+      if (typeof data.webhook_available === 'boolean') {
+        cache.webhookAvailable = data.webhook_available;
+      } else if (typeof data.webhookAvailable === 'boolean') {
+        cache.webhookAvailable = data.webhookAvailable;
+      }
       cache.cachedAt = new Date().toISOString();
       await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
       await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
@@ -1211,6 +1352,7 @@ async function handle_get_binding_link() {
       if (notifyDestination) {
         try {
           sendNotificationDirect(notifyDestination, notification);
+          await schedulePollFallbackOperationSafely('bind_card', normalizePaymentMethods(methods), notifyDestination);
           return `[SYSTEM DIRECTIVE] DIRECT_SEND: The notification has been sent. Do NOT send another card.
 Wait for the payment_method.added webhook before continuing initialization.
 
@@ -1307,11 +1449,13 @@ async function handle_get_risk_rules_link() {
     const notification = buildRiskRulesNotification(bindingUrl);
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    const snapshotBefore = normalizeRuleSettings(cache.riskRules);
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
         sendNotificationDirect(notifyDestination, notification);
+        await schedulePollFallbackOperationSafely('update_rule', snapshotBefore, notifyDestination);
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Risk rules link generated.
 The notification has been sent. Do NOT send another card.`;
       } catch (err) {
@@ -1336,7 +1480,7 @@ The notification has been sent. Do NOT send another card.`;
 
 async function handle_get_payment_method_setup_link() {
   try {
-    const { bindingUrl, env } = await fetchBindingData();
+    const { bindingUrl, env, methods } = await fetchBindingData();
     const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
     const notification = createMessageRequest({
       messageKey: 'payment.method.setup_link',
@@ -1347,11 +1491,13 @@ async function handle_get_payment_method_setup_link() {
     });
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    const snapshotBefore = normalizePaymentMethods(methods);
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
         sendNotificationDirect(notifyDestination, notification);
+        await schedulePollFallbackOperationSafely('bind_card', snapshotBefore, notifyDestination);
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Payment method setup link generated.
 The notification has been sent. Do NOT send another card.`;
       } catch (err) {
@@ -1389,11 +1535,13 @@ async function handle_get_payment_method_modify_link() {
     });
     const cache = await readPaymentMethodsCache() || {};
     const notifyDestination = getNotifyDestination(cache);
+    const snapshotBefore = normalizePaymentMethods(methods);
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
       try {
         sendNotificationDirect(notifyDestination, notification);
+        await schedulePollFallbackOperationSafely('change_card', snapshotBefore, notifyDestination);
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Payment method management link generated.
 The notification has been sent. Do NOT send another card.`;
       } catch (err) {
