@@ -167,8 +167,6 @@ Exactly one layer owns each card. Do NOT duplicate card delivery across tool, we
 - `DATA_ONLY`
   - Meaning: the tool returned data only; no notification was sent
   - Agent may use the data to construct the next required response
-- `NO_REPLY`
-  - Meaning: preserve exactly; do not append text, cards, or retries
 
 ## Prohibited Behaviors (Hard Rule)
 
