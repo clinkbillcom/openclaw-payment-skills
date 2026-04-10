@@ -17,13 +17,13 @@ tools:
   - name: get_wallet_status
     description: Check the local configuration status of the wallet (e.g., if it is initialized).
   - name: get_binding_link
-    description: Generates a URL for the user to bind a new payment method and returns currently bound methods. If no methods exist, returns a setup link; if methods exist, returns an informational card with current card details.
+    description: Generates a URL for the user to bind a new payment method and returns currently bound methods. If no methods exist, returns a setup link; if methods exist, returns an informational card with current card details. You MUST always provide channel, target_id, and target_type from the current conversation metadata to ensure the notification is delivered to the correct surface.
   - name: get_risk_rules_link
-    description: Generates a URL for the user to configure recharge risk rules (per-charge limit, daily limit, frequency, cooldown, approval threshold).
+    description: Generates a URL for the user to configure recharge risk rules (per-charge limit, daily limit, frequency, cooldown, approval threshold). You MUST always provide channel, target_id, and target_type from the current conversation metadata to ensure the link is delivered to the correct surface.
   - name: get_payment_method_setup_link
-    description: Generates a URL for the user to add a new payment method (credit card, PayPal, Cash App, etc.).
+    description: Generates a URL for the user to add a new payment method (credit card, PayPal, Cash App, etc.). You MUST always provide channel, target_id, and target_type from the current conversation metadata to ensure the link is delivered to the correct surface.
   - name: get_payment_method_modify_link
-    description: Generates a URL for the user to manage, switch, or modify existing payment methods.
+    description: Generates a URL for the user to manage, switch, or modify existing payment methods. You MUST always provide channel, target_id, and target_type from the current conversation metadata to ensure the link is delivered to the correct surface.
   - name: list_payment_methods
     description: List all payment methods bound to the user's wallet. Requires a valid binding token.
   - name: get_payment_method_detail
