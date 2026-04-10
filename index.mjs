@@ -413,15 +413,9 @@ async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestina
 
   const activeOperation = getActiveAsyncOperation(cache, type);
   if (activeOperation) {
-    if (notifyDestination) {
-      activeOperation.notifyDestination = cloneJsonValue(notifyDestination);
-      cache.asyncOperations[activeOperation.id] = activeOperation;
-      await writePaymentMethodsCache(cache);
-    }
     await logRequest('poll_fallback/reuse_operation', {
       operationId: activeOperation.id,
       type,
-      notifyDestinationUpdated: Boolean(notifyDestination),
     }, { reused: true });
     return activeOperation;
   }
@@ -1339,21 +1333,11 @@ async function handle_get_wallet_status() {
   return `Wallet Status:\nCustomer ID: ${env.CLINK_CUSTOMER_ID}\nEmail: ${env.CLINK_USER_EMAIL}\nHas API Key: ${!!env.CLINK_CUSTOMER_API_KEY}`;
 }
 
-async function handle_get_binding_link(args = {}) {
+async function handle_get_binding_link() {
   try {
     const { bindingUrl, bindingToken, methods, env } = await fetchBindingData();
     const cache = await readPaymentMethodsCache() || {};
-    let requestNotifyDestination = null;
-    try {
-      requestNotifyDestination = parseNotifyDestinationArgs(args);
-    } catch (error) {
-      return `ERROR: ${error.message}`;
-    }
-    if (requestNotifyDestination) {
-      cache.notifyDestination = requestNotifyDestination;
-      await writePaymentMethodsCache(cache);
-    }
-    const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+    const notifyDestination = getNotifyDestination(cache);
 
     if (methods.length === 0) {
       const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
@@ -1459,22 +1443,12 @@ ${formatNotificationInstruction({
   }
 }
 
-async function handle_get_risk_rules_link(args = {}) {
+async function handle_get_risk_rules_link() {
   try {
     const { bindingUrl } = await fetchBindingData();
     const notification = buildRiskRulesNotification(bindingUrl);
     const cache = await readPaymentMethodsCache() || {};
-    let requestNotifyDestination = null;
-    try {
-      requestNotifyDestination = parseNotifyDestinationArgs(args);
-    } catch (error) {
-      return `ERROR: ${error.message}`;
-    }
-    if (requestNotifyDestination) {
-      cache.notifyDestination = requestNotifyDestination;
-      await writePaymentMethodsCache(cache);
-    }
-    const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+    const notifyDestination = getNotifyDestination(cache);
     const snapshotBefore = normalizeRuleSettings(cache.riskRules);
     let fallbackReason = 'missing_notify_destination';
 
@@ -1504,7 +1478,7 @@ The notification has been sent. Do NOT send another card.`;
   }
 }
 
-async function handle_get_payment_method_setup_link(args = {}) {
+async function handle_get_payment_method_setup_link() {
   try {
     const { bindingUrl, env, methods } = await fetchBindingData();
     const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
@@ -1516,17 +1490,7 @@ async function handle_get_payment_method_setup_link(args = {}) {
       },
     });
     const cache = await readPaymentMethodsCache() || {};
-    let requestNotifyDestination = null;
-    try {
-      requestNotifyDestination = parseNotifyDestinationArgs(args);
-    } catch (error) {
-      return `ERROR: ${error.message}`;
-    }
-    if (requestNotifyDestination) {
-      cache.notifyDestination = requestNotifyDestination;
-      await writePaymentMethodsCache(cache);
-    }
-    const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+    const notifyDestination = getNotifyDestination(cache);
     const snapshotBefore = normalizePaymentMethods(methods);
     let fallbackReason = 'missing_notify_destination';
 
@@ -1556,7 +1520,7 @@ The notification has been sent. Do NOT send another card.`;
   }
 }
 
-async function handle_get_payment_method_modify_link(args = {}) {
+async function handle_get_payment_method_modify_link() {
   try {
     const { bindingUrl, methods } = await fetchBindingData();
     const modifyUrl = buildRedirectUrl(bindingUrl, "payment-method-modify");
@@ -1570,17 +1534,7 @@ async function handle_get_payment_method_modify_link(args = {}) {
       },
     });
     const cache = await readPaymentMethodsCache() || {};
-    let requestNotifyDestination = null;
-    try {
-      requestNotifyDestination = parseNotifyDestinationArgs(args);
-    } catch (error) {
-      return `ERROR: ${error.message}`;
-    }
-    if (requestNotifyDestination) {
-      cache.notifyDestination = requestNotifyDestination;
-      await writePaymentMethodsCache(cache);
-    }
-    const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+    const notifyDestination = getNotifyDestination(cache);
     const snapshotBefore = normalizePaymentMethods(methods);
     let fallbackReason = 'missing_notify_destination';
 
@@ -2671,54 +2625,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_binding_link",
       description: "Generates a URL for the user to bind a new payment method and returns currently bound methods.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Optional notify channel." },
-          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
-          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
-          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
-        }
-      }
+      inputSchema: { type: "object", properties: {} }
     },
     {
       name: "get_risk_rules_link",
       description: "Generates a URL for the user to configure recharge risk rules (per-charge limit, daily limit, frequency, etc.).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Optional notify channel." },
-          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
-          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
-          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
-        }
-      }
+      inputSchema: { type: "object", properties: {} }
     },
     {
       name: "get_payment_method_setup_link",
       description: "Generates a URL for the user to add a new payment method (credit card, PayPal, etc.).",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Optional notify channel." },
-          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
-          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
-          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
-        }
-      }
+      inputSchema: { type: "object", properties: {} }
     },
     {
       name: "get_payment_method_modify_link",
       description: "Generates a URL for the user to manage, switch, or modify existing payment methods.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          channel: { type: "string", description: "Optional notify channel." },
-          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
-          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
-          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
-        }
-      }
+      inputSchema: { type: "object", properties: {} }
     },
     {
       name: "list_payment_methods",
@@ -2835,10 +2757,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     switch (name) {
       case "initialize_wallet":             result = await handle_initialize_wallet(args); break;
       case "get_wallet_status":             result = await handle_get_wallet_status(); break;
-      case "get_binding_link":              result = await handle_get_binding_link(args); break;
-      case "get_risk_rules_link":           result = await handle_get_risk_rules_link(args); break;
-      case "get_payment_method_setup_link": result = await handle_get_payment_method_setup_link(args); break;
-      case "get_payment_method_modify_link":result = await handle_get_payment_method_modify_link(args); break;
+      case "get_binding_link":              result = await handle_get_binding_link(); break;
+      case "get_risk_rules_link":           result = await handle_get_risk_rules_link(); break;
+      case "get_payment_method_setup_link": result = await handle_get_payment_method_setup_link(); break;
+      case "get_payment_method_modify_link":result = await handle_get_payment_method_modify_link(); break;
       case "list_payment_methods":          result = await handle_list_payment_methods(args); break;
       case "get_payment_method_detail":     result = await handle_get_payment_method_detail(args); break;
       case "update_payment_method":         result = await handle_update_payment_method(args); break;
