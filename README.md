@@ -1,4 +1,4 @@
-# Agent Payment Skills
+# OpenClaw Payment Skills
 
 English | [简体中文](README-zh.md)
 

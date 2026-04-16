@@ -1,5 +1,5 @@
 ---
-name: agent-payment-skills
+name: openclaw-payment-skills
 description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract; Feishu uses native cards, Telegram uses rich text/media delivery, and other channels fall back to markdown/text."
 version: "1.0.0"
 metadata:
