@@ -21,7 +21,7 @@ Agent Payment Skills 可以通过 Clink 为 OpenClaw Agent 增加钱包初始化
 
 示例：
 
-- `帮我安装 Clink Payment Skills：https://github.com/clinkbillcom/agent-payment-skills`
+- `帮我安装 Clink Payment Skills：https://github.com/clinkbillcom/openclaw-payment-skills`
 - `帮我绑定支付方式`
 - `检查一下我的支付配置`
 - `给 ModelMax 充值 10 美元`
@@ -36,7 +36,7 @@ Agent Payment Skills 可以通过 Clink 为 OpenClaw Agent 增加钱包初始化
 ### 让 Agent 自动安装
 
 ```text
-帮我安装 Clink Payment Skills：https://github.com/clinkbillcom/agent-payment-skills
+帮我安装 Clink Payment Skills：https://github.com/clinkbillcom/openclaw-payment-skills
 ```
 
 安装完成后，Agent 会继续引导你完成后续配置。
@@ -44,7 +44,7 @@ Agent Payment Skills 可以通过 Clink 为 OpenClaw Agent 增加钱包初始化
 ### Installation for OpenClaw
 
 ```bash
-git clone https://github.com/clinkbillcom/agent-payment-skills.git
+git clone https://github.com/clinkbillcom/openclaw-payment-skills.git
 cd agent-payment-skills
 node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>
 ```

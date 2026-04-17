@@ -21,7 +21,7 @@ After installation, you can ask your agent to:
 
 Examples:
 
-- `Install Clink Payment Skills: https://github.com/clinkbillcom/agent-payment-skills`
+- `Install Clink Payment Skills: https://github.com/clinkbillcom/openclaw-payment-skills`
 - `Bind my payment method`
 - `Check my payment setup`
 - `Recharge ModelMax with 10 USD`
@@ -36,7 +36,7 @@ Examples:
 ### Ask Your Agent to Install It
 
 ```text
-Install Clink Payment Skills: https://github.com/clinkbillcom/agent-payment-skills
+Install Clink Payment Skills: https://github.com/clinkbillcom/openclaw-payment-skills
 ```
 
 After installation, the agent will guide you through the remaining setup.
@@ -44,7 +44,7 @@ After installation, the agent will guide you through the remaining setup.
 ### Installation for OpenClaw
 
 ```bash
-git clone https://github.com/clinkbillcom/agent-payment-skills.git
+git clone https://github.com/clinkbillcom/openclaw-payment-skills.git
 cd agent-payment-skills
 node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>
 ```
