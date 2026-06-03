@@ -2576,6 +2576,134 @@ The notification has been sent. Do NOT send another card.`;
   }
 }
 
+// ------------------------------------------------------------------
+// VIC PURCHASE INSTRUCTION (agentic authorization)
+// ------------------------------------------------------------------
+async function fetchInstruction(endpoint, method, bodyObj) {
+  const env = await getPaymentEnv();
+  if (!env.CLINK_CUSTOMER_API_KEY) {
+    throw new Error("Wallet not initialized. Please run initialize_wallet first.");
+  }
+  // Instruction endpoints authenticate by customer API key only (no X-Customer-ID).
+  return fetchClink(endpoint, {
+    method,
+    headers: {
+      "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
+      "X-Timestamp": Date.now().toString(),
+    },
+    body: bodyObj !== undefined ? JSON.stringify(bodyObj) : undefined,
+  });
+}
+
+async function handle_create_purchase_instruction(args = {}) {
+  if (!args.paymentInstrumentId) return "ERROR: create_purchase_instruction requires 'paymentInstrumentId' (a VIC-ready Visa card).";
+  if (!args.title) return "ERROR: create_purchase_instruction requires 'title'.";
+  if (!Array.isArray(args.mandates) || args.mandates.length === 0) return "ERROR: create_purchase_instruction requires a non-empty 'mandates' array (each with description, amountLimit, currencyCode).";
+
+  // Instruction level no longer carries currencyCode / totalLimitAmount / countryCode — those live on each mandate.
+  const body = {
+    paymentInstrumentId: args.paymentInstrumentId,
+    title: args.title,
+    mandates: args.mandates,
+  };
+  if (args.description !== undefined) body.description = args.description;
+  if (args.effectiveUntilTime !== undefined) body.effectiveUntilTime = args.effectiveUntilTime;
+  if (args.extra !== undefined) body.extra = args.extra;
+
+  try {
+    const data = await fetchInstruction('/a/cwallet/instructions', 'POST', body);
+    await logRequest('create_purchase_instruction', body, data);
+    return `Purchase instruction created (status CREATED). It is NOT usable until you call sign_purchase_instruction with the user's Passkey result.\nRaw Data: ${JSON.stringify(data)}`;
+  } catch (err) {
+    await logError('create_purchase_instruction', err);
+    return `Failed to create purchase instruction: ${err.message}`;
+  }
+}
+
+async function handle_sign_purchase_instruction(args = {}) {
+  if (!args.instructionId) return "ERROR: sign_purchase_instruction requires 'instructionId'.";
+  if (!args.appInstance || typeof args.appInstance !== 'object') return "ERROR: sign_purchase_instruction requires 'appInstance'.";
+  if (!args.authResult || typeof args.authResult !== 'object') return "ERROR: sign_purchase_instruction requires 'authResult' from the front-end Passkey flow.";
+
+  const body = { appInstance: args.appInstance, authResult: args.authResult };
+  if (args.extra !== undefined) body.extra = args.extra;
+
+  try {
+    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}/sign`, 'POST', body);
+    // Never log authResult — it carries fidoBlob.
+    await logRequest('sign_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
+    return `Purchase instruction signed (now ACTIVE). The VIC payment entry and request field are pending backend confirmation.\nRaw Data: ${JSON.stringify(data)}`;
+  } catch (err) {
+    await logError('sign_purchase_instruction', err);
+    return `Failed to sign purchase instruction: ${err.message}`;
+  }
+}
+
+async function handle_list_purchase_instructions(args = {}) {
+  const qs = args.status ? `?status=${encodeURIComponent(args.status)}` : '';
+  try {
+    const data = await fetchInstruction(`/a/cwallet/instructions${qs}`, 'GET');
+    return `Purchase instructions:\n${JSON.stringify(data, null, 2)}`;
+  } catch (err) {
+    await logError('list_purchase_instructions', err);
+    return `Failed to list purchase instructions: ${err.message}`;
+  }
+}
+
+async function handle_get_purchase_instruction(args = {}) {
+  if (!args.instructionId) return "ERROR: get_purchase_instruction requires 'instructionId'.";
+  try {
+    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'GET');
+    return `Purchase instruction detail:\n${JSON.stringify(data, null, 2)}`;
+  } catch (err) {
+    await logError('get_purchase_instruction', err);
+    return `Failed to get purchase instruction: ${err.message}`;
+  }
+}
+
+async function handle_update_purchase_instruction(args = {}) {
+  if (!args.instructionId) return "ERROR: update_purchase_instruction requires 'instructionId'.";
+  if (!args.paymentInstrumentId || !args.title || !Array.isArray(args.mandates) || args.mandates.length === 0) {
+    return "ERROR: update_purchase_instruction is a full update; it requires 'paymentInstrumentId', 'title', and a non-empty 'mandates' array.";
+  }
+  if (!args.appInstance || !args.authResult) return "ERROR: update_purchase_instruction requires fresh 'appInstance' and 'authResult' (re-authentication).";
+
+  const body = {
+    paymentInstrumentId: args.paymentInstrumentId,
+    title: args.title,
+    mandates: args.mandates,
+    appInstance: args.appInstance,
+    authResult: args.authResult,
+  };
+  if (args.description !== undefined) body.description = args.description;
+  if (args.effectiveUntilTime !== undefined) body.effectiveUntilTime = args.effectiveUntilTime;
+  if (args.extra !== undefined) body.extra = args.extra;
+
+  try {
+    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'PUT', body);
+    await logRequest('update_purchase_instruction', { ...body, authResult: '[REDACTED]' }, data);
+    return `Purchase instruction updated.\nRaw Data: ${JSON.stringify(data)}`;
+  } catch (err) {
+    await logError('update_purchase_instruction', err);
+    return `Failed to update purchase instruction: ${err.message}`;
+  }
+}
+
+async function handle_cancel_purchase_instruction(args = {}) {
+  if (!args.instructionId) return "ERROR: cancel_purchase_instruction requires 'instructionId'.";
+  if (!args.appInstance || !args.authResult) return "ERROR: cancel_purchase_instruction requires 'appInstance' and 'authResult'.";
+
+  const body = { authResult: args.authResult, appInstance: args.appInstance };
+  try {
+    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}/cancel`, 'POST', body);
+    await logRequest('cancel_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
+    return `Purchase instruction cancelled.\nRaw Data: ${JSON.stringify(data)}`;
+  } catch (err) {
+    await logError('cancel_purchase_instruction', err);
+    return `Failed to cancel purchase instruction: ${err.message}`;
+  }
+}
+
 async function handle_install_system_hooks(args) {
   const skillDir = SKILL_DIR;
   const hooksTarget = path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.mjs');
@@ -3015,6 +3143,89 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
+      name: "create_purchase_instruction",
+      description: "VIC: create a local purchase instruction (agentic authorization) for a VIC-ready Visa card. Status is CREATED and NOT usable until sign_purchase_instruction. Only call after the user explicitly authorizes the spend scope; never invent mandates or limits. Currency and amountLimit live on each mandate (not at instruction level).",
+      inputSchema: {
+        type: "object",
+        properties: {
+          paymentInstrumentId: { type: "string", description: "VIC-ready Visa payment instrument ID" },
+          title: { type: "string", description: "Instruction title" },
+          description: { type: "string", description: "Optional description" },
+          effectiveUntilTime: { type: "string", description: "Optional expiry, UTC string \"yyyy-MM-dd HH:mm:ss\", e.g. \"2026-06-25 00:00:00\"" },
+          mandates: { type: "array", description: "Non-empty array of mandate rules: { title?, description, amountLimit (number), currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
+          extra: { type: "object", description: "Optional extra fields" }
+        },
+        required: ["paymentInstrumentId", "title", "mandates"]
+      }
+    },
+    {
+      name: "sign_purchase_instruction",
+      description: "VIC: submit the user's Passkey/FIDO result and app/device context to activate a purchase instruction (status CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow — never fabricate them.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          instructionId: { type: "string", description: "Local instruction ID from create_purchase_instruction" },
+          appInstance: { type: "object", description: "Visa app/device context, e.g. { deviceData: { type, brand, model, manufacturer }, userAgent, clientDeviceId }" },
+          authResult: { type: "object", description: "FIDO/DFP result, e.g. { identifier, fidoBlob, dfpSessionId }" },
+          extra: { type: "object", description: "Optional extra fields" }
+        },
+        required: ["instructionId", "appInstance", "authResult"]
+      }
+    },
+    {
+      name: "list_purchase_instructions",
+      description: "VIC: list the current customer's purchase instructions, optionally filtered by status.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "Optional status filter, e.g. ACTIVE / CREATED / CANCELLED" }
+        }
+      }
+    },
+    {
+      name: "get_purchase_instruction",
+      description: "VIC: get a single purchase instruction (with its mandates) by instruction ID.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          instructionId: { type: "string", description: "Local instruction ID" }
+        },
+        required: ["instructionId"]
+      }
+    },
+    {
+      name: "update_purchase_instruction",
+      description: "VIC: full update of a purchase instruction. Requires re-authentication (fresh appInstance + authResult) and the complete instruction fields + mandates.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          instructionId: { type: "string" },
+          paymentInstrumentId: { type: "string" },
+          title: { type: "string" },
+          description: { type: "string" },
+          effectiveUntilTime: { type: "string", description: "UTC string \"yyyy-MM-dd HH:mm:ss\"" },
+          mandates: { type: "array" },
+          appInstance: { type: "object" },
+          authResult: { type: "object" },
+          extra: { type: "object" }
+        },
+        required: ["instructionId", "paymentInstrumentId", "title", "mandates", "appInstance", "authResult"]
+      }
+    },
+    {
+      name: "cancel_purchase_instruction",
+      description: "VIC: cancel a purchase instruction. Requires appInstance + authResult.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          instructionId: { type: "string" },
+          appInstance: { type: "object" },
+          authResult: { type: "object" }
+        },
+        required: ["instructionId", "appInstance", "authResult"]
+      }
+    },
+    {
       name: "install_system_hooks",
       description: "Update openclaw.json and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.",
       inputSchema: {
@@ -3065,6 +3276,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "clink_pay":                     result = await handle_clink_pay(args); break;
       case "clink_refund":                  result = await handle_clink_refund(args); break;
       case "get_refund_status":             result = await handle_get_refund_status(args); break;
+      case "create_purchase_instruction":   result = await handle_create_purchase_instruction(args); break;
+      case "sign_purchase_instruction":     result = await handle_sign_purchase_instruction(args); break;
+      case "list_purchase_instructions":    result = await handle_list_purchase_instructions(args); break;
+      case "get_purchase_instruction":      result = await handle_get_purchase_instruction(args); break;
+      case "update_purchase_instruction":   result = await handle_update_purchase_instruction(args); break;
+      case "cancel_purchase_instruction":   result = await handle_cancel_purchase_instruction(args); break;
       case "install_system_hooks":          result = await handle_install_system_hooks(args); break;
       case "uninstall_system_hooks":        result = await handle_uninstall_system_hooks(args); break;
       default: throw new Error(`Unknown tool: ${name}`);
