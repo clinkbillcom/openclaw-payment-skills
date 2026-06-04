@@ -448,6 +448,58 @@ const MESSAGE_CATALOG = Object.freeze({
       actions: [{ type: 'url', label: 'Add Payment Method', url: vars.setupUrl }],
     }),
   }),
+  'payment.vic_registration_required': defineCatalogEntry({
+    'zh-CN': (vars) => buildMessageModel({
+      key: 'payment.vic_registration_required',
+      locale: 'zh-CN',
+      title: '🔐 需要完成 VIC 注册',
+      theme: 'orange',
+      facts: [
+        ['支付方式', vars.cardDisplay || 'Visa 卡'],
+        ['支付方式 ID', vars.paymentInstrumentId || 'N/A'],
+        ['任务状态', '⏸ 等待 VIC 注册'],
+      ],
+      sections: ['这张 Visa 卡需要先完成 VIC / Passkey 注册，之后才能继续创建 purchase instruction。'],
+      actions: [{ type: 'url', label: '完成 VIC 注册', url: vars.passkeyUrl }],
+    }),
+    'en-US': (vars) => buildMessageModel({
+      key: 'payment.vic_registration_required',
+      locale: 'en-US',
+      title: '🔐 Complete VIC Registration',
+      theme: 'orange',
+      facts: [
+        ['Payment Method', vars.cardDisplay || 'Visa card'],
+        ['Payment Instrument ID', vars.paymentInstrumentId || 'N/A'],
+        ['Task Status', '⏸ Waiting for VIC registration'],
+      ],
+      sections: ['This Visa card must complete VIC / Passkey registration before a purchase instruction can be created.'],
+      actions: [{ type: 'url', label: 'Complete VIC Registration', url: vars.passkeyUrl }],
+    }),
+  }),
+  'payment.vic_registration_complete': defineCatalogEntry({
+    'zh-CN': (vars) => buildMessageModel({
+      key: 'payment.vic_registration_complete',
+      locale: 'zh-CN',
+      title: '✅ VIC 注册已完成',
+      theme: 'green',
+      facts: [
+        ['支付方式', vars.cardDisplay || 'Visa 卡'],
+        ['支付方式 ID', vars.paymentInstrumentId || 'N/A'],
+      ],
+      sections: ['已检测到该 Visa 卡完成 VIC 注册，可以继续 purchase instruction 流程。'],
+    }),
+    'en-US': (vars) => buildMessageModel({
+      key: 'payment.vic_registration_complete',
+      locale: 'en-US',
+      title: '✅ VIC Registration Complete',
+      theme: 'green',
+      facts: [
+        ['Payment Method', vars.cardDisplay || 'Visa card'],
+        ['Payment Instrument ID', vars.paymentInstrumentId || 'N/A'],
+      ],
+      sections: ['This Visa card is now VIC-enabled. Continue the purchase instruction flow.'],
+    }),
+  }),
   'payment.method.manage_link': defineCatalogEntry({
     'zh-CN': (vars) => buildMessageModel({
       key: 'payment.method.manage_link',

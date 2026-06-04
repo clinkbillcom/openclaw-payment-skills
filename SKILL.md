@@ -37,13 +37,13 @@ tools:
   - name: pre_check_account
     description: Run before clink_pay to verify account readiness (wallet initialized, payment method bound). On success it returns an internal readiness directive only; do not send a user-facing success card.
   - name: clink_pay
-    description: Execute a payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). VIC payment entry and request field are pending backend confirmation; do not pass an instruction field to clink_pay yet. merchant_integration must include server, confirm_tool, and optional confirm_args.
+    description: Execute a non-Visa payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). Visa cards are gated into the VIC registration / purchase-instruction flow instead of normal charge. merchant_integration must include server, confirm_tool, and optional confirm_args.
   - name: clink_refund
     description: Apply for a NEW full refund on an existing Clink order. Requires the ORIGINAL `orderId` (starts with `order_`). Do NOT use this tool for checking the status of an existing refund request.
   - name: get_refund_status
     description: Query the latest status of an ALREADY SUBMITTED Clink refund order via `refundOrderId` (starts with `rfd_`). Use this tool when the user asks for the "status" or "progress" of a refund.
   - name: create_purchase_instruction
-    description: "VIC: create a local agentic purchase instruction (status CREATED) for a VIC-ready Visa card. Only after explicit user authorization of the spend scope. Not usable until sign_purchase_instruction. Never invent mandates/limits."
+    description: "VIC: create a local agentic purchase instruction (status CREATED) for a Visa card whose payment method has isVic=true. Only after explicit user authorization of the spend scope. Not usable until sign_purchase_instruction. Never invent mandates/limits."
   - name: sign_purchase_instruction
     description: "VIC: submit the user's Passkey/FIDO result + app/device context to activate a purchase instruction (CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow; never fabricate them."
   - name: list_purchase_instructions
@@ -330,7 +330,14 @@ When the user requests a recharge or another skill triggers an auto top-up:
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills pre_check_account --args '{}'
    ```
    - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
-2. **Execute Payment:** The merchant skill must call `clink_pay` directly with fully prepared payment inputs plus `merchant_integration`.
+2. **Route by selected payment method:**
+   - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
+   - Visa payment methods never use the normal charge path directly.
+   - If the selected Visa payment method has `isVic !== true`, the payment skill sends a VIC registration link and waits for the same `paymentInstrumentId` to appear with `isVic=true`.
+   - The VIC registration link path is `/passkey-auth/{paymentInstrumentId}?type=visa`.
+   - The updated payment method list may arrive through agent refresh (`get_binding_link`, payment-method tools, or a later payment call) or through the OpenClaw payment-method webhook (`payment_method.added` or `payment_method.update`). If `webhookAvailable=false`, the skill starts the `vic_registration` poll fallback and the agent must keep monitoring until success, failure, or timeout.
+   - Once the selected Visa payment method has `isVic=true`, continue the VIC purchase instruction flow. Do NOT call `clink_pay` for that Visa card.
+3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
    If calling via shell (do NOT omit --args, replace placeholders):
    ```
    # Direct mode:
@@ -338,12 +345,12 @@ When the user requests a recharge or another skill triggers an auto top-up:
    # Session mode:
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
    ```
-3. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
-4. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
+4. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
+5. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
    - `agent_order.succeeded` → Payment webhook may send `✅ Payment Successful` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
    - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
    - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS Verification Required` card, then waits for webhook
-5. **Handle Failures:**
+6. **Handle Failures:**
    - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
    - Email mismatch → Show the security block card. Do NOT retry.
    - Risk rule triggered → Show options (override / modify rules / pause).
@@ -388,9 +395,9 @@ When the user asks to check an existing refund:
 
 ### 2.8 VIC Agentic Authorization (Purchase Instruction)
 
-Use this only for a VIC-ready Visa card, when the user wants to pre-authorize the agent to pay within mandate limits. Non-Visa or non-VIC-ready cards use the normal `clink_pay` flow instead.
+Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
 
-1. **Confirm VIC readiness:** the selected/default payment method must be a Visa card with `vicReadiness=READY`. If not, do not use VIC; fall back to normal payment.
+1. **Confirm Visa + isVic:** the selected/default payment method must be a Visa card. If it has `isVic !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `isVic=true`.
 2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE`. If an ACTIVE instruction already matches the card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
 3. **Create (only after explicit user authorization of the spend scope):**
    ```
@@ -402,7 +409,7 @@ Use this only for a VIC-ready Visa card, when the user wants to pre-authorize th
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills sign_purchase_instruction --args '{"instructionId":"<INSTRUCTION_ID>","appInstance":{"deviceData":{"type":"Laptop","brand":"Chrome"}},"authResult":{"identifier":"<FIDO_ID>","fidoBlob":"<BLOB>","dfpSessionId":"<DFP>"}}'
    ```
    Status must become `ACTIVE` before any payment. Never fabricate `authResult`/`appInstance`.
-5. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-VIC routes.
+5. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
 
 **VIC hard rules:** never create/sign without explicit user authorization; never invent mandates or authResult; an instruction must be `ACTIVE` before VIC payment execution; `update`/`cancel` require fresh `appInstance` + `authResult`; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
 

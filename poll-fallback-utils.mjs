@@ -7,12 +7,21 @@ export function isAsyncOperationExpired(operation, now = Date.now()) {
   return Number.isFinite(expireAt) && expireAt > 0 && now >= expireAt;
 }
 
-export function getReusableAsyncOperation(cache, type, now = Date.now()) {
+export function getReusableAsyncOperation(cache, type, now = Date.now(), details = {}) {
+  const requestedPaymentInstrumentId = type === 'vic_registration' && typeof details?.paymentInstrumentId === 'string'
+    ? details.paymentInstrumentId.trim()
+    : '';
   const operations = Object.values(cache?.asyncOperations || {});
   for (const operation of operations) {
     if (operation?.type !== type) continue;
     if (isTerminalAsyncOperationStatus(operation.status)) continue;
     if (isAsyncOperationExpired(operation, now)) continue;
+    if (requestedPaymentInstrumentId) {
+      const operationPaymentInstrumentId = typeof operation.paymentInstrumentId === 'string'
+        ? operation.paymentInstrumentId.trim()
+        : '';
+      if (operationPaymentInstrumentId !== requestedPaymentInstrumentId) continue;
+    }
     return operation;
   }
   return null;
@@ -45,6 +54,16 @@ export function buildPollFallbackTimeoutMessageRequest(type) {
       messageKey: 'poll_fallback.timeout',
       vars: {
         flowLabel: 'payment method change',
+        referenceId: 'N/A',
+        expectedEvent: 'payment_method.added',
+      },
+    };
+  }
+  if (type === 'vic_registration') {
+    return {
+      messageKey: 'poll_fallback.timeout',
+      vars: {
+        flowLabel: 'VIC registration',
         referenceId: 'N/A',
         expectedEvent: 'payment_method.added',
       },

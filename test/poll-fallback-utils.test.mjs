@@ -35,6 +35,29 @@ test('reuses non-terminal operations by type for active poll fallbacks', () => {
   );
 });
 
+test('does not reuse VIC registration operations for a different payment instrument', () => {
+  const cache = {
+    asyncOperations: {
+      activeVicRegistration: {
+        id: 'op_vic_1',
+        type: 'vic_registration',
+        paymentInstrumentId: 'pi_visa_1',
+        status: 'pending',
+        expireAt: Date.now() + 60_000,
+      },
+    },
+  };
+
+  assert.equal(
+    getReusableAsyncOperation(cache, 'vic_registration', Date.now(), { paymentInstrumentId: 'pi_visa_2' }),
+    null,
+  );
+  assert.equal(
+    getReusableAsyncOperation(cache, 'vic_registration', Date.now(), { paymentInstrumentId: 'pi_visa_1' })?.id,
+    'op_vic_1',
+  );
+});
+
 test('keeps DIRECT_SEND_POLL_REQUIRED only when a poll operation actually exists', () => {
   const started = buildDirectSendDirective({
     summary: 'Setup link sent.',
@@ -61,6 +84,19 @@ test('builds a timeout notification payload for bind-card poll fallback flows', 
     messageKey: 'poll_fallback.timeout',
     vars: {
       flowLabel: 'payment method setup',
+      referenceId: 'N/A',
+      expectedEvent: 'payment_method.added',
+    },
+  });
+});
+
+test('builds a timeout notification payload for VIC registration poll fallback flows', () => {
+  const message = buildPollFallbackTimeoutMessageRequest('vic_registration');
+
+  assert.deepEqual(message, {
+    messageKey: 'poll_fallback.timeout',
+    vars: {
+      flowLabel: 'VIC registration',
       referenceId: 'N/A',
       expectedEvent: 'payment_method.added',
     },

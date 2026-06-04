@@ -135,9 +135,12 @@ function normalizePaymentMethods(methods) {
           paymentInstrumentId: method.paymentInstrumentId || null,
           paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
           cardBrand: method.cardBrand || method.cardScheme || null,
+          cardScheme: method.cardScheme || method.cardBrand || null,
+          network: method.network || method.cardNetwork || method.paymentNetwork || null,
           cardLast4: method.cardLast4 || method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
           walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
+          isVic: method.isVic === true || method.is_vic === true,
           isDefault: method.isDefault ?? false,
           isDisabled: method.isDisabled ?? false,
           status: method.status || ((method.isDisabled ?? false) ? 'disabled' : 'active'),
@@ -150,9 +153,11 @@ function paymentMethodIdentity(method) {
   return [
     method.paymentInstrumentId || '',
     method.cardBrand || '',
+    method.cardScheme || '',
     method.cardLast4 || '',
     method.walletAccountTag || '',
     method.paymentMethodType || '',
+    method.isVic === true ? 'isVic' : 'notVic',
   ].join('|');
 }
 
@@ -162,9 +167,11 @@ function serializePaymentMethods(methods) {
       .map((method) => ({
         paymentInstrumentId: method.paymentInstrumentId,
         cardBrand: method.cardBrand || '',
+        cardScheme: method.cardScheme || '',
         cardLast4: method.cardLast4 || '',
         walletAccountTag: method.walletAccountTag || '',
         paymentMethodType: method.paymentMethodType || '',
+        isVic: Boolean(method.isVic),
         isDefault: Boolean(method.isDefault),
         status: method.status || '',
       }))
@@ -179,6 +186,36 @@ function isSamePaymentMethods(left, right) {
 function detectNewCard(beforeMethods, afterMethods) {
   const beforeSet = new Set(normalizePaymentMethods(beforeMethods).map(paymentMethodIdentity));
   return normalizePaymentMethods(afterMethods).find((method) => !beforeSet.has(paymentMethodIdentity(method))) || null;
+}
+
+function normalizeCardNetwork(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isVisaPaymentMethod(method) {
+  if (!method || typeof method !== 'object') return false;
+  return [
+    method.cardBrand,
+    method.cardScheme,
+    method.network,
+    method.cardNetwork,
+    method.paymentNetwork,
+    method.paymentMethodType,
+    method.paymentInstrumentType,
+  ].some((candidate) => normalizeCardNetwork(candidate) === 'visa');
+}
+
+function isVicPaymentMethod(method) {
+  return Boolean(method && typeof method === 'object' && (method.isVic === true || method.is_vic === true));
+}
+
+function resolveVicRegistrationTargetId(operation) {
+  if (typeof operation?.paymentInstrumentId === 'string' && operation.paymentInstrumentId.trim()) {
+    return operation.paymentInstrumentId.trim();
+  }
+  const snapshotMethod = normalizePaymentMethods(operation?.snapshotBefore || [])
+    .find((method) => isVisaPaymentMethod(method) && !isVicPaymentMethod(method));
+  return snapshotMethod?.paymentInstrumentId || '';
 }
 
 function normalizeRuleSettings(settings) {
@@ -449,6 +486,60 @@ async function tryHandleBindLikeSuccess(operation, latestMethods) {
   return true;
 }
 
+async function tryHandleVicRegistrationSuccess(operation, latestMethods) {
+  const targetPaymentInstrumentId = resolveVicRegistrationTargetId(operation);
+  if (!targetPaymentInstrumentId) return false;
+
+  const latestMethod = normalizePaymentMethods(latestMethods)
+    .find((method) => method.paymentInstrumentId === targetPaymentInstrumentId);
+  if (!latestMethod || !isVisaPaymentMethod(latestMethod) || !isVicPaymentMethod(latestMethod)) {
+    return false;
+  }
+
+  const cache = await readCache();
+  const notifyDestination = getNotifyDestination(cache, operation.notifyDestination);
+  if (!notifyDestination) {
+    await updateOperation(operation.id, { lastError: 'Missing notify destination for VIC registration poll fallback delivery.' });
+    return false;
+  }
+
+  const cardDisplay = formatPaymentMethodDisplay(latestMethod);
+  const notification = createMessageRequest({
+    messageKey: 'payment.vic_registration_complete',
+    vars: {
+      cardDisplay,
+      paymentInstrumentId: targetPaymentInstrumentId,
+    },
+  });
+
+  try {
+    await sendNotifications(notifyDestination, [notification]);
+  } catch (error) {
+    await logError('vic_registration/send', error);
+    await updateOperation(operation.id, { lastError: error instanceof Error ? error.message : String(error) });
+    return false;
+  }
+
+  const freshCache = await readCache();
+  freshCache.paymentMethods = normalizePaymentMethods(latestMethods);
+  freshCache.defaultPaymentMethodId = resolveDefaultPaymentMethodId(latestMethods);
+  freshCache.cachedAt = new Date().toISOString();
+  await writeCache(freshCache);
+  await finalizeOperation(operation.id, {
+    status: 'succeeded',
+    resultPayload: {
+      completionSource: 'poll',
+      paymentInstrumentId: targetPaymentInstrumentId,
+      isVic: true,
+    },
+  });
+  await logRequest('vic_registration/succeeded', {
+    operationId: operation.id,
+    paymentInstrumentId: targetPaymentInstrumentId,
+  });
+  return true;
+}
+
 async function tryHandleRuleSuccess(operation, latestRules) {
   const cache = await readCache();
   if (isSameRuleSettings(latestRules, operation.snapshotBefore)) {
@@ -558,6 +649,10 @@ async function runOperation(operationId) {
       if (operation.type === 'bind_card' || operation.type === 'change_card') {
         const latestMethods = await queryBindingMethods(cache);
         const completed = await tryHandleBindLikeSuccess(operation, latestMethods);
+        if (completed) return;
+      } else if (operation.type === 'vic_registration') {
+        const latestMethods = await queryBindingMethods(cache);
+        const completed = await tryHandleVicRegistrationSuccess(operation, latestMethods);
         if (completed) return;
       } else if (operation.type === 'update_rule') {
         const latestRules = await queryRiskRules(cache);

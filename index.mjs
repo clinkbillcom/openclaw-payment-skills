@@ -240,9 +240,12 @@ function normalizePaymentMethods(methods) {
           paymentInstrumentId: method.paymentInstrumentId || null,
           paymentMethodType: method.paymentMethodType || method.paymentInstrumentType || null,
           cardBrand: method.cardBrand || method.cardScheme || null,
+          cardScheme: method.cardScheme || method.cardBrand || null,
+          network: method.network || method.cardNetwork || method.paymentNetwork || null,
           cardLast4: method.cardLast4 || method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
           walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
+          isVic: method.isVic === true || method.is_vic === true,
           isDefault: method.isDefault ?? false,
           isDisabled: method.isDisabled ?? false,
           status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
@@ -363,7 +366,7 @@ function createAsyncOperationId(type) {
   return `${String(type)}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
 }
 
-function buildAsyncOperation(type, snapshotBefore, notifyDestination) {
+function buildAsyncOperation(type, snapshotBefore, notifyDestination, details = {}) {
   const now = Date.now();
   return {
     id: createAsyncOperationId(type),
@@ -376,6 +379,7 @@ function buildAsyncOperation(type, snapshotBefore, notifyDestination) {
     retryCount: 0,
     snapshotBefore: cloneJsonValue(snapshotBefore),
     notifyDestination: notifyDestination ? cloneJsonValue(notifyDestination) : null,
+    ...(details && typeof details === 'object' && !Array.isArray(details) ? cloneJsonValue(details) : {}),
     lastError: '',
     resultPayload: null,
   };
@@ -389,13 +393,13 @@ function spawnPollFallbackProcessor(operationId) {
   child.unref();
 }
 
-async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestination = null) {
+async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestination = null, details = {}) {
   const cache = normalizeCache(await readPaymentMethodsCache() || {});
   if (isWebhookAvailable(cache)) {
     return null;
   }
 
-  const activeOperation = getReusableAsyncOperation(cache, type);
+  const activeOperation = getReusableAsyncOperation(cache, type, Date.now(), details);
   if (activeOperation) {
     if (notifyDestination) {
       activeOperation.notifyDestination = cloneJsonValue(notifyDestination);
@@ -410,7 +414,7 @@ async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestina
     return activeOperation;
   }
 
-  const operation = buildAsyncOperation(type, snapshotBefore, notifyDestination || getNotifyDestination(cache));
+  const operation = buildAsyncOperation(type, snapshotBefore, notifyDestination || getNotifyDestination(cache), details);
   cache.asyncOperations[operation.id] = operation;
   await writePaymentMethodsCache(cache);
   spawnPollFallbackProcessor(operation.id);
@@ -423,9 +427,9 @@ async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestina
   return operation;
 }
 
-async function schedulePollFallbackOperationSafely(type, snapshotBefore, notifyDestination = null) {
+async function schedulePollFallbackOperationSafely(type, snapshotBefore, notifyDestination = null, details = {}) {
   try {
-    return await schedulePollFallbackOperation(type, snapshotBefore, notifyDestination);
+    return await schedulePollFallbackOperation(type, snapshotBefore, notifyDestination, details);
   } catch (error) {
     await logError(`poll_fallback/${type}`, error);
     return null;
@@ -436,7 +440,7 @@ function requiresPollFallback(cache) {
   return normalizeCache(cache).webhookAvailable === false;
 }
 
-async function ensureRequiredPollFallback(type, snapshotBefore, cache, notifyDestination = null) {
+async function ensureRequiredPollFallback(type, snapshotBefore, cache, notifyDestination = null, details = {}) {
   const normalizedCache = normalizeCache(cache);
   if (!requiresPollFallback(normalizedCache)) {
     return { required: false, operation: null };
@@ -445,6 +449,7 @@ async function ensureRequiredPollFallback(type, snapshotBefore, cache, notifyDes
     type,
     snapshotBefore,
     notifyDestination || getNotifyDestination(normalizedCache),
+    details,
   );
   return {
     required: true,
@@ -1258,8 +1263,15 @@ async function fetchBindingData() {
 }
 
 function buildRedirectUrl(bindingUrl, redirectPath) {
-  const sep = bindingUrl.includes("?") ? "&" : "?";
-  return `${bindingUrl}${sep}redirectUrl=/${redirectPath}`;
+  const targetPath = redirectPath.startsWith("/") ? redirectPath : `/${redirectPath}`;
+  try {
+    const url = new URL(bindingUrl);
+    url.searchParams.set("redirectUrl", targetPath);
+    return url.toString();
+  } catch {
+    const sep = bindingUrl.includes("?") ? "&" : "?";
+    return `${bindingUrl}${sep}redirectUrl=${encodeURIComponent(targetPath)}`;
+  }
 }
 
 function buildRiskRulesNotification(bindingUrl) {
@@ -1268,6 +1280,256 @@ function buildRiskRulesNotification(bindingUrl) {
     messageKey: 'risk.rules_link',
     vars: { riskUrl },
   });
+}
+
+function normalizeCardNetwork(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function isVisaPaymentMethod(method) {
+  if (!method || typeof method !== 'object') return false;
+  const candidates = [
+    method.cardBrand,
+    method.cardScheme,
+    method.network,
+    method.cardNetwork,
+    method.paymentNetwork,
+    method.paymentMethodType,
+    method.paymentInstrumentType,
+    method.paymentMethod?.cardBrand,
+    method.paymentMethod?.cardScheme,
+    method.paymentMethod?.network,
+  ];
+  return candidates.some((candidate) => normalizeCardNetwork(candidate) === 'visa');
+}
+
+function hasPaymentMethodNetworkSignal(method) {
+  if (!method || typeof method !== 'object') return false;
+  return [
+    method.cardBrand,
+    method.cardScheme,
+    method.network,
+    method.cardNetwork,
+    method.paymentNetwork,
+    method.paymentMethod?.cardBrand,
+    method.paymentMethod?.cardScheme,
+    method.paymentMethod?.network,
+  ].some((candidate) => Boolean(normalizeCardNetwork(candidate)));
+}
+
+function normalizePaymentMethodType(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase().replace(/[\s-]+/g, '_') : '';
+}
+
+function isCardLikePaymentMethod(method) {
+  if (!method || typeof method !== 'object') return false;
+  const typeCandidates = [
+    method.paymentMethodType,
+    method.paymentInstrumentType,
+    method.paymentMethod?.paymentMethodType,
+    method.paymentMethod?.paymentInstrumentType,
+  ];
+  if (typeCandidates.some((candidate) => ['card', 'credit_card', 'debit_card'].includes(normalizePaymentMethodType(candidate)))) {
+    return true;
+  }
+  return [
+    method.cardBrand,
+    method.cardScheme,
+    method.cardLast4,
+    method.cardLastFour,
+    method.cardNetwork,
+    method.paymentNetwork,
+    method.paymentMethod?.cardBrand,
+    method.paymentMethod?.cardScheme,
+    method.paymentMethod?.cardLast4,
+    method.paymentMethod?.cardLastFour,
+  ].some((candidate) => typeof candidate === 'string' && candidate.trim());
+}
+
+function shouldFailClosedForUnknownCardNetwork(method) {
+  return isCardLikePaymentMethod(method) && !hasPaymentMethodNetworkSignal(method);
+}
+
+function isVicPaymentMethod(method) {
+  return Boolean(method && typeof method === 'object' && (method.isVic === true || method.is_vic === true));
+}
+
+function findPaymentMethodById(methods, paymentInstrumentId) {
+  if (!paymentInstrumentId) return null;
+  return normalizePaymentMethods(methods).find((method) => method.paymentInstrumentId === paymentInstrumentId) || null;
+}
+
+function buildVicRegistrationUrl(bindingUrl, paymentInstrumentId) {
+  return buildRedirectUrl(bindingUrl, `passkey-auth/${encodeURIComponent(paymentInstrumentId)}?type=visa`);
+}
+
+function buildVicRegistrationNotification({ paymentInstrumentId, cardDisplay, passkeyUrl }) {
+  return createMessageRequest({
+    messageKey: 'payment.vic_registration_required',
+    vars: {
+      paymentInstrumentId,
+      cardDisplay,
+      passkeyUrl,
+    },
+  });
+}
+
+function buildVicInstructionRequiredDirective(paymentMethod) {
+  return `[SYSTEM DIRECTIVE] Account pre-check PASSED: selected Visa card is VIC-enabled.
+Do NOT call clink_pay for this Visa card yet.
+Continue the VIC purchase instruction flow: list active purchase instructions for this card, reuse a matching ACTIVE instruction when available, otherwise call create_purchase_instruction and then sign_purchase_instruction with the user's Passkey result.
+Payment Instrument ID: ${paymentMethod.paymentInstrumentId}`;
+}
+
+function buildUnknownPaymentMethodNetworkDirective({ paymentInstrumentId, errorMessage = '' }) {
+  return `[SYSTEM DIRECTIVE] Account pre-check BLOCKED: selected card network could not be confirmed.
+The payment method looks like a card, but cardBrand/cardScheme/network are missing. Because the skill cannot prove this card is non-Visa, it must not use the normal charge path.
+Do NOT call clink_pay for this payment method until payment methods refresh successfully and the card network is known.
+Payment Instrument ID: ${paymentInstrumentId || 'N/A'}${errorMessage ? `\nRefresh error: ${errorMessage}` : ''}`;
+}
+
+async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = null, notifyDestination = null, context = 'payment' }) {
+  let method = selectedMethod ? normalizePaymentMethods([selectedMethod])[0] : null;
+  let bindingUrl = '';
+  let latestMethods = [];
+
+  if (!method || !hasPaymentMethodNetworkSignal(method) || (isVisaPaymentMethod(method) && !isVicPaymentMethod(method))) {
+    try {
+      const bindingData = await fetchBindingData();
+      bindingUrl = bindingData.bindingUrl || '';
+      latestMethods = normalizePaymentMethods(bindingData.methods || []);
+      method = findPaymentMethodById(latestMethods, paymentInstrumentId) || method;
+    } catch (error) {
+      await logError(`${context}/vic_registration_refresh`, error);
+      if (!method) {
+        return {
+          blocked: true,
+          response: `Failed to resolve payment method for VIC registration: ${error.message}`,
+        };
+      }
+      if (shouldFailClosedForUnknownCardNetwork(method)) {
+        return {
+          blocked: true,
+          route: 'card_network_unknown',
+          paymentMethod: method,
+          response: buildUnknownPaymentMethodNetworkDirective({
+            paymentInstrumentId: method.paymentInstrumentId || paymentInstrumentId,
+            errorMessage: error.message,
+          }),
+        };
+      }
+    }
+  }
+
+  if (shouldFailClosedForUnknownCardNetwork(method)) {
+    return {
+      blocked: true,
+      route: 'card_network_unknown',
+      paymentMethod: method,
+      response: buildUnknownPaymentMethodNetworkDirective({
+        paymentInstrumentId: method.paymentInstrumentId || paymentInstrumentId,
+      }),
+    };
+  }
+
+  if (!method || !isVisaPaymentMethod(method)) {
+    return { blocked: false, route: 'legacy', paymentMethod: method };
+  }
+
+  if (isVicPaymentMethod(method)) {
+    return {
+      blocked: true,
+      route: 'vic_instruction_required',
+      paymentMethod: method,
+      response: buildVicInstructionRequiredDirective(method),
+    };
+  }
+
+  if (!bindingUrl) {
+    try {
+      const bindingData = await fetchBindingData();
+      bindingUrl = bindingData.bindingUrl || '';
+      latestMethods = normalizePaymentMethods(bindingData.methods || []);
+      method = findPaymentMethodById(latestMethods, paymentInstrumentId) || method;
+    } catch (error) {
+      await logError(`${context}/vic_registration_link`, error);
+      return {
+        blocked: true,
+        response: `Failed to generate VIC registration link: ${error.message}`,
+      };
+    }
+  }
+
+  if (isVicPaymentMethod(method)) {
+    return {
+      blocked: true,
+      route: 'vic_instruction_required',
+      paymentMethod: method,
+      response: buildVicInstructionRequiredDirective(method),
+    };
+  }
+
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  const effectiveNotifyDestination = notifyDestination || getNotifyDestination(cache);
+  const passkeyUrl = buildVicRegistrationUrl(bindingUrl, paymentInstrumentId);
+  const cardDisplay = formatPaymentMethodDisplay(method);
+  const notification = buildVicRegistrationNotification({
+    paymentInstrumentId,
+    cardDisplay,
+    passkeyUrl,
+  });
+  const snapshotBefore = latestMethods.length > 0
+    ? latestMethods
+    : normalizePaymentMethods(cache.paymentMethods || [method]);
+  const pollFallback = await ensureRequiredPollFallback(
+    'vic_registration',
+    snapshotBefore,
+    cache,
+    effectiveNotifyDestination,
+    { paymentInstrumentId },
+  );
+  const pollFallbackLines = getRequiredPollFallbackLines({
+    fallback: pollFallback,
+    successEvent: 'payment_method.added with isVic=true for the same paymentInstrumentId',
+  });
+
+  const followUp = [
+    'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
+    'Do NOT create a purchase instruction and do NOT charge until this same Visa payment method appears with isVic=true.',
+    ...(pollFallback.required
+      ? pollFallbackLines
+      : ['Wait for the payment-method webhook or refresh payment methods until isVic=true, then continue the VIC purchase instruction flow.']),
+  ];
+
+  if (effectiveNotifyDestination) {
+    try {
+      sendNotificationDirect(effectiveNotifyDestination, notification);
+      return {
+        blocked: true,
+        route: 'vic_registration_required',
+        paymentMethod: method,
+        response: buildDirectSendDirective({
+          summary: 'VIC registration link delivered.',
+          pollFallback,
+          pollFallbackLines,
+          webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until isVic=true, then continue the VIC purchase instruction flow.',
+        }),
+      };
+    } catch (error) {
+      await logError(`${context}/vic_registration_direct_send`, error);
+    }
+  }
+
+  return {
+    blocked: true,
+    route: 'vic_registration_required',
+    paymentMethod: method,
+    response: formatNotificationInstruction({
+      summary: 'VIC registration is required before this Visa card can be used.',
+      notifications: notification,
+      followUp,
+    }),
+  };
 }
 
 // ------------------------------------------------------------------
@@ -1830,6 +2092,16 @@ Call initialize_wallet first before attempting to charge.`;
 Call get_payment_method_setup_link to prompt the user to bind a card before charging.`;
   }
 
+  const normalizedDefaultCard = normalizePaymentMethods([defaultCard])[0] || defaultCard;
+  const vicGate = await ensureVisaVicReadyForUse({
+    paymentInstrumentId: normalizedDefaultCard.paymentInstrumentId,
+    selectedMethod: normalizedDefaultCard,
+    context: 'pre_check_account',
+  });
+  if (vicGate.blocked) {
+    return vicGate.response;
+  }
+
   return `[SYSTEM DIRECTIVE] Account pre-check PASSED. Ready to charge.
 Do NOT send any extra "Clink 账户检测通过" notification to the user for this state.
 IMMEDIATELY call clink_pay. Use the user-provided amount if one was specified in this turn; otherwise, use the default amount provided by the merchant.`;
@@ -1905,6 +2177,20 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
       await logError('clink_pay/fetchPaymentMethod', err);
       return `Failed to fetch default payment method: ${err.message}`;
     }
+  }
+
+  const vicGate = await ensureVisaVicReadyForUse({
+    paymentInstrumentId: piId,
+    selectedMethod: defaultCard,
+    notifyDestination: requestNotifyDestination,
+    context: 'clink_pay',
+  });
+  if (vicGate.blocked) {
+    return vicGate.response;
+  }
+  if (vicGate.paymentMethod) {
+    defaultCard = vicGate.paymentMethod;
+    pmType = vicGate.paymentMethod.paymentMethodType || vicGate.paymentMethod.paymentInstrumentType || pmType;
   }
 
   const timestamp = Date.now().toString();
