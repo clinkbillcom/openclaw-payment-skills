@@ -12,6 +12,7 @@ const webhookSource = await fs.readFile(new URL('../hooks/my_payment_webhook.mjs
 const pollSource = await fs.readFile(new URL('../scripts/poll-fallback.mjs', import.meta.url), 'utf8');
 const notificationSource = await fs.readFile(new URL('../notification-utils.js', import.meta.url), 'utf8');
 const skillSource = await fs.readFile(new URL('../SKILL.md', import.meta.url), 'utf8');
+const configSource = await fs.readFile(new URL('../config.mjs', import.meta.url), 'utf8');
 
 function sliceBetween(source, startNeedle, endNeedle) {
   const start = source.indexOf(startNeedle);
@@ -167,6 +168,15 @@ test('VIC registration notification exists and uses passkeyUrl', () => {
   assert.match(notificationSource, /'payment\.vic_registration_required'/);
   assert.match(notificationSource, /passkeyUrl/);
   assert.match(notificationSource, /Complete VIC Registration|完成 VIC 注册/);
+});
+
+test('purchase instruction APIs use the agent UAT domain', () => {
+  const fetchInstruction = extractFunction(indexSource, 'fetchInstruction');
+
+  assert.match(configSource, /AGENT_API_BASE_URL:\s*"https:\/\/uat-agent\.clinkbill\.com"/);
+  assert.match(indexSource, /const AGENT_BASE_URL = CONFIG\.AGENT_API_BASE_URL/);
+  assert.match(fetchInstruction, /fetchClinkFromBase\(AGENT_BASE_URL/);
+  assert.doesNotMatch(fetchInstruction, /fetchClink\(endpoint/);
 });
 
 test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {

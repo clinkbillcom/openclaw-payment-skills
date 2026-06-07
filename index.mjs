@@ -1180,6 +1180,7 @@ function resolveChargeCardDisplay({ paymentInstrumentId, channelPaymentResponse,
 // API HELPERS
 // ------------------------------------------------------------------
 const BASE_URL = CONFIG.API_BASE_URL;
+const AGENT_BASE_URL = CONFIG.AGENT_API_BASE_URL;
 
 class ClinkApiError extends Error {
   constructor(code, msg, raw) {
@@ -1219,7 +1220,11 @@ function httpsRequest(urlStr, options = {}, body = null) {
 }
 
 async function fetchClink(endpoint, options = {}) {
-  const url = `${BASE_URL}${endpoint}`;
+  return fetchClinkFromBase(BASE_URL, endpoint, options);
+}
+
+async function fetchClinkFromBase(baseUrl, endpoint, options = {}) {
+  const url = `${baseUrl}${endpoint}`;
   const body = options.body ? JSON.parse(options.body) : null;
   const data = await httpsRequest(url, { method: options.method || "GET", headers: options.headers }, body);
   if (data.code !== 200) {
@@ -2909,7 +2914,7 @@ async function fetchInstruction(endpoint, method, bodyObj) {
     throw new Error("Wallet not initialized. Please run initialize_wallet first.");
   }
   // Instruction endpoints authenticate by customer API key only (no X-Customer-ID).
-  return fetchClink(endpoint, {
+  return fetchClinkFromBase(AGENT_BASE_URL, endpoint, {
     method,
     headers: {
       "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
