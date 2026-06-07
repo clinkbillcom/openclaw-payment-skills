@@ -170,13 +170,22 @@ test('VIC registration notification exists and uses passkeyUrl', () => {
   assert.match(notificationSource, /Complete VIC Registration|完成 VIC 注册/);
 });
 
-test('purchase instruction APIs use the agent UAT domain', () => {
+test('purchase instruction APIs use the default UAT API domain', () => {
   const fetchInstruction = extractFunction(indexSource, 'fetchInstruction');
 
-  assert.match(configSource, /AGENT_API_BASE_URL:\s*"https:\/\/uat-agent\.clinkbill\.com"/);
-  assert.match(indexSource, /const AGENT_BASE_URL = CONFIG\.AGENT_API_BASE_URL/);
-  assert.match(fetchInstruction, /fetchClinkFromBase\(AGENT_BASE_URL/);
-  assert.doesNotMatch(fetchInstruction, /fetchClink\(endpoint/);
+  assert.match(configSource, /API_BASE_URL:\s*"https:\/\/uat-api\.clinkbill\.com"/);
+  assert.doesNotMatch(configSource, /AGENT_API_BASE_URL/);
+  assert.doesNotMatch(indexSource, /AGENT_BASE_URL/);
+  assert.match(fetchInstruction, /fetchClink\(endpoint/);
+});
+
+test('purchase instruction APIs use the agent cwallet instruction path', () => {
+  assert.match(indexSource, /fetchInstruction\('\/agent\/cwallet\/instructions', 'POST'/);
+  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}\/sign`/);
+  assert.match(indexSource, /`\/agent\/cwallet\/instructions\$\{qs\}`/);
+  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}`/);
+  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}\/cancel`/);
+  assert.doesNotMatch(indexSource, /\/a\/cwallet\/instructions/);
 });
 
 test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {

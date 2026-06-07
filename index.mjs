@@ -1180,7 +1180,6 @@ function resolveChargeCardDisplay({ paymentInstrumentId, channelPaymentResponse,
 // API HELPERS
 // ------------------------------------------------------------------
 const BASE_URL = CONFIG.API_BASE_URL;
-const AGENT_BASE_URL = CONFIG.AGENT_API_BASE_URL;
 
 class ClinkApiError extends Error {
   constructor(code, msg, raw) {
@@ -1220,11 +1219,7 @@ function httpsRequest(urlStr, options = {}, body = null) {
 }
 
 async function fetchClink(endpoint, options = {}) {
-  return fetchClinkFromBase(BASE_URL, endpoint, options);
-}
-
-async function fetchClinkFromBase(baseUrl, endpoint, options = {}) {
-  const url = `${baseUrl}${endpoint}`;
+  const url = `${BASE_URL}${endpoint}`;
   const body = options.body ? JSON.parse(options.body) : null;
   const data = await httpsRequest(url, { method: options.method || "GET", headers: options.headers }, body);
   if (data.code !== 200) {
@@ -2914,7 +2909,7 @@ async function fetchInstruction(endpoint, method, bodyObj) {
     throw new Error("Wallet not initialized. Please run initialize_wallet first.");
   }
   // Instruction endpoints authenticate by customer API key only (no X-Customer-ID).
-  return fetchClinkFromBase(AGENT_BASE_URL, endpoint, {
+  return fetchClink(endpoint, {
     method,
     headers: {
       "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
@@ -2940,7 +2935,7 @@ async function handle_create_purchase_instruction(args = {}) {
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
-    const data = await fetchInstruction('/a/cwallet/instructions', 'POST', body);
+    const data = await fetchInstruction('/agent/cwallet/instructions', 'POST', body);
     await logRequest('create_purchase_instruction', body, data);
     return `Purchase instruction created (status CREATED). It is NOT usable until you call sign_purchase_instruction with the user's Passkey result.\nRaw Data: ${JSON.stringify(data)}`;
   } catch (err) {
@@ -2958,7 +2953,7 @@ async function handle_sign_purchase_instruction(args = {}) {
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
-    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}/sign`, 'POST', body);
+    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}/sign`, 'POST', body);
     // Never log authResult — it carries fidoBlob.
     await logRequest('sign_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
     return `Purchase instruction signed (now ACTIVE). The VIC payment entry and request field are pending backend confirmation.\nRaw Data: ${JSON.stringify(data)}`;
@@ -2971,7 +2966,7 @@ async function handle_sign_purchase_instruction(args = {}) {
 async function handle_list_purchase_instructions(args = {}) {
   const qs = args.status ? `?status=${encodeURIComponent(args.status)}` : '';
   try {
-    const data = await fetchInstruction(`/a/cwallet/instructions${qs}`, 'GET');
+    const data = await fetchInstruction(`/agent/cwallet/instructions${qs}`, 'GET');
     return `Purchase instructions:\n${JSON.stringify(data, null, 2)}`;
   } catch (err) {
     await logError('list_purchase_instructions', err);
@@ -2982,7 +2977,7 @@ async function handle_list_purchase_instructions(args = {}) {
 async function handle_get_purchase_instruction(args = {}) {
   if (!args.instructionId) return "ERROR: get_purchase_instruction requires 'instructionId'.";
   try {
-    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'GET');
+    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'GET');
     return `Purchase instruction detail:\n${JSON.stringify(data, null, 2)}`;
   } catch (err) {
     await logError('get_purchase_instruction', err);
@@ -3009,7 +3004,7 @@ async function handle_update_purchase_instruction(args = {}) {
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
-    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'PUT', body);
+    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'PUT', body);
     await logRequest('update_purchase_instruction', { ...body, authResult: '[REDACTED]' }, data);
     return `Purchase instruction updated.\nRaw Data: ${JSON.stringify(data)}`;
   } catch (err) {
@@ -3024,7 +3019,7 @@ async function handle_cancel_purchase_instruction(args = {}) {
 
   const body = { authResult: args.authResult, appInstance: args.appInstance };
   try {
-    const data = await fetchInstruction(`/a/cwallet/instructions/${encodeURIComponent(args.instructionId)}/cancel`, 'POST', body);
+    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}/cancel`, 'POST', body);
     await logRequest('cancel_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
     return `Purchase instruction cancelled.\nRaw Data: ${JSON.stringify(data)}`;
   } catch (err) {
