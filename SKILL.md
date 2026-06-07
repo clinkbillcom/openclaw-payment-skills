@@ -1,6 +1,6 @@
 ---
 name: openclaw-payment-skills
-description: "Universal agent skill to integrate Clink payments, handling user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract; Feishu uses native cards, Telegram uses rich text/media delivery, and other channels fall back to markdown/text."
+description: "Universal agent skill to integrate Clink payments, including Visa purchase/book intent routed through VIC registration and purchase-instruction authorization, user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract."
 version: "1.0.0"
 metadata:
   openclaw:
@@ -95,8 +95,9 @@ When this rule fires:
 2. Call `pre_check_account` or use current payment-method state to resolve the selected/default payment method.
 3. If the selected/default Visa card has `visaRegistrationSucceeded !== true`, start VIC registration and wait for the same `paymentInstrumentId` to become VIC-ready.
 4. If the selected/default Visa card has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow: call `list_purchase_instructions`, reuse a matching ACTIVE instruction when possible, otherwise create an instruction draft with `create_purchase_instruction`.
-5. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices.
-6. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
+5. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
+6. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices.
+7. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
 
 ## Routing Boundary Rule (Hard Rule)
 
