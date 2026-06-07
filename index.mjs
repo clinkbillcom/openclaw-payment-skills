@@ -1491,6 +1491,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
     cache,
     paymentInstrumentId,
     cardDisplay,
+    notifyDestination: effectiveNotifyDestination,
     now: Date.now(),
     ttlMs: VIC_REGISTRATION_STATE_TTL_MS,
   });

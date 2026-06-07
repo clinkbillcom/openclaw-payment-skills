@@ -82,6 +82,22 @@ You MUST:
 - After installation is complete, execute the install success notification immediately via `pre_install.mjs` or `send-message.mjs`.
 - Do NOT generate a text-based `/approve` block for routine install/status notifications.
 
+## PRIORITY RULE: Explicit Visa Purchase Intent -> VIC Instruction Flow
+
+If the user message contains both a Visa payment signal and a purchase intent, this skill owns the payment authorization part of the request even when the message does not mention Clink, wallet, or this skill by name.
+
+Visa payment signals include: `visa`, `Visa card`, `Visa 卡`, or card-ending language that clearly refers to a known Visa card.
+
+Purchase intent signals include: `buy`, `purchase`, `order`, `book`, `reserve`, `下单`, `购买`, `预订`, `订酒店`, `买票`, or equivalent wording that asks the agent to acquire goods, services, bookings, tickets, reservations, or merchant value for the user.
+
+When this rule fires:
+1. Do not answer only that the merchant booking plugin is missing. Preserve the merchant task as the business intent, but route the payment authorization through VIC first.
+2. Call `pre_check_account` or use current payment-method state to resolve the selected/default payment method.
+3. If the selected/default Visa card has `visaRegistrationSucceeded !== true`, start VIC registration and wait for the same `paymentInstrumentId` to become VIC-ready.
+4. If the selected/default Visa card has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow: call `list_purchase_instructions`, reuse a matching ACTIVE instruction when possible, otherwise create an instruction draft with `create_purchase_instruction`.
+5. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices.
+6. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
+
 ## Routing Boundary Rule (Hard Rule)
 
 Route generic auto-top-up language by product ownership, not by keyword alone.

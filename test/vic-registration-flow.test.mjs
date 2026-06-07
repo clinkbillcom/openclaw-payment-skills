@@ -169,6 +169,18 @@ test('VIC registration notification exists and uses passkeyUrl', () => {
   assert.match(notificationSource, /Complete VIC Registration|完成 VIC 注册/);
 });
 
+test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {
+  assert.match(skillSource, /Explicit Visa Purchase Intent/i);
+  assert.match(skillSource, /visa.*purchase.*intent/i);
+  assert.match(skillSource, /Visa card|Visa 卡/);
+  assert.match(skillSource, /buy|purchase|order|book|reserve|下单|购买|预订|订酒店/);
+  assert.match(skillSource, /pre_check_account/);
+  assert.match(skillSource, /create_purchase_instruction/);
+  assert.match(skillSource, /VIC registration/i);
+  assert.match(skillSource, /Do NOT call clink_pay for Visa/i);
+  assert.match(skillSource, /do not answer only that the merchant booking plugin is missing/i);
+});
+
 test('blocks card payment when brand/network is unknown and payment method refresh fails', async () => {
   const ensureVisaVicReadyForUse = buildVicGateHarness()(async () => {
     throw new Error('refresh unavailable');

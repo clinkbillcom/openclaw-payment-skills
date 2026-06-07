@@ -113,7 +113,11 @@ test('payment_method.update treats visaRegistrationSucceeded as VIC completion',
 
   const cache = await readCache(skillDir);
   assert.equal(cache.paymentMethods[0].visaRegistrationSucceeded, true);
-  assert.equal(cache.paymentFlowStates['vic_registration:pi_visa_1'].status, 'ready');
+  assert.ok(
+    Object.values(cache.paymentFlowStates).some((state) =>
+      state.paymentInstrumentId === 'pi_visa_1' && state.status === 'ready'
+    ),
+  );
   assert.match(result.message, /VIC 注册完成回调/);
 });
 

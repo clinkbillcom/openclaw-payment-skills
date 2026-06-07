@@ -528,7 +528,9 @@ async function upsertCachedPaymentMethodFromWebhook(data, cachedMethod, { markIn
       paymentInstrumentId: cachedMethod.paymentInstrumentId,
       now: Date.now(),
     });
-    cache.paymentFlowStates[readyState.key] = readyState.state;
+    for (const [key, state] of Object.entries(readyState.states)) {
+      cache.paymentFlowStates[key] = state;
+    }
   }
 
   if (existing >= 0) {

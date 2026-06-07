@@ -535,7 +535,9 @@ async function tryHandleVicRegistrationSuccess(operation, latestMethods) {
     paymentInstrumentId: targetPaymentInstrumentId,
     now: Date.now(),
   });
-  freshCache.paymentFlowStates[readyState.key] = readyState.state;
+  for (const [key, state] of Object.entries(readyState.states)) {
+    freshCache.paymentFlowStates[key] = state;
+  }
   freshCache.cachedAt = new Date().toISOString();
   await writeCache(freshCache);
   await finalizeOperation(operation.id, {
