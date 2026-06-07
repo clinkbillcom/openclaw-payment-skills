@@ -2,6 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs/promises';
 
+import {
+  isVisaRegistrationSucceeded,
+  VIC_REGISTRATION_STATE_TTL_MS,
+} from '../vic-registration-state-utils.mjs';
+
 const indexSource = await fs.readFile(new URL('../index.mjs', import.meta.url), 'utf8');
 const webhookSource = await fs.readFile(new URL('../hooks/my_payment_webhook.mjs', import.meta.url), 'utf8');
 const pollSource = await fs.readFile(new URL('../scripts/poll-fallback.mjs', import.meta.url), 'utf8');
@@ -47,7 +52,7 @@ function buildVicGateHarness() {
     'normalizePaymentMethodType',
     'isCardLikePaymentMethod',
     'shouldFailClosedForUnknownCardNetwork',
-    'isVicPaymentMethod',
+    'isVisaRegistrationCompletePaymentMethod',
     'findPaymentMethodById',
     'buildVicInstructionRequiredDirective',
     'buildUnknownPaymentMethodNetworkDirective',
@@ -58,10 +63,20 @@ function buildVicGateHarness() {
     .join('\n\n');
 
   return new Function('fetchBindingDataImpl', `
+    const VIC_REGISTRATION_STATE_TTL_MS = ${VIC_REGISTRATION_STATE_TTL_MS};
+    const isVisaRegistrationSucceeded = ${isVisaRegistrationSucceeded.toString()};
+    function resolveVicRegistrationState({ paymentInstrumentId }) {
+      return {
+        key: 'vic_registration:' + paymentInstrumentId,
+        state: { type: 'vic_registration', status: 'pending_notified', paymentInstrumentId },
+        shouldNotify: true,
+      };
+    }
     ${functionSources}
     async function fetchBindingData() { return fetchBindingDataImpl(); }
     async function logError() {}
     async function readPaymentMethodsCache() { return {}; }
+    async function writePaymentFlowState() {}
     function normalizeCache(cache) { return cache && typeof cache === 'object' ? cache : {}; }
     function getNotifyDestination() { return null; }
     function buildVicRegistrationUrl() { return 'https://example.test/passkey-auth/pi_unknown?type=visa'; }
@@ -69,12 +84,13 @@ function buildVicGateHarness() {
     function buildVicRegistrationNotification() { return { messageKey: 'payment.vic_registration_required' }; }
     async function ensureRequiredPollFallback() { return { required: false, operation: null }; }
     function getRequiredPollFallbackLines() { return []; }
+    function buildDirectSendDirective({ summary }) { return '[SYSTEM DIRECTIVE] ' + summary; }
     function formatNotificationInstruction({ summary }) { return '[SYSTEM DIRECTIVE] ' + summary; }
     return ensureVisaVicReadyForUse;
   `);
 }
 
-test('normalizes payment methods with isVic and without vicReadiness', () => {
+test('normalizes payment methods with visaRegistrationSucceeded only and without vicReadiness', () => {
   const indexNormalizer = sliceBetween(
     indexSource,
     'function normalizePaymentMethods(methods) {',
@@ -92,7 +108,8 @@ test('normalizes payment methods with isVic and without vicReadiness', () => {
   );
 
   for (const source of [indexNormalizer, pollNormalizer, webhookMapper]) {
-    assert.match(source, /isVic/);
+    assert.match(source, /visaRegistrationSucceeded/);
+    assert.doesNotMatch(source, /is_vic/);
     assert.doesNotMatch(source, /vicReadiness/);
     assert.doesNotMatch(source, /vicReadinessReason/);
   }
@@ -114,7 +131,7 @@ test('clink_pay routes Visa cards through VIC gates before charging', () => {
   );
 });
 
-test('pre_check_account routes Visa cards without isVic to VIC registration first', () => {
+test('pre_check_account routes Visa cards without visaRegistrationSucceeded to VIC registration first', () => {
   const handler = sliceBetween(
     indexSource,
     'async function handle_pre_check_account() {',
@@ -125,6 +142,19 @@ test('pre_check_account routes Visa cards without isVic to VIC registration firs
   assert.match(indexSource, /VIC registration/);
   assert.match(indexSource, /VIC purchase instruction flow/);
   assert.doesNotMatch(handler, /vicReadiness/);
+});
+
+test('VIC gate uses registration state before sending duplicate registration notifications', () => {
+  const gate = sliceBetween(
+    indexSource,
+    'async function ensureVisaVicReadyForUse',
+    '// ------------------------------------------------------------------\n// TOOL IMPLEMENTATIONS',
+  );
+
+  assert.match(gate, /resolveVicRegistrationState/);
+  assert.match(gate, /vicState\.shouldNotify/);
+  assert.match(gate, /vic_registration_pending/);
+  assert.match(gate, /writePaymentFlowState/);
 });
 
 test('builds passkey-auth registration links from paymentInstrumentId', () => {
@@ -149,7 +179,7 @@ test('blocks card payment when brand/network is unknown and payment method refre
     selectedMethod: {
       paymentInstrumentId: 'pi_unknown',
       paymentMethodType: 'CARD',
-      isVic: false,
+      visaRegistrationSucceeded: false,
     },
     context: 'clink_pay',
   });
@@ -160,10 +190,38 @@ test('blocks card payment when brand/network is unknown and payment method refre
   assert.match(result.response, /refresh unavailable/);
 });
 
-test('routes VIC-enabled Visa cards to purchase instruction flow', async () => {
+test('routes Visa cards with visaRegistrationSucceeded to purchase instruction flow', async () => {
   const ensureVisaVicReadyForUse = buildVicGateHarness()(async () => {
     throw new Error('refresh should not be needed');
   });
+
+  const result = await ensureVisaVicReadyForUse({
+    paymentInstrumentId: 'pi_vic',
+    selectedMethod: {
+      paymentInstrumentId: 'pi_vic',
+      cardBrand: 'visa',
+      paymentMethodType: 'CARD',
+      visaRegistrationSucceeded: true,
+    },
+    context: 'clink_pay',
+  });
+
+  assert.equal(result.blocked, true);
+  assert.equal(result.route, 'vic_instruction_required');
+  assert.match(result.response, /VIC purchase instruction flow/);
+  assert.match(result.response, /Do NOT call clink_pay/);
+});
+
+test('does not treat isVic as VIC registration completion', async () => {
+  const ensureVisaVicReadyForUse = buildVicGateHarness()(async () => ({
+    bindingUrl: 'https://example.test/bind',
+    methods: [{
+      paymentInstrumentId: 'pi_vic',
+      cardBrand: 'visa',
+      paymentMethodType: 'CARD',
+      isVic: true,
+    }],
+  }));
 
   const result = await ensureVisaVicReadyForUse({
     paymentInstrumentId: 'pi_vic',
@@ -177,9 +235,8 @@ test('routes VIC-enabled Visa cards to purchase instruction flow', async () => {
   });
 
   assert.equal(result.blocked, true);
-  assert.equal(result.route, 'vic_instruction_required');
-  assert.match(result.response, /VIC purchase instruction flow/);
-  assert.match(result.response, /Do NOT call clink_pay/);
+  assert.equal(result.route, 'vic_registration_required');
+  assert.doesNotMatch(result.response, /VIC purchase instruction flow/);
 });
 
 test('does not fail closed for non-card payment methods without card network fields', async () => {
@@ -200,14 +257,15 @@ test('does not fail closed for non-card payment methods without card network fie
   assert.equal(result.route, 'legacy');
 });
 
-test('webhook treats an isVic update on the same Visa card as VIC registration completion', () => {
-  assert.match(webhookSource, /isVicRegistrationComplete/);
+test('webhook treats a VIC-ready update on the same Visa card as VIC registration completion', () => {
+  assert.match(webhookSource, /isVisaRegistrationComplete/);
+  assert.match(webhookSource, /visaRegistrationSucceeded/);
   assert.match(webhookSource, /payment\.vic_registration_complete/);
   assert.match(webhookSource, /Continue the VIC purchase instruction flow/);
   assert.match(webhookSource, /Do NOT call clink_pay/);
 });
 
-test('poll fallback treats isVic changes as payment method changes', () => {
+test('poll fallback treats VIC registration changes as payment method changes', () => {
   const identity = sliceBetween(
     pollSource,
     'function paymentMethodIdentity(method) {',
@@ -219,14 +277,14 @@ test('poll fallback treats isVic changes as payment method changes', () => {
     'function isSamePaymentMethods(left, right) {',
   );
 
-  assert.match(identity, /isVic/);
-  assert.match(serializer, /isVic/);
+  assert.match(pollSource, /visaRegistrationSucceeded/);
   assert.match(pollSource, /operation\.type === 'vic_registration'/);
 });
 
-test('skill guidance uses isVic for Visa routing and removes vicReadiness', () => {
-  assert.match(skillSource, /isVic/);
+test('skill guidance uses visaRegistrationSucceeded for Visa routing and removes vicReadiness', () => {
+  assert.match(skillSource, /visaRegistrationSucceeded/);
   assert.match(skillSource, /passkey-auth\/\{paymentInstrumentId\}\?type=visa/);
+  assert.doesNotMatch(skillSource, /isVic/);
   assert.doesNotMatch(skillSource, /vicReadiness/);
   assert.doesNotMatch(skillSource, /vicReadinessReason/);
 });

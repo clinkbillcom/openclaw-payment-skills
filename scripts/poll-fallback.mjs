@@ -6,6 +6,10 @@ import https from 'https';
 import { CONFIG } from '../config.mjs';
 import { createMessageRequest } from '../notification-utils.js';
 import { buildPollFallbackTimeoutMessageRequest } from '../poll-fallback-utils.mjs';
+import {
+  isVisaRegistrationSucceeded,
+  markVicRegistrationReady,
+} from '../vic-registration-state-utils.mjs';
 
 const SCRIPT_DIR = path.dirname(new URL(import.meta.url).pathname);
 const SKILL_DIR = path.join(SCRIPT_DIR, '..');
@@ -64,6 +68,9 @@ function normalizeCache(cache) {
   if (normalized.webhookAvailable === undefined) normalized.webhookAvailable = null;
   if (!normalized.asyncOperations || typeof normalized.asyncOperations !== 'object') {
     normalized.asyncOperations = {};
+  }
+  if (!normalized.paymentFlowStates || typeof normalized.paymentFlowStates !== 'object') {
+    normalized.paymentFlowStates = {};
   }
   normalized.notifyDestination = normalizeNotifyDestinationValue(normalized.notifyDestination);
   if (
@@ -140,7 +147,7 @@ function normalizePaymentMethods(methods) {
           cardLast4: method.cardLast4 || method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
           walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
-          isVic: method.isVic === true || method.is_vic === true,
+          visaRegistrationSucceeded: isVisaRegistrationSucceeded(method),
           isDefault: method.isDefault ?? false,
           isDisabled: method.isDisabled ?? false,
           status: method.status || ((method.isDisabled ?? false) ? 'disabled' : 'active'),
@@ -157,7 +164,7 @@ function paymentMethodIdentity(method) {
     method.cardLast4 || '',
     method.walletAccountTag || '',
     method.paymentMethodType || '',
-    method.isVic === true ? 'isVic' : 'notVic',
+    method.visaRegistrationSucceeded === true ? 'visaRegistrationSucceeded' : 'visaRegistrationPending',
   ].join('|');
 }
 
@@ -171,7 +178,7 @@ function serializePaymentMethods(methods) {
         cardLast4: method.cardLast4 || '',
         walletAccountTag: method.walletAccountTag || '',
         paymentMethodType: method.paymentMethodType || '',
-        isVic: Boolean(method.isVic),
+        visaRegistrationSucceeded: Boolean(method.visaRegistrationSucceeded),
         isDefault: Boolean(method.isDefault),
         status: method.status || '',
       }))
@@ -205,8 +212,8 @@ function isVisaPaymentMethod(method) {
   ].some((candidate) => normalizeCardNetwork(candidate) === 'visa');
 }
 
-function isVicPaymentMethod(method) {
-  return Boolean(method && typeof method === 'object' && (method.isVic === true || method.is_vic === true));
+function isVisaRegistrationCompletePaymentMethod(method) {
+  return isVisaRegistrationSucceeded(method);
 }
 
 function resolveVicRegistrationTargetId(operation) {
@@ -214,7 +221,7 @@ function resolveVicRegistrationTargetId(operation) {
     return operation.paymentInstrumentId.trim();
   }
   const snapshotMethod = normalizePaymentMethods(operation?.snapshotBefore || [])
-    .find((method) => isVisaPaymentMethod(method) && !isVicPaymentMethod(method));
+    .find((method) => isVisaPaymentMethod(method) && !isVisaRegistrationCompletePaymentMethod(method));
   return snapshotMethod?.paymentInstrumentId || '';
 }
 
@@ -492,7 +499,7 @@ async function tryHandleVicRegistrationSuccess(operation, latestMethods) {
 
   const latestMethod = normalizePaymentMethods(latestMethods)
     .find((method) => method.paymentInstrumentId === targetPaymentInstrumentId);
-  if (!latestMethod || !isVisaPaymentMethod(latestMethod) || !isVicPaymentMethod(latestMethod)) {
+  if (!latestMethod || !isVisaPaymentMethod(latestMethod) || !isVisaRegistrationCompletePaymentMethod(latestMethod)) {
     return false;
   }
 
@@ -523,6 +530,12 @@ async function tryHandleVicRegistrationSuccess(operation, latestMethods) {
   const freshCache = await readCache();
   freshCache.paymentMethods = normalizePaymentMethods(latestMethods);
   freshCache.defaultPaymentMethodId = resolveDefaultPaymentMethodId(latestMethods);
+  const readyState = markVicRegistrationReady({
+    cache: freshCache,
+    paymentInstrumentId: targetPaymentInstrumentId,
+    now: Date.now(),
+  });
+  freshCache.paymentFlowStates[readyState.key] = readyState.state;
   freshCache.cachedAt = new Date().toISOString();
   await writeCache(freshCache);
   await finalizeOperation(operation.id, {
@@ -530,7 +543,7 @@ async function tryHandleVicRegistrationSuccess(operation, latestMethods) {
     resultPayload: {
       completionSource: 'poll',
       paymentInstrumentId: targetPaymentInstrumentId,
-      isVic: true,
+      visaRegistrationSucceeded: true,
     },
   });
   await logRequest('vic_registration/succeeded', {

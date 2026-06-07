@@ -98,7 +98,7 @@ test('builds a timeout notification payload for VIC registration poll fallback f
     vars: {
       flowLabel: 'VIC registration',
       referenceId: 'N/A',
-      expectedEvent: 'payment_method.added',
+      expectedEvent: 'payment_method.added/update',
     },
   });
 });

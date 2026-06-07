@@ -34,6 +34,10 @@ const {
   createMessageRequest,
   renderMessageMarkdown,
 } = await import(pathToFileURL(path.join(SKILL_DIR, 'notification-utils.js')).href);
+const {
+  isVisaRegistrationSucceeded,
+  markVicRegistrationReady,
+} = await import(pathToFileURL(path.join(SKILL_DIR, 'vic-registration-state-utils.mjs')).href);
 
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
@@ -41,6 +45,9 @@ function normalizeCache(cache) {
   if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
+  }
+  if (!normalized.paymentFlowStates || typeof normalized.paymentFlowStates !== 'object') {
+    normalized.paymentFlowStates = {};
   }
   if (
     normalized.notifyDestination &&
@@ -491,20 +498,20 @@ function toCachedPaymentMethod(data, paymentInstrumentId) {
     cardLast4: data.cardLast4 || data.cardLastFour || data.card_last4 || data.card_last_four || null,
     issuerBank: data.issuerBank || null,
     walletAccountTag: data.walletAccountTag || data.wallet?.accountTag || null,
-    isVic: data.isVic === true || data.is_vic === true,
+    visaRegistrationSucceeded: isVisaRegistrationSucceeded(data),
     isDefault: data.isDefault ?? false,
     isDisabled: data.isDisabled ?? false,
     status: data.status || ((data.isDisabled ?? false) ? 'disabled' : 'active'),
   };
 }
 
-function isVicRegistrationCompleteTransition(previousMethod, cachedMethod) {
+function isVisaRegistrationCompleteTransition(previousMethod, cachedMethod) {
   return Boolean(
     previousMethod &&
     cachedMethod.paymentInstrumentId === previousMethod.paymentInstrumentId &&
     isVisaPaymentMethod(cachedMethod) &&
-    cachedMethod.isVic === true &&
-    previousMethod.isVic !== true,
+    cachedMethod.visaRegistrationSucceeded === true &&
+    previousMethod.visaRegistrationSucceeded !== true,
   );
 }
 
@@ -514,7 +521,15 @@ async function upsertCachedPaymentMethodFromWebhook(data, cachedMethod, { markIn
   const wasInitialized = Boolean(cache.initialized);
   const existing = cache.paymentMethods.findIndex(m => m.paymentInstrumentId === data.paymentInstrumentId);
   const previousMethod = existing >= 0 ? cache.paymentMethods[existing] : null;
-  const isVicRegistrationComplete = isVicRegistrationCompleteTransition(previousMethod, cachedMethod);
+  const isVisaRegistrationComplete = isVisaRegistrationCompleteTransition(previousMethod, cachedMethod);
+  if (isVisaRegistrationComplete) {
+    const readyState = markVicRegistrationReady({
+      cache,
+      paymentInstrumentId: cachedMethod.paymentInstrumentId,
+      now: Date.now(),
+    });
+    cache.paymentFlowStates[readyState.key] = readyState.state;
+  }
 
   if (existing >= 0) {
     cache.paymentMethods[existing] = cachedMethod;
@@ -530,7 +545,7 @@ async function upsertCachedPaymentMethodFromWebhook(data, cachedMethod, { markIn
   await writeCache(cache);
 
   return {
-    isVicRegistrationComplete,
+    isVisaRegistrationComplete,
     shouldSendCompleteCard: markInitialized && !wasInitialized && !hadExistingPaymentMethod,
   };
 }
@@ -558,9 +573,9 @@ async function buildVicRegistrationCompleteWebhookResult(eventName, data, cardDi
 事件: ${eventName}
 支付方式 ID: ${data.paymentInstrumentId || "N/A"}
 卡片: ${cardDisplay}
-isVic: true
+visaRegistrationSucceeded: true
 
-[SYSTEM DIRECTIVE] The selected Visa payment method now has isVic=true.
+[SYSTEM DIRECTIVE] The selected Visa payment method now has visaRegistrationSucceeded=true.
 The VIC registration-complete notification has already been sent to the user directly. Do NOT send another card.
 Continue the VIC purchase instruction flow for this paymentInstrumentId. Do NOT call clink_pay for this Visa card.`
     };
@@ -574,7 +589,7 @@ Continue the VIC purchase instruction flow for this paymentInstrumentId. Do NOT 
 事件: ${eventName}
 支付方式 ID: ${data.paymentInstrumentId || "N/A"}
 卡片: ${cardDisplay}
-isVic: true
+visaRegistrationSucceeded: true
 
 ${formatNotificationInstruction(
   'VIC registration is complete for the selected Visa card.',
@@ -613,16 +628,16 @@ export default async function(ctx) {
       const cardDisplay = formatCachedCard(cachedMethod);
       const email = data.customerEmail || "N/A";
       let shouldSendCompleteCard = true;
-      let isVicRegistrationComplete = false;
+      let isVisaRegistrationComplete = false;
 
       // Update cache
       try {
         const upsertResult = await upsertCachedPaymentMethodFromWebhook(data, cachedMethod, { markInitialized: true });
         shouldSendCompleteCard = upsertResult.shouldSendCompleteCard;
-        isVicRegistrationComplete = upsertResult.isVicRegistrationComplete;
+        isVisaRegistrationComplete = upsertResult.isVisaRegistrationComplete;
       } catch (err) { await logError('payment_method.added cache update', err); }
 
-      if (isVicRegistrationComplete) {
+      if (isVisaRegistrationComplete) {
         return await buildVicRegistrationCompleteWebhookResult('payment_method.added', data, cardDisplay);
       }
 
@@ -687,14 +702,14 @@ ${formatNotificationInstruction(
       await logRequest('payment_method.update', data);
       const cachedMethod = toCachedPaymentMethod(data, data.paymentInstrumentId);
       const cardDisplay = formatCachedCard(cachedMethod);
-      let isVicRegistrationComplete = false;
+      let isVisaRegistrationComplete = false;
 
       try {
         const upsertResult = await upsertCachedPaymentMethodFromWebhook(data, cachedMethod);
-        isVicRegistrationComplete = upsertResult.isVicRegistrationComplete;
+        isVisaRegistrationComplete = upsertResult.isVisaRegistrationComplete;
       } catch (err) { await logError('payment_method.update cache update', err); }
 
-      if (isVicRegistrationComplete) {
+      if (isVisaRegistrationComplete) {
         return await buildVicRegistrationCompleteWebhookResult('payment_method.update', data, cardDisplay);
       }
 

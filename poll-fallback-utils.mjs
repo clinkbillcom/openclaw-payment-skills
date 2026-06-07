@@ -65,7 +65,7 @@ export function buildPollFallbackTimeoutMessageRequest(type) {
       vars: {
         flowLabel: 'VIC registration',
         referenceId: 'N/A',
-        expectedEvent: 'payment_method.added',
+        expectedEvent: 'payment_method.added/update',
       },
     };
   }

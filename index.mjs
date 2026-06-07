@@ -17,6 +17,11 @@ import {
   buildDirectSendDirective,
   getReusableAsyncOperation,
 } from "./poll-fallback-utils.mjs";
+import {
+  isVisaRegistrationSucceeded,
+  resolveVicRegistrationState,
+  VIC_REGISTRATION_STATE_TTL_MS,
+} from "./vic-registration-state-utils.mjs";
 
 // ------------------------------------------------------------------
 // CONFIG HELPERS
@@ -166,6 +171,9 @@ function normalizeCache(cache) {
   if (!normalized.asyncOperations || typeof normalized.asyncOperations !== 'object') {
     normalized.asyncOperations = {};
   }
+  if (!normalized.paymentFlowStates || typeof normalized.paymentFlowStates !== 'object') {
+    normalized.paymentFlowStates = {};
+  }
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
   }
@@ -245,7 +253,7 @@ function normalizePaymentMethods(methods) {
           cardLast4: method.cardLast4 || method.cardLastFour || null,
           issuerBank: method.issuerBank || null,
           walletAccountTag: method.walletAccountTag || method.wallet?.accountTag || null,
-          isVic: method.isVic === true || method.is_vic === true,
+          visaRegistrationSucceeded: isVisaRegistrationSucceeded(method),
           isDefault: method.isDefault ?? false,
           isDisabled: method.isDisabled ?? false,
           status: method.status || ((method.isDisabled ?? false) ? "disabled" : "active"),
@@ -1018,6 +1026,12 @@ async function overwriteCachedBindingMethods(methods) {
   await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
 }
 
+async function writePaymentFlowState(key, state) {
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  cache.paymentFlowStates[key] = state;
+  await writePaymentMethodsCache(cache);
+}
+
 function formatPaymentMethodDisplay(method) {
   if (!method) return 'Unknow';
   const brand = method.cardBrand || method.cardScheme || method.paymentMethodType || method.paymentInstrumentType || "Unknow";
@@ -1350,8 +1364,8 @@ function shouldFailClosedForUnknownCardNetwork(method) {
   return isCardLikePaymentMethod(method) && !hasPaymentMethodNetworkSignal(method);
 }
 
-function isVicPaymentMethod(method) {
-  return Boolean(method && typeof method === 'object' && (method.isVic === true || method.is_vic === true));
+function isVisaRegistrationCompletePaymentMethod(method) {
+  return isVisaRegistrationSucceeded(method);
 }
 
 function findPaymentMethodById(methods, paymentInstrumentId) {
@@ -1393,7 +1407,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
   let bindingUrl = '';
   let latestMethods = [];
 
-  if (!method || !hasPaymentMethodNetworkSignal(method) || (isVisaPaymentMethod(method) && !isVicPaymentMethod(method))) {
+  if (!method || !hasPaymentMethodNetworkSignal(method) || (isVisaPaymentMethod(method) && !isVisaRegistrationCompletePaymentMethod(method))) {
     try {
       const bindingData = await fetchBindingData();
       bindingUrl = bindingData.bindingUrl || '';
@@ -1436,7 +1450,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
     return { blocked: false, route: 'legacy', paymentMethod: method };
   }
 
-  if (isVicPaymentMethod(method)) {
+  if (isVisaRegistrationCompletePaymentMethod(method)) {
     return {
       blocked: true,
       route: 'vic_instruction_required',
@@ -1460,7 +1474,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
     }
   }
 
-  if (isVicPaymentMethod(method)) {
+  if (isVisaRegistrationCompletePaymentMethod(method)) {
     return {
       blocked: true,
       route: 'vic_instruction_required',
@@ -1473,6 +1487,14 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
   const effectiveNotifyDestination = notifyDestination || getNotifyDestination(cache);
   const passkeyUrl = buildVicRegistrationUrl(bindingUrl, paymentInstrumentId);
   const cardDisplay = formatPaymentMethodDisplay(method);
+  const vicState = resolveVicRegistrationState({
+    cache,
+    paymentInstrumentId,
+    cardDisplay,
+    now: Date.now(),
+    ttlMs: VIC_REGISTRATION_STATE_TTL_MS,
+  });
+  await writePaymentFlowState(vicState.key, vicState.state);
   const notification = buildVicRegistrationNotification({
     paymentInstrumentId,
     cardDisplay,
@@ -1490,16 +1512,31 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
   );
   const pollFallbackLines = getRequiredPollFallbackLines({
     fallback: pollFallback,
-    successEvent: 'payment_method.added with isVic=true for the same paymentInstrumentId',
+    successEvent: 'payment_method.added/update with visaRegistrationSucceeded=true for the same paymentInstrumentId',
   });
 
   const followUp = [
     'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-    'Do NOT create a purchase instruction and do NOT charge until this same Visa payment method appears with isVic=true.',
+    'Do NOT create a purchase instruction and do NOT charge until this same Visa payment method appears with visaRegistrationSucceeded=true.',
     ...(pollFallback.required
       ? pollFallbackLines
-      : ['Wait for the payment-method webhook or refresh payment methods until isVic=true, then continue the VIC purchase instruction flow.']),
+      : ['Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.']),
   ];
+
+  if (!vicState.shouldNotify) {
+    return {
+      blocked: true,
+      route: 'vic_registration_pending',
+      paymentMethod: method,
+      response: buildDirectSendDirective({
+        summary: 'VIC registration is already pending for this Visa card.',
+        pollFallback,
+        pollFallbackLines,
+        webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
+        suffix: 'The VIC registration notification was already sent for this paymentInstrumentId. Do NOT send another card and do NOT retry clink_pay until the same Visa payment method appears with visaRegistrationSucceeded=true.',
+      }),
+    };
+  }
 
   if (effectiveNotifyDestination) {
     try {
@@ -1512,7 +1549,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
           summary: 'VIC registration link delivered.',
           pollFallback,
           pollFallbackLines,
-          webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until isVic=true, then continue the VIC purchase instruction flow.',
+          webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
         }),
       };
     } catch (error) {

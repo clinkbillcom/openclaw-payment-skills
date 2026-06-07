@@ -20,6 +20,10 @@ async function setupWebhookTestSkillDir(initialCache) {
     ].join('\n'),
     'utf8',
   );
+  await fs.copyFile(
+    new URL('../vic-registration-state-utils.mjs', import.meta.url),
+    path.join(skillDir, 'vic-registration-state-utils.mjs'),
+  );
   await fs.writeFile(
     path.join(skillDir, 'clink.config.json'),
     JSON.stringify(initialCache, null, 2),
@@ -48,7 +52,7 @@ test('payment_method.update upserts an existing payment method and triggers VIC 
       paymentMethodType: 'CARD',
       cardBrand: 'visa',
       cardLast4: '4242',
-      isVic: false,
+      visaRegistrationSucceeded: false,
       isDefault: true,
     }],
     defaultPaymentMethodId: 'pi_visa_1',
@@ -63,7 +67,7 @@ test('payment_method.update upserts an existing payment method and triggers VIC 
         paymentMethodType: 'CARD',
         cardBrand: 'visa',
         cardLast4: '4242',
-        isVic: true,
+        visaRegistrationSucceeded: true,
         isDefault: true,
       },
     },
@@ -72,10 +76,45 @@ test('payment_method.update upserts an existing payment method and triggers VIC 
   const cache = await readCache(skillDir);
   assert.equal(cache.paymentMethods.length, 1);
   assert.equal(cache.paymentMethods[0].paymentInstrumentId, 'pi_visa_1');
-  assert.equal(cache.paymentMethods[0].isVic, true);
+  assert.equal(cache.paymentMethods[0].visaRegistrationSucceeded, true);
   assert.equal(cache.defaultPaymentMethodId, 'pi_visa_1');
   assert.match(result.message, /VIC 注册完成回调/);
   assert.match(result.message, /Continue the VIC purchase instruction flow/);
+});
+
+test('payment_method.update treats visaRegistrationSucceeded as VIC completion', async () => {
+  const skillDir = await setupWebhookTestSkillDir({
+    initialized: true,
+    paymentMethods: [{
+      paymentInstrumentId: 'pi_visa_1',
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      cardLast4: '4242',
+      visaRegistrationSucceeded: false,
+      isDefault: true,
+    }],
+    defaultPaymentMethodId: 'pi_visa_1',
+  });
+  const webhook = await importWebhookForSkillDir(skillDir);
+
+  const result = await webhook({
+    payload: {
+      type: 'payment_method.update',
+      data: {
+        paymentInstrumentId: 'pi_visa_1',
+        paymentMethodType: 'CARD',
+        cardBrand: 'visa',
+        cardLast4: '4242',
+        visaRegistrationSucceeded: true,
+        isDefault: true,
+      },
+    },
+  });
+
+  const cache = await readCache(skillDir);
+  assert.equal(cache.paymentMethods[0].visaRegistrationSucceeded, true);
+  assert.equal(cache.paymentFlowStates['vic_registration:pi_visa_1'].status, 'ready');
+  assert.match(result.message, /VIC 注册完成回调/);
 });
 
 test('payment_method.update inserts an unseen payment method into cache without bound-success notification', async () => {
@@ -94,7 +133,7 @@ test('payment_method.update inserts an unseen payment method into cache without 
         paymentMethodType: 'CARD',
         cardBrand: 'mastercard',
         cardLast4: '5555',
-        isVic: false,
+        visaRegistrationSucceeded: false,
         isDefault: true,
       },
     },

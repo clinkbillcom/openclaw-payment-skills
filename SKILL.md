@@ -43,7 +43,7 @@ tools:
   - name: get_refund_status
     description: Query the latest status of an ALREADY SUBMITTED Clink refund order via `refundOrderId` (starts with `rfd_`). Use this tool when the user asks for the "status" or "progress" of a refund.
   - name: create_purchase_instruction
-    description: "VIC: create a local agentic purchase instruction (status CREATED) for a Visa card whose payment method has isVic=true. Only after explicit user authorization of the spend scope. Not usable until sign_purchase_instruction. Never invent mandates/limits."
+    description: "VIC: create a local agentic purchase instruction (status CREATED) for a Visa card whose payment method has visaRegistrationSucceeded=true. Only after explicit user authorization of the spend scope. Not usable until sign_purchase_instruction. Never invent mandates/limits."
   - name: sign_purchase_instruction
     description: "VIC: submit the user's Passkey/FIDO result + app/device context to activate a purchase instruction (CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow; never fabricate them."
   - name: list_purchase_instructions
@@ -333,10 +333,10 @@ When the user requests a recharge or another skill triggers an auto top-up:
 2. **Route by selected payment method:**
    - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
    - Visa payment methods never use the normal charge path directly.
-   - If the selected Visa payment method has `isVic !== true`, the payment skill sends a VIC registration link and waits for the same `paymentInstrumentId` to appear with `isVic=true`.
+   - If the selected Visa payment method has `visaRegistrationSucceeded !== true`, the payment skill sends a VIC registration link once for that pending state and waits for the same `paymentInstrumentId` to appear with `visaRegistrationSucceeded=true`.
    - The VIC registration link path is `/passkey-auth/{paymentInstrumentId}?type=visa`.
    - The updated payment method list may arrive through agent refresh (`get_binding_link`, payment-method tools, or a later payment call) or through the OpenClaw payment-method webhook (`payment_method.added` or `payment_method.update`). If `webhookAvailable=false`, the skill starts the `vic_registration` poll fallback and the agent must keep monitoring until success, failure, or timeout.
-   - Once the selected Visa payment method has `isVic=true`, continue the VIC purchase instruction flow. Do NOT call `clink_pay` for that Visa card.
+   - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow. Do NOT call `clink_pay` for that Visa card.
 3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
    If calling via shell (do NOT omit --args, replace placeholders):
    ```
@@ -397,7 +397,7 @@ When the user asks to check an existing refund:
 
 Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
 
-1. **Confirm Visa + isVic:** the selected/default payment method must be a Visa card. If it has `isVic !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `isVic=true`.
+1. **Confirm Visa + VIC registration:** the selected/default payment method must be a Visa card. If it has `visaRegistrationSucceeded !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
 2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE`. If an ACTIVE instruction already matches the card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
 3. **Create (only after explicit user authorization of the spend scope):**
    ```
