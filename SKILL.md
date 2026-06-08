@@ -47,7 +47,7 @@ tools:
   - name: sign_purchase_instruction
     description: "VIC: submit the user's Passkey/FIDO result + app/device context to activate a purchase instruction (CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow; never fabricate them."
   - name: list_purchase_instructions
-    description: "VIC: list the current customer's purchase instructions, optionally filtered by status."
+    description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
   - name: get_purchase_instruction
     description: "VIC: get a single purchase instruction with its mandates by instructionId."
   - name: update_purchase_instruction
@@ -94,10 +94,45 @@ When this rule fires:
 1. Do not answer only that the merchant booking plugin is missing. Preserve the merchant task as the business intent, but route the payment authorization through VIC first.
 2. Call `pre_check_account` or use current payment-method state to resolve the selected/default payment method.
 3. If the selected/default Visa card has `visaRegistrationSucceeded !== true`, start VIC registration and wait for the same `paymentInstrumentId` to become VIC-ready.
-4. If the selected/default Visa card has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow: call `list_purchase_instructions`, reuse a matching ACTIVE instruction when possible, otherwise create an instruction draft with `create_purchase_instruction`.
+4. If the selected/default Visa card has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow: `list_purchase_instructions` must be the next purchase-instruction tool call, with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`. Do NOT create_purchase_instruction before list_purchase_instructions. Reuse a matching ACTIVE instruction for that exact paymentInstrumentId when possible; otherwise create an instruction draft with `create_purchase_instruction`.
 5. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
-6. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices.
+6. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices. If the user already supplied merchant/merchant class, amount limit, currency, and timing constraints, the scope is complete enough to list and then create a draft.
 7. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
+
+### Explicit Visa Purchase Matching Rule
+
+For a scoped Visa purchase intent, list_purchase_instructions must be the next purchase-instruction tool call after the selected/default Visa card is confirmed VIC-ready. Call it with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`, for example `GET /agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456`. Do NOT create_purchase_instruction before list_purchase_instructions, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
+
+Evaluate existing ACTIVE instructions by semantic match, not exact string equality only. A reusable instruction must satisfy:
+- Same `paymentInstrumentId` as the selected Visa card. If an instruction is for another paymentInstrumentId, or its paymentInstrumentId is missing and cannot be proven to be the selected card, do not reuse it.
+- An ACTIVE/non-expired mandate whose `amountLimit` is greater than or equal to the requested spend cap.
+- Same `currencyCode`.
+- Matching merchant/category constraints, such as hotel/lodging `merchantCategoryCode` `7011`, or title/description/preferredMerchantName that semantically covers the requested merchant and service.
+- `effectiveUntilTime` covers the requested service/booking window when an expiry is present.
+
+If no ACTIVE instruction semantically matches, immediately call `create_purchase_instruction` with a draft mandate based on the user-supplied scope.
+
+For example, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我使用 visa 下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
+
+For that request, after `list_purchase_instructions` returns no semantic match, create a draft like:
+
+```json
+{
+  "paymentInstrumentId": "<selected Visa paymentInstrumentId>",
+  "title": "全季酒店住宿预订",
+  "mandates": [
+    {
+      "title": "Hotel Booking",
+      "description": "全季酒店住宿预订，靠近上海迪士尼，交通方便，按用户要求明天入住",
+      "amountLimit": 500.00,
+      "currencyCode": "CNY",
+      "merchantCategoryCode": "7011",
+      "preferredMerchantName": "全季酒店",
+      "effectiveUntilTime": "<date/time covering the requested stay window>"
+    }
+  ]
+}
+```
 
 ## Routing Boundary Rule (Hard Rule)
 
@@ -415,7 +450,7 @@ When the user asks to check an existing refund:
 Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
 
 1. **Confirm Visa + VIC registration:** the selected/default payment method must be a Visa card. If it has `visaRegistrationSucceeded !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
-2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE`. If an ACTIVE instruction already matches the card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
+2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE` and the selected Visa card's exact `paymentInstrumentId`. If an ACTIVE instruction already matches that exact card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
 3. **Create draft (only after explicit user authorization of the spend scope):**
    ```
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills create_purchase_instruction --args '{"paymentInstrumentId":"<VISA_PI>","title":"<TITLE>","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'

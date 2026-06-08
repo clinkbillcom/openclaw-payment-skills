@@ -1441,7 +1441,8 @@ function buildPurchaseInstructionAuthNotification({ paymentInstrumentId, instruc
 function buildVicInstructionRequiredDirective(paymentMethod) {
   return `[SYSTEM DIRECTIVE] Account pre-check PASSED: selected Visa card is VIC-enabled.
 Do NOT call clink_pay for this Visa card yet.
-Continue the VIC purchase instruction flow: list active purchase instructions for this card, reuse a matching ACTIVE instruction when available, otherwise call create_purchase_instruction and then sign_purchase_instruction with the user's Passkey result.
+Continue the VIC purchase instruction flow now: list_purchase_instructions must be the next purchase-instruction tool call, with status=ACTIVE and paymentInstrumentId=${paymentMethod.paymentInstrumentId}. Do NOT create_purchase_instruction before list_purchase_instructions.
+After list_purchase_instructions returns, only reuse ACTIVE instructions whose paymentInstrumentId exactly matches ${paymentMethod.paymentInstrumentId}. Then semantically match by amountLimit, currencyCode, merchant/category/MCC, merchant name/title/description, and expiry. If no matching instruction is returned for this paymentInstrumentId, call create_purchase_instruction with the user's supplied spend scope, then wait for the user's Passkey result before sign_purchase_instruction.
 Payment Instrument ID: ${paymentMethod.paymentInstrumentId}`;
 }
 
@@ -3077,7 +3078,10 @@ async function handle_sign_purchase_instruction(args = {}) {
 }
 
 async function handle_list_purchase_instructions(args = {}) {
-  const qs = args.status ? `?status=${encodeURIComponent(args.status)}` : '';
+  const params = new URLSearchParams();
+  if (args.status) params.set('status', args.status);
+  if (args.paymentInstrumentId) params.set('paymentInstrumentId', args.paymentInstrumentId);
+  const qs = params.toString() ? `?${params.toString()}` : '';
   try {
     const data = await fetchInstruction(`/agent/cwallet/instructions${qs}`, 'GET');
     return `Purchase instructions:\n${JSON.stringify(data, null, 2)}`;
@@ -3615,11 +3619,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_purchase_instructions",
-      description: "VIC: list the current customer's purchase instructions, optionally filtered by status.",
+      description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft.",
       inputSchema: {
         type: "object",
         properties: {
-          status: { type: "string", description: "Optional status filter, e.g. ACTIVE / CREATED / CANCELLED" }
+          status: { type: "string", enum: ["CREATED", "ACTIVE", "PENDING", "CANCELLED", "EXPIRED", "DECLINED"], description: "Optional status filter." },
+          paymentInstrumentId: { type: "string", description: "Optional selected Visa paymentInstrumentId filter, e.g. pi_123456." }
         }
       }
     },

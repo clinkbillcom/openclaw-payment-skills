@@ -233,6 +233,36 @@ test('purchase instruction APIs use the agent cwallet instruction path', () => {
   assert.doesNotMatch(indexSource, /\/a\/cwallet\/instructions/);
 });
 
+test('list purchase instructions filters by status and paymentInstrumentId', async () => {
+  const listHandlerSource = extractFunction(indexSource, 'handle_list_purchase_instructions');
+  const handleListPurchaseInstructions = new Function(`
+    ${listHandlerSource}
+    return handle_list_purchase_instructions;
+  `)();
+
+  const calls = [];
+  globalThis.fetchInstruction = async (endpoint, method) => {
+    calls.push({ endpoint, method });
+    return [{ instructionId: 'ins_100001', paymentInstrumentId: 'pi_123456', status: 'ACTIVE' }];
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handleListPurchaseInstructions({
+      status: 'ACTIVE',
+      paymentInstrumentId: 'pi_123456',
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, 'GET');
+    assert.equal(calls[0].endpoint, '/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456');
+    assert.match(result, /ins_100001/);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.logError;
+  }
+});
+
 test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {
   assert.match(skillSource, /description: .*Visa.*purchase.*book.*VIC/i);
   assert.match(skillSource, /Explicit Visa Purchase Intent/i);
@@ -247,6 +277,20 @@ test('skill routes explicit Visa purchase intent to VIC before merchant plugin f
   assert.match(skillSource, /do not answer only that the merchant booking plugin is missing/i);
   assert.match(skillSource, /Do NOT ask the user for a payment link/i);
   assert.match(skillSource, /Session ID/i);
+});
+
+test('skill forces list-then-create flow for scoped Visa hotel booking intents', () => {
+  assert.match(skillSource, /list_purchase_instructions must be the next purchase-instruction tool call/i);
+  assert.match(skillSource, /Do NOT create_purchase_instruction before list_purchase_instructions/i);
+  assert.match(skillSource, /semantic match/i);
+  assert.match(skillSource, /paymentInstrumentId/);
+  assert.match(skillSource, /amountLimit/);
+  assert.match(skillSource, /currencyCode/);
+  assert.match(skillSource, /merchantCategoryCode.*7011/s);
+  assert.match(skillSource, /全季酒店/);
+  assert.match(skillSource, /500\.00/);
+  assert.match(skillSource, /CNY/);
+  assert.match(skillSource, /preferredMerchantName/);
 });
 
 test('blocks card payment when brand/network is unknown and payment method refresh fails', async () => {
@@ -290,6 +334,9 @@ test('routes Visa cards with visaRegistrationSucceeded to purchase instruction f
   assert.equal(result.route, 'vic_instruction_required');
   assert.match(result.response, /VIC purchase instruction flow/);
   assert.match(result.response, /Do NOT call clink_pay/);
+  assert.match(result.response, /list_purchase_instructions must be the next purchase-instruction tool call/i);
+  assert.match(result.response, /paymentInstrumentId=pi_vic/);
+  assert.match(result.response, /Do NOT create_purchase_instruction before list_purchase_instructions/i);
 });
 
 test('does not treat isVic as VIC registration completion', async () => {
