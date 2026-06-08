@@ -35,7 +35,7 @@ tools:
   - name: set_default_payment_method
     description: Set a specific payment method as the default for future transactions.
   - name: pre_check_account
-    description: Run before clink_pay to verify account readiness (wallet initialized, payment method bound). On success it returns an internal readiness directive only; do not send a user-facing success card.
+    description: Run before clink_pay and for explicit Visa purchase/book/order intents to verify account readiness and route Visa cards into VIC registration or purchase-instruction authorization. For scoped Visa booking/order requests, call this first, then follow its directive to list_purchase_instructions and create_purchase_instruction.
   - name: clink_pay
     description: Execute a non-Visa payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). Visa cards are gated into the VIC registration / purchase-instruction flow instead of normal charge. merchant_integration must include server, confirm_tool, and optional confirm_args.
   - name: clink_refund
@@ -113,6 +113,8 @@ Evaluate existing ACTIVE instructions by semantic match, not exact string equali
 If no ACTIVE instruction semantically matches, immediately call `create_purchase_instruction` with a draft mandate based on the user-supplied scope.
 
 For example, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我使用 visa 下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
+
+For this exact request, first call `pre_check_account`, then `list_purchase_instructions` with `status=ACTIVE` and the selected Visa `paymentInstrumentId`, then `create_purchase_instruction` if no semantic match is returned.
 
 For that request, after `list_purchase_instructions` returns no semantic match, create a draft like:
 

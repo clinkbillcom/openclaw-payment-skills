@@ -263,6 +263,32 @@ test('list purchase instructions filters by status and paymentInstrumentId', asy
   }
 });
 
+test('empty active Visa instruction list directs agent to create a draft when scope is complete', async () => {
+  const listHandlerSource = extractFunction(indexSource, 'handle_list_purchase_instructions');
+  const handleListPurchaseInstructions = new Function(`
+    ${listHandlerSource}
+    return handle_list_purchase_instructions;
+  `)();
+
+  globalThis.fetchInstruction = async () => [];
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handleListPurchaseInstructions({
+      status: 'ACTIVE',
+      paymentInstrumentId: 'pi_vic',
+    });
+
+    assert.match(result, /Purchase instructions:\n\[\]/);
+    assert.match(result, /No matching ACTIVE purchase instruction/i);
+    assert.match(result, /immediately call create_purchase_instruction/i);
+    assert.match(result, /Do NOT ask for a payment link/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.logError;
+  }
+});
+
 test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {
   assert.match(skillSource, /description: .*Visa.*purchase.*book.*VIC/i);
   assert.match(skillSource, /Explicit Visa Purchase Intent/i);
@@ -277,6 +303,15 @@ test('skill routes explicit Visa purchase intent to VIC before merchant plugin f
   assert.match(skillSource, /do not answer only that the merchant booking plugin is missing/i);
   assert.match(skillSource, /Do NOT ask the user for a payment link/i);
   assert.match(skillSource, /Session ID/i);
+});
+
+test('tool descriptions route scoped Visa booking requests into account pre-check before fallback', () => {
+  assert.match(indexSource, /name: "pre_check_account"[\s\S]*Visa purchase\/book\/order intents/);
+  assert.match(indexSource, /name: "pre_check_account"[\s\S]*list_purchase_instructions/);
+  assert.match(indexSource, /name: "pre_check_account"[\s\S]*create_purchase_instruction/);
+  assert.match(skillSource, /For this exact request, first call `pre_check_account`/);
+  assert.match(skillSource, /then `list_purchase_instructions`/);
+  assert.match(skillSource, /then `create_purchase_instruction`/);
 });
 
 test('skill forces list-then-create flow for scoped Visa hotel booking intents', () => {
