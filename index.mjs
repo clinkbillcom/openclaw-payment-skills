@@ -1268,6 +1268,16 @@ async function fetchBindingData() {
   }
 
   try {
+    const cache = normalizeCache(await readPaymentMethodsCache() || {});
+    if (bindingUrl) cache.bindingUrl = bindingUrl;
+    if (bindingToken) cache.bindingToken = bindingToken;
+    cache.cachedAt = new Date().toISOString();
+    await writePaymentMethodsCache(cache);
+  } catch (err) {
+    await logError('fetchBindingData/cacheBindingUrl', err);
+  }
+
+  try {
     await overwriteCachedBindingMethods(data.paymentMethodsVoList || []);
   } catch (err) {
     await logError('fetchBindingData/overwriteCachedBindingMethods', err);
@@ -1377,12 +1387,52 @@ function buildVicRegistrationUrl(bindingUrl, paymentInstrumentId) {
   return buildRedirectUrl(bindingUrl, `passkey-auth/${encodeURIComponent(paymentInstrumentId)}?type=visa`);
 }
 
+function buildPurchaseInstructionPasskeyUrl(bindingUrl, paymentInstrumentId, instructionId) {
+  return buildRedirectUrl(bindingUrl, `passkey-auth/${encodeURIComponent(paymentInstrumentId)}?type=visa&instructionId=${encodeURIComponent(instructionId)}`);
+}
+
+async function resolvePurchaseInstructionBindingUrl() {
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  if (typeof cache.bindingUrl === 'string' && cache.bindingUrl.trim()) {
+    return { bindingUrl: cache.bindingUrl.trim(), cache };
+  }
+
+  try {
+    const bindingData = await fetchBindingData();
+    const freshCache = normalizeCache(await readPaymentMethodsCache() || cache);
+    const bindingUrl = bindingData.bindingUrl || freshCache.bindingUrl || '';
+    if (!bindingUrl) {
+      throw new Error('bindingUrl missing from bindingLink response');
+    }
+    return { bindingUrl, cache: freshCache };
+  } catch (error) {
+    await logError('resolvePurchaseInstructionBindingUrl', error);
+    if (typeof cache.bindingUrl === 'string' && cache.bindingUrl.trim()) {
+      return { bindingUrl: cache.bindingUrl.trim(), cache };
+    }
+    throw error;
+  }
+}
+
 function buildVicRegistrationNotification({ paymentInstrumentId, cardDisplay, passkeyUrl }) {
   return createMessageRequest({
     messageKey: 'payment.vic_registration_required',
     vars: {
       paymentInstrumentId,
       cardDisplay,
+      passkeyUrl,
+    },
+  });
+}
+
+function buildPurchaseInstructionAuthNotification({ paymentInstrumentId, instructionId, cardDisplay, title, passkeyUrl }) {
+  return createMessageRequest({
+    messageKey: 'payment.purchase_instruction_auth_required',
+    vars: {
+      paymentInstrumentId,
+      instructionId,
+      cardDisplay,
+      title,
       passkeyUrl,
     },
   });
@@ -2923,6 +2973,12 @@ async function handle_create_purchase_instruction(args = {}) {
   if (!args.paymentInstrumentId) return "ERROR: create_purchase_instruction requires 'paymentInstrumentId' (a VIC-ready Visa card).";
   if (!args.title) return "ERROR: create_purchase_instruction requires 'title'.";
   if (!Array.isArray(args.mandates) || args.mandates.length === 0) return "ERROR: create_purchase_instruction requires a non-empty 'mandates' array (each with description, amountLimit, currencyCode).";
+  let requestNotifyDestination = null;
+  try {
+    requestNotifyDestination = parseNotifyDestinationArgs(args);
+  } catch (error) {
+    return `ERROR: ${error.message}`;
+  }
 
   // Instruction level no longer carries currencyCode / totalLimitAmount / countryCode — those live on each mandate.
   const body = {
@@ -2937,7 +2993,64 @@ async function handle_create_purchase_instruction(args = {}) {
   try {
     const data = await fetchInstruction('/agent/cwallet/instructions', 'POST', body);
     await logRequest('create_purchase_instruction', body, data);
-    return `Purchase instruction created (status CREATED). It is NOT usable until you call sign_purchase_instruction with the user's Passkey result.\nRaw Data: ${JSON.stringify(data)}`;
+    if (!data?.instructionId) {
+      return `Purchase instruction created, but the response did not include instructionId. It is NOT usable until you call sign_purchase_instruction with the user's Passkey result.\nRaw Data: ${JSON.stringify(data)}`;
+    }
+
+    try {
+      const { bindingUrl, cache } = await resolvePurchaseInstructionBindingUrl();
+      if (requestNotifyDestination) {
+        cache.notifyDestination = requestNotifyDestination;
+        await writePaymentMethodsCache(cache);
+      }
+      const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+      const paymentInstrumentId = data.paymentInstrumentId || args.paymentInstrumentId;
+      const passkeyUrl = buildPurchaseInstructionPasskeyUrl(bindingUrl, paymentInstrumentId, data.instructionId);
+      const cardDisplay = formatPaymentMethodDisplay({
+        paymentMethodType: data.cardType || 'CARD',
+        cardBrand: data.cardScheme || 'Visa',
+        cardLast4: data.cardLastFour,
+      });
+      const notification = buildPurchaseInstructionAuthNotification({
+        paymentInstrumentId,
+        instructionId: data.instructionId,
+        cardDisplay,
+        title: data.title || args.title,
+        passkeyUrl,
+      });
+      if (notifyDestination) {
+        try {
+          sendNotificationDirect(notifyDestination, notification);
+          return buildDirectSendDirective({
+            summary: 'Purchase instruction draft created and Passkey authorization card delivered.',
+            suffix: [
+              'Do NOT call sign_purchase_instruction until the front-end Passkey flow returns appInstance and authResult for this instructionId.',
+              `Instruction ID: ${data.instructionId}`,
+              `Raw Data: ${JSON.stringify(data)}`,
+            ].join('\n'),
+          });
+        } catch (directSendError) {
+          await logError('create_purchase_instruction/direct_send', directSendError);
+        }
+      }
+      await logNotificationFallback('create_purchase_instruction/passkey_auth', {
+        cache,
+        message: notification,
+        reason: notifyDestination ? 'direct_send_failed' : 'missing_notify_destination',
+      });
+      return formatNotificationInstruction({
+        summary: 'Purchase instruction draft created. Passkey authorization is required before it can become ACTIVE.',
+        notifications: notification,
+        followUp: [
+          'Do NOT call sign_purchase_instruction until the front-end Passkey flow returns appInstance and authResult for this instructionId.',
+          `Instruction ID: ${data.instructionId}`,
+          `Raw Data: ${JSON.stringify(data)}`,
+        ],
+      });
+    } catch (notificationError) {
+      await logError('create_purchase_instruction/passkey_notification', notificationError);
+      return `Purchase instruction created (status CREATED), but failed to generate the Passkey authorization link: ${notificationError.message}\nInstruction ID: ${data.instructionId}\nRaw Data: ${JSON.stringify(data)}`;
+    }
   } catch (err) {
     await logError('create_purchase_instruction', err);
     return `Failed to create purchase instruction: ${err.message}`;
@@ -3477,7 +3590,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           description: { type: "string", description: "Optional description" },
           effectiveUntilTime: { type: "string", description: "Optional expiry, UTC string \"yyyy-MM-dd HH:mm:ss\", e.g. \"2026-06-25 00:00:00\"" },
           mandates: { type: "array", description: "Non-empty array of mandate rules: { title?, description, amountLimit (number), currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
-          extra: { type: "object", description: "Optional extra fields" }
+          extra: { type: "object", description: "Optional extra fields" },
+          channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination." },
+          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
+          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         },
         required: ["paymentInstrumentId", "title", "mandates"]
       }

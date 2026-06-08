@@ -416,11 +416,11 @@ Use this for every selected Visa card before payment execution. Non-Visa cards u
 
 1. **Confirm Visa + VIC registration:** the selected/default payment method must be a Visa card. If it has `visaRegistrationSucceeded !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
 2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE`. If an ACTIVE instruction already matches the card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
-3. **Create (only after explicit user authorization of the spend scope):**
+3. **Create draft (only after explicit user authorization of the spend scope):**
    ```
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills create_purchase_instruction --args '{"paymentInstrumentId":"<VISA_PI>","title":"<TITLE>","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
    ```
-   Save `instructionId`; status is `CREATED` and not yet usable.
+   The tool parses the backend `instructionId` from the CREATED draft response and sends a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
 4. **Sign (after the user completes Passkey on the front-end):**
    ```
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills sign_purchase_instruction --args '{"instructionId":"<INSTRUCTION_ID>","appInstance":{"deviceData":{"type":"Laptop","brand":"Chrome"}},"authResult":{"identifier":"<FIDO_ID>","fidoBlob":"<BLOB>","dfpSessionId":"<DFP>"}}'

@@ -476,6 +476,36 @@ const MESSAGE_CATALOG = Object.freeze({
       actions: [{ type: 'url', label: 'Complete VIC Registration', url: vars.passkeyUrl }],
     }),
   }),
+  'payment.purchase_instruction_auth_required': defineCatalogEntry({
+    'zh-CN': (vars) => buildMessageModel({
+      key: 'payment.purchase_instruction_auth_required',
+      locale: 'zh-CN',
+      title: '🔐 需要完成购买指令授权',
+      theme: 'orange',
+      facts: [
+        ['购买指令 ID', vars.instructionId || 'N/A'],
+        ['支付方式', vars.cardDisplay || 'Visa 卡'],
+        ['支付方式 ID', vars.paymentInstrumentId || 'N/A'],
+        ['授权状态', '⏸ 等待 Passkey 授权'],
+      ],
+      sections: [`${vars.title || 'Purchase instruction'} 已创建为 draft，需要完成 Passkey 授权后才能变为 ACTIVE。`],
+      actions: [{ type: 'url', label: '完成购买指令授权', url: vars.passkeyUrl }],
+    }),
+    'en-US': (vars) => buildMessageModel({
+      key: 'payment.purchase_instruction_auth_required',
+      locale: 'en-US',
+      title: '🔐 Authorize Purchase Instruction',
+      theme: 'orange',
+      facts: [
+        ['Instruction ID', vars.instructionId || 'N/A'],
+        ['Payment Method', vars.cardDisplay || 'Visa card'],
+        ['Payment Instrument ID', vars.paymentInstrumentId || 'N/A'],
+        ['Authorization Status', '⏸ Waiting for Passkey authorization'],
+      ],
+      sections: [`${vars.title || 'Purchase instruction'} was created as a draft and must be authorized with Passkey before it becomes ACTIVE.`],
+      actions: [{ type: 'url', label: 'Authorize Purchase Instruction', url: vars.passkeyUrl }],
+    }),
+  }),
   'payment.vic_registration_complete': defineCatalogEntry({
     'zh-CN': (vars) => buildMessageModel({
       key: 'payment.vic_registration_complete',

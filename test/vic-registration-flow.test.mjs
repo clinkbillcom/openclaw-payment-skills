@@ -170,6 +170,51 @@ test('VIC registration notification exists and uses passkeyUrl', () => {
   assert.match(notificationSource, /Complete VIC Registration|完成 VIC 注册/);
 });
 
+test('purchase instruction draft creation sends passkey auth URL with instructionId', () => {
+  const createHandler = extractFunction(indexSource, 'handle_create_purchase_instruction');
+  const bindingResolver = extractFunction(indexSource, 'resolvePurchaseInstructionBindingUrl');
+
+  assert.match(indexSource, /function buildPurchaseInstructionPasskeyUrl/);
+  assert.match(indexSource, /instructionId=\$\{encodeURIComponent\(instructionId\)\}/);
+  assert.match(createHandler, /data\.instructionId/);
+  assert.match(createHandler, /resolvePurchaseInstructionBindingUrl/);
+  assert.match(bindingResolver, /readPaymentMethodsCache/);
+  assert.match(bindingResolver, /cache\.bindingUrl/);
+  assert.match(bindingResolver, /fetchBindingData/);
+  assert.match(createHandler, /buildPurchaseInstructionPasskeyUrl\(bindingUrl,\s*paymentInstrumentId,\s*data\.instructionId\)/);
+  assert.match(createHandler, /getNotifyDestination/);
+  assert.match(createHandler, /sendNotificationDirect/);
+  assert.match(createHandler, /buildDirectSendDirective/);
+  assert.match(createHandler, /formatNotificationInstruction/);
+  assert.match(indexSource, /payment\.purchase_instruction_auth_required/);
+  assert.match(notificationSource, /'payment\.purchase_instruction_auth_required'/);
+  assert.match(notificationSource, /instructionId/);
+  assert.match(notificationSource, /passkeyUrl/);
+});
+
+test('purchase instruction passkey URL keeps instructionId inside redirectUrl', () => {
+  const buildRedirectUrlSource = extractFunction(indexSource, 'buildRedirectUrl');
+  const buildPasskeyUrlSource = extractFunction(indexSource, 'buildPurchaseInstructionPasskeyUrl');
+  const buildPurchaseInstructionPasskeyUrl = new Function(`
+    ${buildRedirectUrlSource}
+    ${buildPasskeyUrlSource}
+    return buildPurchaseInstructionPasskeyUrl;
+  `)();
+
+  const url = new URL(buildPurchaseInstructionPasskeyUrl(
+    'https://example.test/bind?existing=1#token',
+    'cpi_9031',
+    'inst_a&b',
+  ));
+
+  assert.equal(url.origin, 'https://example.test');
+  assert.equal(url.searchParams.get('existing'), '1');
+  assert.equal(
+    url.searchParams.get('redirectUrl'),
+    '/passkey-auth/cpi_9031?type=visa&instructionId=inst_a%26b',
+  );
+});
+
 test('purchase instruction APIs use the default UAT API domain', () => {
   const fetchInstruction = extractFunction(indexSource, 'fetchInstruction');
 
