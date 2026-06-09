@@ -97,6 +97,7 @@ const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
 const MERCHANT_CONFIRMATION_RUNNER = path.join(SKILL_DIR, 'scripts', 'run-merchant-confirmation.mjs');
 const POLL_FALLBACK_SCRIPT = path.join(SKILL_DIR, 'scripts', 'poll-fallback.mjs');
+const PURCHASE_INSTRUCTION_MANAGE_URL = 'https://uat-agent.clinkbill.com';
 const POLL_START_DELAY_MS = 30_000;
 const POLL_INTERVAL_MS = 5_000;
 const POLL_TIMEOUT_MS = 120_000;
@@ -1425,7 +1426,17 @@ function buildVicRegistrationNotification({ paymentInstrumentId, cardDisplay, pa
   });
 }
 
-function buildPurchaseInstructionAuthNotification({ paymentInstrumentId, instructionId, cardDisplay, title, passkeyUrl }) {
+function buildPurchaseInstructionAuthNotification({
+  paymentInstrumentId,
+  instructionId,
+  cardDisplay,
+  title,
+  description,
+  effectiveUntilTime,
+  mandates,
+  shippingAddress,
+  passkeyUrl,
+}) {
   return createMessageRequest({
     messageKey: 'payment.purchase_instruction_auth_required',
     vars: {
@@ -1433,6 +1444,10 @@ function buildPurchaseInstructionAuthNotification({ paymentInstrumentId, instruc
       instructionId,
       cardDisplay,
       title,
+      description,
+      effectiveUntilTime,
+      mandates,
+      shippingAddress,
       passkeyUrl,
     },
   });
@@ -1441,8 +1456,8 @@ function buildPurchaseInstructionAuthNotification({ paymentInstrumentId, instruc
 function buildVicInstructionRequiredDirective(paymentMethod) {
   return `[SYSTEM DIRECTIVE] Account pre-check PASSED: selected Visa card is VIC-enabled.
 Do NOT call clink_pay for this Visa card yet.
-Continue the VIC purchase instruction flow now: list_purchase_instructions must be the next purchase-instruction tool call, with status=ACTIVE and paymentInstrumentId=${paymentMethod.paymentInstrumentId}. Do NOT create_purchase_instruction before list_purchase_instructions.
-After list_purchase_instructions returns, only reuse ACTIVE instructions whose paymentInstrumentId exactly matches ${paymentMethod.paymentInstrumentId}. Then semantically match by amountLimit, currencyCode, merchant/category/MCC, merchant name/title/description, and expiry. If no matching instruction is returned for this paymentInstrumentId, call create_purchase_instruction with the user's supplied spend scope, then wait for the user's Passkey result before sign_purchase_instruction.
+Continue the VIC purchase instruction flow through prepare_visa_purchase_instruction once the user's spend scope is available. That state machine must list ACTIVE instructions with status=ACTIVE and paymentInstrumentId=${paymentMethod.paymentInstrumentId} before any draft creation. Do NOT manually call create_purchase_instruction before the state machine list step.
+The state machine only reuses ACTIVE instructions whose paymentInstrumentId exactly matches ${paymentMethod.paymentInstrumentId}, then matches by amountLimit, currencyCode, merchant/category/MCC, merchant name/title/description, and expiry. If no matching instruction is returned for this paymentInstrumentId, it creates a draft with the user's supplied spend scope, then waits for the user's Passkey result before sign_purchase_instruction.
 Payment Instrument ID: ${paymentMethod.paymentInstrumentId}`;
 }
 
@@ -2970,10 +2985,244 @@ async function fetchInstruction(endpoint, method, bodyObj) {
   });
 }
 
-async function handle_create_purchase_instruction(args = {}) {
+async function resolveSelectedPaymentMethod(paymentInstrumentId = null) {
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  let methods = normalizePaymentMethods(cache.paymentMethods || []);
+  let selected = paymentInstrumentId ? findPaymentMethodById(methods, paymentInstrumentId) : null;
+
+  if (!paymentInstrumentId) {
+    selected = methods.find((method) => method.paymentInstrumentId === cache.defaultPaymentMethodId)
+      || methods.find((method) => method.isDefault)
+      || methods[0]
+      || null;
+
+    if (selected) return selected;
+  } else if (selected) {
+    return selected;
+  }
+
+  const bindingData = await fetchBindingData();
+  methods = normalizePaymentMethods(bindingData.methods || []);
+  selected = paymentInstrumentId ? findPaymentMethodById(methods, paymentInstrumentId) : null;
+  if (paymentInstrumentId) return selected || null;
+  return selected
+    || methods.find((method) => method.isDefault)
+    || methods[0]
+    || null;
+}
+
+function normalizeInstructionComparableText(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, '');
+}
+
+function parseInstructionTimeMs(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const isoLike = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const withZone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(isoLike) ? isoLike : `${isoLike}Z`;
+  const parsed = Date.parse(withZone);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function isPlainObject(value) {
+  return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validatePurchaseInstructionShippingAddress(args = {}) {
+  const missing = [];
+  const requiresShipping = args.requiresShipping === true;
+  const hasShippingAddress = args.shippingAddress !== undefined && args.shippingAddress !== null;
+  if (!requiresShipping && !hasShippingAddress) return missing;
+  if (!isPlainObject(args.shippingAddress)) return ['shippingAddress'];
+
+  const address = args.shippingAddress;
+  for (const field of ['name', 'line1', 'city', 'state', 'zip', 'countryCode']) {
+    if (!String(address[field] || '').trim()) missing.push(`shippingAddress.${field}`);
+  }
+  const countryCode = String(address.countryCode || '').trim().toUpperCase();
+  if (countryCode && countryCode !== 'US') missing.push('shippingAddress.countryCode must be US');
+  return missing;
+}
+
+function validatePurchaseInstructionScope(args = {}) {
+  const missing = [];
+  if (!Array.isArray(args.mandates) || args.mandates.length === 0) {
+    missing.push('mandates');
+    return missing;
+  }
+
+  args.mandates.forEach((mandate, index) => {
+    const prefix = `mandates[${index}]`;
+    const amountLimit = Number(mandate?.amountLimit);
+    if (!Number.isFinite(amountLimit) || amountLimit <= 0) missing.push(`${prefix}.amountLimit`);
+    if (!String(mandate?.currencyCode || '').trim()) missing.push(`${prefix}.currencyCode`);
+    if (
+      !String(mandate?.merchantCategoryCode || '').trim() &&
+      !String(mandate?.preferredMerchantName || '').trim() &&
+      !String(mandate?.merchantCategory || '').trim()
+    ) {
+      missing.push(`${prefix}.merchantCategoryCode or preferredMerchantName`);
+    }
+  });
+
+  missing.push(...validatePurchaseInstructionShippingAddress(args));
+  return missing;
+}
+
+function mandateMatchesPurchaseScope(candidateMandate = {}, requestedMandate = {}) {
+  const requestedCurrency = String(requestedMandate.currencyCode || '').trim().toUpperCase();
+  const candidateCurrency = String(candidateMandate.currencyCode || '').trim().toUpperCase();
+  if (requestedCurrency && candidateCurrency !== requestedCurrency) return false;
+
+  const requestedAmount = Number(requestedMandate.amountLimit);
+  const candidateAmount = Number(candidateMandate.amountLimit);
+  if (Number.isFinite(requestedAmount) && (!Number.isFinite(candidateAmount) || candidateAmount < requestedAmount)) {
+    return false;
+  }
+
+  const requestedMcc = String(requestedMandate.merchantCategoryCode || '').trim();
+  const candidateMcc = String(candidateMandate.merchantCategoryCode || '').trim();
+  if (requestedMcc && candidateMcc && candidateMcc !== requestedMcc) return false;
+  const categoryMatches = Boolean(requestedMcc && candidateMcc && candidateMcc === requestedMcc);
+
+  const requestedMerchant = normalizeInstructionComparableText(requestedMandate.preferredMerchantName);
+  const candidateMerchantText = normalizeInstructionComparableText([
+    candidateMandate.preferredMerchantName,
+    candidateMandate.title,
+    candidateMandate.description,
+    candidateMandate.merchantCategory,
+  ].filter(Boolean).join(' '));
+  if (requestedMerchant && !categoryMatches) {
+    if (!candidateMerchantText) return false;
+    if (!candidateMerchantText.includes(requestedMerchant) && !requestedMerchant.includes(candidateMerchantText)) {
+      return false;
+    }
+  } else if (requestedMcc && !candidateMcc) {
+    return false;
+  }
+
+  const requestedUntil = parseInstructionTimeMs(requestedMandate.effectiveUntilTime);
+  const candidateUntil = parseInstructionTimeMs(candidateMandate.effectiveUntilTime);
+  if (requestedUntil !== null && candidateUntil !== null && candidateUntil < requestedUntil) return false;
+
+  return true;
+}
+
+function findReusablePurchaseInstruction(instructions, { paymentInstrumentId, mandates }) {
+  if (!Array.isArray(instructions) || !paymentInstrumentId || !Array.isArray(mandates) || mandates.length === 0) {
+    return null;
+  }
+
+  return instructions.find((instruction) => {
+    if (!instruction || instruction.paymentInstrumentId !== paymentInstrumentId) return false;
+    if (String(instruction.status || '').toUpperCase() !== 'ACTIVE') return false;
+    const instructionMandates = Array.isArray(instruction.mandates) ? instruction.mandates : [];
+    if (instructionMandates.length === 0) return false;
+    return mandates.every((requestedMandate) =>
+      instructionMandates.some((candidateMandate) =>
+        mandateMatchesPurchaseScope(candidateMandate, requestedMandate),
+      ),
+    );
+  }) || null;
+}
+
+async function handle_prepare_visa_purchase_instruction(args = {}) {
+  if (!args.title) return "ERROR: prepare_visa_purchase_instruction requires 'title'.";
+  if (!Array.isArray(args.mandates) || args.mandates.length === 0) {
+    return "ERROR: prepare_visa_purchase_instruction requires a non-empty 'mandates' array with amountLimit and currencyCode.";
+  }
+
+  const missingScope = validatePurchaseInstructionScope(args);
+  if (missingScope.length > 0) {
+    return `[VIC_STATE_MACHINE] state=MISSING_SCOPE
+The spend scope is incomplete. Ask the user only for the missing mandate fields before listing or creating a purchase instruction.
+Missing fields: ${missingScope.join(', ')}`;
+  }
+
+  let requestNotifyDestination = null;
+  if (args.channel !== undefined || args.target_id !== undefined || args.target_type !== undefined || args.locale !== undefined) {
+    try {
+      requestNotifyDestination = parseNotifyDestinationArgs(args);
+    } catch (error) {
+      return `ERROR: ${error.message}`;
+    }
+  }
+
+  try {
+    const selectedMethod = await resolveSelectedPaymentMethod(args.paymentInstrumentId || null);
+    if (!selectedMethod?.paymentInstrumentId) {
+      return `[VIC_STATE_MACHINE] state=NO_PAYMENT_METHOD
+No payment method is bound. Call get_payment_method_setup_link before preparing a Visa purchase instruction.`;
+    }
+
+    const vicGate = await ensureVisaVicReadyForUse({
+      paymentInstrumentId: selectedMethod.paymentInstrumentId,
+      selectedMethod,
+      notifyDestination: requestNotifyDestination,
+      context: 'prepare_visa_purchase_instruction',
+    });
+
+    if (!vicGate.blocked || vicGate.route === 'legacy') {
+      return `[VIC_STATE_MACHINE] state=NON_VISA
+The selected/default payment method is not Visa. Do not create a VIC purchase instruction; continue with the normal non-Visa payment route when payment inputs are ready.
+Payment Instrument ID: ${selectedMethod.paymentInstrumentId}`;
+    }
+
+    if (vicGate.route !== 'vic_instruction_required') {
+      return `[VIC_STATE_MACHINE] state=${vicGate.route || 'BLOCKED'}
+${vicGate.response}`;
+    }
+
+    const paymentInstrumentId = vicGate.paymentMethod?.paymentInstrumentId || selectedMethod.paymentInstrumentId;
+    const endpoint = `/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=${encodeURIComponent(paymentInstrumentId)}`;
+    const activeInstructions = await fetchInstruction(endpoint, 'GET');
+    await logRequest('prepare_visa_purchase_instruction/list_active', { status: 'ACTIVE', paymentInstrumentId }, activeInstructions);
+
+    const reusableInstruction = findReusablePurchaseInstruction(activeInstructions, {
+      paymentInstrumentId,
+      mandates: args.mandates,
+    });
+    if (reusableInstruction) {
+      return `[VIC_STATE_MACHINE] state=REUSED_ACTIVE_INSTRUCTION
+Found a reusable ACTIVE purchase instruction for the selected Visa card. Do NOT call create_purchase_instruction.
+Instruction ID: ${reusableInstruction.instructionId}
+Raw Data: ${JSON.stringify(reusableInstruction)}`;
+    }
+
+    const createResult = await createPurchaseInstructionDraft({
+      ...args,
+      paymentInstrumentId,
+    });
+    if (!isPurchaseInstructionDraftCreateSuccess(createResult)) {
+      return `[VIC_STATE_MACHINE] state=CREATE_FAILED
+No reusable ACTIVE purchase instruction matched the selected Visa card and spend scope, but draft creation did not complete.
+${createResult}`;
+    }
+    return `[VIC_STATE_MACHINE] state=CREATED_DRAFT
+No reusable ACTIVE purchase instruction matched the selected Visa card and spend scope.
+${createResult}`;
+  } catch (err) {
+    await logError('prepare_visa_purchase_instruction', err);
+    return `Failed to prepare Visa purchase instruction: ${err.message}`;
+  }
+}
+
+function isPurchaseInstructionDraftCreateSuccess(result) {
+  const text = String(result || '');
+  if (/^(ERROR:|Failed to create purchase instruction:)/i.test(text)) return false;
+  if (/did not include instructionId/i.test(text)) return false;
+  if (/failed to generate the Passkey authorization link/i.test(text)) return false;
+  return /Instruction ID:/i.test(text);
+}
+
+async function createPurchaseInstructionDraft(args = {}) {
   if (!args.paymentInstrumentId) return "ERROR: create_purchase_instruction requires 'paymentInstrumentId' (a VIC-ready Visa card).";
   if (!args.title) return "ERROR: create_purchase_instruction requires 'title'.";
   if (!Array.isArray(args.mandates) || args.mandates.length === 0) return "ERROR: create_purchase_instruction requires a non-empty 'mandates' array (each with description, amountLimit, currencyCode).";
+  const missingScope = validatePurchaseInstructionScope(args);
+  if (missingScope.length > 0) return `ERROR: create_purchase_instruction spend scope is incomplete: ${missingScope.join(', ')}`;
   let requestNotifyDestination = null;
   try {
     requestNotifyDestination = parseNotifyDestinationArgs(args);
@@ -2989,6 +3238,8 @@ async function handle_create_purchase_instruction(args = {}) {
   };
   if (args.description !== undefined) body.description = args.description;
   if (args.effectiveUntilTime !== undefined) body.effectiveUntilTime = args.effectiveUntilTime;
+  if (args.isRecurring !== undefined) body.isRecurring = args.isRecurring;
+  if (args.shippingAddress !== undefined) body.shippingAddress = args.shippingAddress;
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
@@ -3017,6 +3268,10 @@ async function handle_create_purchase_instruction(args = {}) {
         instructionId: data.instructionId,
         cardDisplay,
         title: data.title || args.title,
+        description: data.description ?? args.description ?? '',
+        effectiveUntilTime: data.effectiveUntilTime ?? args.effectiveUntilTime ?? '',
+        mandates: Array.isArray(data.mandates) && data.mandates.length > 0 ? data.mandates : args.mandates,
+        shippingAddress: data.shippingAddress ?? args.shippingAddress ?? null,
         passkeyUrl,
       });
       if (notifyDestination) {
@@ -3087,13 +3342,63 @@ async function handle_list_purchase_instructions(args = {}) {
     const lines = [`Purchase instructions:\n${JSON.stringify(data, null, 2)}`];
     if (args.status === 'ACTIVE' && args.paymentInstrumentId && Array.isArray(data) && data.length === 0) {
       lines.push(`[SYSTEM DIRECTIVE] No matching ACTIVE purchase instruction was returned for paymentInstrumentId=${args.paymentInstrumentId}.
-If the user's Visa purchase/book/order request already includes a complete spend scope, immediately call create_purchase_instruction with that scope.
+If the current/default card is Visa and the user's purchase/book/order request already includes a complete spend scope, call prepare_visa_purchase_instruction with that scope so the state machine can create the draft.
 Do NOT ask for a payment link, payment URL,代付链接, Session ID, or tell the user to use the merchant app before creating the draft.`);
     }
     return lines.join('\n');
   } catch (err) {
     await logError('list_purchase_instructions', err);
     return `Failed to list purchase instructions: ${err.message}`;
+  }
+}
+
+async function handle_get_purchase_instruction_manage_link(args = {}) {
+  const notification = createMessageRequest({
+    messageKey: 'payment.purchase_instruction_manage_link',
+    vars: {
+      manageUrl: PURCHASE_INSTRUCTION_MANAGE_URL,
+    },
+  });
+
+  try {
+    const cache = await readPaymentMethodsCache() || {};
+    let requestNotifyDestination = null;
+    try {
+      requestNotifyDestination = parseNotifyDestinationArgs(args);
+    } catch (error) {
+      return `ERROR: ${error.message}`;
+    }
+    if (requestNotifyDestination) {
+      cache.notifyDestination = requestNotifyDestination;
+      await writePaymentMethodsCache(cache);
+    }
+    const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
+
+    if (notifyDestination) {
+      try {
+        sendNotificationDirect(notifyDestination, notification);
+        return buildDirectSendDirective({
+          summary: 'Purchase instruction management link delivered.',
+          suffix: 'Use this page for 修改授权, 查看授权, and 取消 instruction 授权 requests.',
+        });
+      } catch (directSendError) {
+        await logError('get_purchase_instruction_manage_link/direct_send', directSendError);
+      }
+    }
+
+    await logNotificationFallback('get_purchase_instruction_manage_link', {
+      cache,
+      message: notification,
+      reason: notifyDestination ? 'direct_send_failed' : 'missing_notify_destination',
+    });
+    return formatNotificationInstruction({
+      summary: 'Purchase instruction management link generated.',
+      notifications: notification,
+      followUp: ['Use this page for 修改授权, 查看授权, and 取消 instruction 授权 requests.'],
+    });
+  } catch (err) {
+    await logError('get_purchase_instruction_manage_link', err);
+    return `Failed to get purchase instruction management link: ${err.message}`;
   }
 }
 
@@ -3532,7 +3837,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "pre_check_account",
-      description: "Run before clink_pay and for explicit Visa purchase/book/order intents to verify account readiness and route Visa cards into VIC registration or purchase-instruction authorization. For scoped Visa booking/order requests, call this first, then follow its directive to list_purchase_instructions and create_purchase_instruction.",
+      description: "Run before clink_pay to verify account readiness and resolve the current/default card. For purchase/book/order intents, prefer prepare_visa_purchase_instruction; if this pre-check finds a Visa card, it routes the agent back to that state machine instead of normal charge.",
       inputSchema: { type: "object", properties: {} }
     },
     {
@@ -3590,32 +3895,50 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
-      name: "create_purchase_instruction",
-      description: "VIC: create a local purchase instruction (agentic authorization) for a VIC-ready Visa card. Status is CREATED and NOT usable until sign_purchase_instruction. Only call after the user explicitly authorizes the spend scope; never invent mandates or limits. Currency and amountLimit live on each mandate (not at instruction level).",
+      name: "prepare_visa_purchase_instruction",
+      description: "VIC state machine: for purchase/book/order intents, resolve the current/default card; if it is Visa, handle VIC registration or list ACTIVE instructions by paymentInstrumentId and reuse/create a draft. For physical goods that require delivery, set requiresShipping=true and provide a US shippingAddress before draft creation. This is the primary entrypoint for Visa purchase authorization; do not manually chain pre_check_account/list/create first.",
       inputSchema: {
         type: "object",
         properties: {
-          paymentInstrumentId: { type: "string", description: "VIC-ready Visa payment instrument ID" },
+          paymentInstrumentId: { type: "string", description: "Optional selected payment instrument ID. If omitted, the current/default card is resolved." },
           title: { type: "string", description: "Instruction title" },
-          description: { type: "string", description: "Optional description" },
-          effectiveUntilTime: { type: "string", description: "Optional expiry, UTC string \"yyyy-MM-dd HH:mm:ss\", e.g. \"2026-06-25 00:00:00\"" },
-          mandates: { type: "array", description: "Non-empty array of mandate rules: { title?, description, amountLimit (number), currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
+          description: { type: "string", description: "Optional instruction description" },
+          effectiveUntilTime: { type: "string", description: "Optional instruction expiry, UTC string \"yyyy-MM-dd HH:mm:ss\"." },
+          isRecurring: { type: "boolean", description: "Optional. Default false unless the user clearly authorizes recurring payments." },
+          mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
+          requiresShipping: { type: "boolean", description: "Set true only for physical goods that require delivery. This is local validation metadata and is not sent to the backend." },
+          shippingAddress: {
+            type: "object",
+            description: "Required when requiresShipping=true. Only US shipping addresses are supported; countryCode must be US. Passed to POST /agent/cwallet/instructions as shippingAddress.",
+            properties: {
+              addressId: { type: "string" },
+              name: { type: "string" },
+              line1: { type: "string" },
+              line2: { type: "string" },
+              line3: { type: "string" },
+              city: { type: "string" },
+              state: { type: "string" },
+              zip: { type: "string" },
+              countryCode: { type: "string", description: "Must be US." },
+              deliveryContactDetails: { type: "object" }
+            }
+          },
           extra: { type: "object", description: "Optional extra fields" },
-          channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination." },
+          channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination when a draft is created." },
           target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
           target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
           locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         },
-        required: ["paymentInstrumentId", "title", "mandates"]
+        required: ["title", "mandates"]
       }
     },
     {
       name: "sign_purchase_instruction",
-      description: "VIC: submit the user's Passkey/FIDO result and app/device context to activate a purchase instruction (status CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow — never fabricate them.",
+      description: "VIC: submit the user's Passkey/FIDO result and app/device context to activate a purchase instruction (status CREATED -> ACTIVE). The instructionId comes from prepare_visa_purchase_instruction state=CREATED_DRAFT or a reused ACTIVE instruction. authResult/appInstance come from the front-end Passkey flow — never fabricate them.",
       inputSchema: {
         type: "object",
         properties: {
-          instructionId: { type: "string", description: "Local instruction ID from create_purchase_instruction" },
+          instructionId: { type: "string", description: "Local instruction ID from prepare_visa_purchase_instruction" },
           appInstance: { type: "object", description: "Visa app/device context, e.g. { deviceData: { type, brand, model, manufacturer }, userAgent, clientDeviceId }" },
           authResult: { type: "object", description: "FIDO/DFP result, e.g. { identifier, fidoBlob, dfpSessionId }" },
           extra: { type: "object", description: "Optional extra fields" }
@@ -3635,8 +3958,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
+      name: "get_purchase_instruction_manage_link",
+      description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link https://uat-agent.clinkbill.com. Feishu renders this as a button; other channels receive a link.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          channel: { type: "string", description: "Optional notify channel. Feishu supports native button cards; other channels receive markdown/text links." },
+          target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
+          target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
+          locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
+        }
+      }
+    },
+    {
       name: "get_purchase_instruction",
-      description: "VIC: get a single purchase instruction (with its mandates) by instruction ID.",
+      description: "VIC backend API: get a single purchase instruction by instructionId. For user requests to view/manage authorization, prefer get_purchase_instruction_manage_link.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3647,7 +3983,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "update_purchase_instruction",
-      description: "VIC: full update of a purchase instruction. Requires re-authentication (fresh appInstance + authResult) and the complete instruction fields + mandates.",
+      description: "VIC backend API: full update of a purchase instruction. Requires re-authentication (fresh appInstance + authResult) and the complete instruction fields + mandates. For user requests to modify authorization, prefer get_purchase_instruction_manage_link.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3666,7 +4002,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "cancel_purchase_instruction",
-      description: "VIC: cancel a purchase instruction. Requires appInstance + authResult.",
+      description: "VIC backend API: cancel a purchase instruction. Requires appInstance + authResult. For user requests to cancel authorization, prefer get_purchase_instruction_manage_link.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3728,9 +4064,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "clink_pay":                     result = await handle_clink_pay(args); break;
       case "clink_refund":                  result = await handle_clink_refund(args); break;
       case "get_refund_status":             result = await handle_get_refund_status(args); break;
-      case "create_purchase_instruction":   result = await handle_create_purchase_instruction(args); break;
+      case "prepare_visa_purchase_instruction": result = await handle_prepare_visa_purchase_instruction(args); break;
       case "sign_purchase_instruction":     result = await handle_sign_purchase_instruction(args); break;
       case "list_purchase_instructions":    result = await handle_list_purchase_instructions(args); break;
+      case "get_purchase_instruction_manage_link": result = await handle_get_purchase_instruction_manage_link(args); break;
       case "get_purchase_instruction":      result = await handle_get_purchase_instruction(args); break;
       case "update_purchase_instruction":   result = await handle_update_purchase_instruction(args); break;
       case "cancel_purchase_instruction":   result = await handle_cancel_purchase_instruction(args); break;

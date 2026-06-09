@@ -1,6 +1,6 @@
 ---
 name: openclaw-payment-skills
-description: "Universal agent skill to integrate Clink payments, including Visa purchase/book intent routed through VIC registration and purchase-instruction authorization, user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract."
+description: "Universal agent skill to integrate Clink payments, including purchase/book intent routed through VIC registration and purchase-instruction authorization when the current card is Visa, user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract."
 version: "1.0.0"
 metadata:
   openclaw:
@@ -35,25 +35,27 @@ tools:
   - name: set_default_payment_method
     description: Set a specific payment method as the default for future transactions.
   - name: pre_check_account
-    description: Run before clink_pay and for explicit Visa purchase/book/order intents to verify account readiness and route Visa cards into VIC registration or purchase-instruction authorization. For scoped Visa booking/order requests, call this first, then follow its directive to list_purchase_instructions and create_purchase_instruction.
+    description: Run before clink_pay to verify account readiness and resolve the current/default card. For purchase/book/order intents, prefer prepare_visa_purchase_instruction; if this pre-check finds a Visa card, it routes the agent back to that state machine instead of normal charge.
   - name: clink_pay
     description: Execute a non-Visa payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). Visa cards are gated into the VIC registration / purchase-instruction flow instead of normal charge. merchant_integration must include server, confirm_tool, and optional confirm_args.
   - name: clink_refund
     description: Apply for a NEW full refund on an existing Clink order. Requires the ORIGINAL `orderId` (starts with `order_`). Do NOT use this tool for checking the status of an existing refund request.
   - name: get_refund_status
     description: Query the latest status of an ALREADY SUBMITTED Clink refund order via `refundOrderId` (starts with `rfd_`). Use this tool when the user asks for the "status" or "progress" of a refund.
-  - name: create_purchase_instruction
-    description: "VIC: create a local agentic purchase instruction (status CREATED) for a Visa card whose payment method has visaRegistrationSucceeded=true. Only after explicit user authorization of the spend scope. Not usable until sign_purchase_instruction. Never invent mandates/limits."
+  - name: prepare_visa_purchase_instruction
+    description: "VIC state machine: primary entrypoint for purchase/book/order intents. Resolves the current/default card; if it is Visa, handles VIC registration or lists ACTIVE instructions filtered by paymentInstrumentId and reuses/creates a draft. For physical goods that require delivery, set requiresShipping=true and provide a US shippingAddress. Use this instead of manually chaining pre_check_account, list_purchase_instructions, and create_purchase_instruction."
   - name: sign_purchase_instruction
     description: "VIC: submit the user's Passkey/FIDO result + app/device context to activate a purchase instruction (CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow; never fabricate them."
   - name: list_purchase_instructions
     description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
+  - name: get_purchase_instruction_manage_link
+    description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return https://uat-agent.clinkbill.com as the authorization management link."
   - name: get_purchase_instruction
-    description: "VIC: get a single purchase instruction with its mandates by instructionId."
+    description: "VIC backend API: get a single purchase instruction with its mandates by instructionId. For user-facing authorization management, use get_purchase_instruction_manage_link."
   - name: update_purchase_instruction
-    description: "VIC: full update of a purchase instruction; requires re-authentication (fresh appInstance + authResult) plus the complete instruction fields and mandates."
+    description: "VIC backend API: full update of a purchase instruction; requires re-authentication (fresh appInstance + authResult) plus the complete instruction fields and mandates. For user-facing authorization management, use get_purchase_instruction_manage_link."
   - name: cancel_purchase_instruction
-    description: "VIC: cancel a purchase instruction; requires appInstance + authResult."
+    description: "VIC backend API: cancel a purchase instruction; requires appInstance + authResult. For user-facing authorization management, use get_purchase_instruction_manage_link."
   - name: install_system_hooks
     description: Update `openclaw.json` and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.
   - name: uninstall_system_hooks
@@ -82,26 +84,34 @@ You MUST:
 - After installation is complete, execute the install success notification immediately via `pre_install.mjs` or `send-message.mjs`.
 - Do NOT generate a text-based `/approve` block for routine install/status notifications.
 
-## PRIORITY RULE: Explicit Visa Purchase Intent -> VIC Instruction Flow
+## PRIORITY RULE: Current Visa Card + Purchase Intent -> VIC Instruction Flow
 
-If the user message contains both a Visa payment signal and a purchase intent, this skill owns the payment authorization part of the request even when the message does not mention Clink, wallet, or this skill by name.
+If the user message contains a purchase intent and the current/selected/default payment method is a Visa card, this skill owns the payment authorization part of the request even when the message does not mention Visa, Clink, wallet, or this skill by name.
 
-Visa payment signals include: `visa`, `Visa card`, `Visa 卡`, or card-ending language that clearly refers to a known Visa card.
+If the current payment method is not already known in the conversation, `prepare_visa_purchase_instruction` resolves the selected/default payment method inside the state machine before deciding whether the VIC flow applies.
 
 Purchase intent signals include: `buy`, `purchase`, `order`, `book`, `reserve`, `下单`, `购买`, `预订`, `订酒店`, `买票`, or equivalent wording that asks the agent to acquire goods, services, bookings, tickets, reservations, or merchant value for the user.
 
 When this rule fires:
 1. Do not answer only that the merchant booking plugin is missing. Preserve the merchant task as the business intent, but route the payment authorization through VIC first.
-2. Call `pre_check_account` or use current payment-method state to resolve the selected/default payment method.
-3. If the selected/default Visa card has `visaRegistrationSucceeded !== true`, start VIC registration and wait for the same `paymentInstrumentId` to become VIC-ready.
-4. If the selected/default Visa card has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow: `list_purchase_instructions` must be the next purchase-instruction tool call, with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`. Do NOT create_purchase_instruction before list_purchase_instructions. Reuse a matching ACTIVE instruction for that exact paymentInstrumentId when possible; otherwise create an instruction draft with `create_purchase_instruction`.
-5. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
-6. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices. If the user already supplied merchant/merchant class, amount limit, currency, and timing constraints, the scope is complete enough to list and then create a draft.
-7. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
+2. Call `prepare_visa_purchase_instruction` as the primary entrypoint once the spend scope is complete enough to express a mandate. Do not manually chain `pre_check_account`, `list_purchase_instructions`, and `create_purchase_instruction` for this primary purchase path.
+3. The state machine resolves the selected/default/current payment method. If it is not Visa, it returns `state=NON_VISA`; use the normal non-Visa payment route when payment inputs are ready.
+4. If the selected/default/current Visa card has `visaRegistrationSucceeded !== true`, the state machine starts VIC registration and waits for the same `paymentInstrumentId` to become VIC-ready.
+5. If the selected/default/current Visa card has `visaRegistrationSucceeded=true`, the state machine lists ACTIVE purchase instructions with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`. It reuses a matching ACTIVE instruction when possible; otherwise it creates an instruction draft. The model must not call `create_purchase_instruction` before this state machine list step.
+6. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
+7. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices. If the user already supplied merchant/merchant class, amount limit, currency, and timing constraints, the scope is complete enough to list and then create a draft.
+8. If the intent is to buy physical goods that require delivery, collect a US shipping address before draft creation and call `prepare_visa_purchase_instruction` with `requiresShipping=true` plus `shippingAddress`. Only US shipping addresses are supported; `shippingAddress.countryCode` must be `US`. Do not require `shippingAddress` for services, subscriptions, hotels, tickets, bookings, or reservations that do not ship a physical item.
+9. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
 
-### Explicit Visa Purchase Matching Rule
+## PRIORITY RULE: Instruction Authorization Management Link
 
-For a scoped Visa purchase intent, list_purchase_instructions must be the next purchase-instruction tool call after the selected/default Visa card is confirmed VIC-ready. Call it with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`, for example `GET /agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456`. Do NOT create_purchase_instruction before list_purchase_instructions, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
+If the user asks to 修改授权, 查看授权, 取消 instruction 授权, manage instruction authorization, view instruction authorization, edit instruction authorization, cancel instruction authorization, or uses semantically similar wording for purchase instruction authorization management, call `get_purchase_instruction_manage_link`.
+
+This returns `https://uat-agent.clinkbill.com`. In Feishu it is delivered as a button through the normal notification renderer; in other channels it is shown as a link. Do not ask the user for `appInstance`, `authResult`, or call the backend `get_purchase_instruction`, `update_purchase_instruction`, or `cancel_purchase_instruction` APIs for this user-facing management intent.
+
+### Current Visa Card Purchase Matching Rule
+
+For a scoped purchase intent where the selected/default/current payment method is a Visa card, `prepare_visa_purchase_instruction` must be the next tool call after the mandate scope is complete. Inside that state machine, the ACTIVE instruction list call uses `status=ACTIVE` and the selected card's exact `paymentInstrumentId`, for example `GET /agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456`. Do NOT call `create_purchase_instruction` before the state machine list step, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
 
 Evaluate existing ACTIVE instructions by semantic match, not exact string equality only. A reusable instruction must satisfy:
 - Same `paymentInstrumentId` as the selected Visa card. If an instruction is for another paymentInstrumentId, or its paymentInstrumentId is missing and cannot be proven to be the selected card, do not reuse it.
@@ -110,13 +120,33 @@ Evaluate existing ACTIVE instructions by semantic match, not exact string equali
 - Matching merchant/category constraints, such as hotel/lodging `merchantCategoryCode` `7011`, or title/description/preferredMerchantName that semantically covers the requested merchant and service.
 - `effectiveUntilTime` covers the requested service/booking window when an expiry is present.
 
-If no ACTIVE instruction semantically matches, immediately call `create_purchase_instruction` with a draft mandate based on the user-supplied scope.
+If no ACTIVE instruction semantically matches, the state machine creates a draft mandate based on the user-supplied scope.
 
-For example, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我使用 visa 下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
+For physical goods that require delivery, include the user-provided US `shippingAddress` in the draft request. The address shape is:
 
-For this exact request, first call `pre_check_account`, then `list_purchase_instructions` with `status=ACTIVE` and the selected Visa `paymentInstrumentId`, then `create_purchase_instruction` if no semantic match is returned.
+```json
+{
+  "requiresShipping": true,
+  "shippingAddress": {
+    "addressId": "addr_001",
+    "name": "Jim",
+    "line1": "123 Market St",
+    "line2": "Apt 201",
+    "line3": "",
+    "city": "San Francisco",
+    "state": "CA",
+    "zip": "94105",
+    "countryCode": "US",
+    "deliveryContactDetails": {}
+  }
+}
+```
 
-For that request, after `list_purchase_instructions` returns no semantic match, create a draft like:
+For example, if the current/default card is Visa, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
+
+For this exact request, when the current/default card is Visa, call `prepare_visa_purchase_instruction` with the selected scope. The state machine then resolves the card, lists ACTIVE instructions with `status=ACTIVE` and the selected Visa `paymentInstrumentId`, and creates a draft if no semantic match is returned.
+
+For that request, after the state machine finds no semantic match, it creates a draft like:
 
 ```json
 {
@@ -451,19 +481,21 @@ When the user asks to check an existing refund:
 
 Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
 
-1. **Confirm Visa + VIC registration:** the selected/default payment method must be a Visa card. If it has `visaRegistrationSucceeded !== true`, send the user to `/passkey-auth/{paymentInstrumentId}?type=visa` and wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
-2. **Reuse check:** call `list_purchase_instructions` with `status=ACTIVE` and the selected Visa card's exact `paymentInstrumentId`. If an ACTIVE instruction already matches that exact card, currency, amount/quantity within mandate, merchant/MCC, and is not expired, reuse its `instructionId` and skip to step 5.
-3. **Create draft (only after explicit user authorization of the spend scope):**
+1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
    ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills create_purchase_instruction --args '{"paymentInstrumentId":"<VISA_PI>","title":"<TITLE>","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
    ```
-   The tool parses the backend `instructionId` from the CREATED draft response and sends a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
-4. **Sign (after the user completes Passkey on the front-end):**
+2. **State machine outcomes:**
+   - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
+   - `state=vic_registration_required` or `state=vic_registration_pending` means the user must finish `/passkey-auth/{paymentInstrumentId}?type=visa`; wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
+   - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
+   - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
+3. **Sign (after the user completes Passkey on the front-end):**
    ```
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills sign_purchase_instruction --args '{"instructionId":"<INSTRUCTION_ID>","appInstance":{"deviceData":{"type":"Laptop","brand":"Chrome"}},"authResult":{"identifier":"<FIDO_ID>","fidoBlob":"<BLOB>","dfpSessionId":"<DFP>"}}'
    ```
    Status must become `ACTIVE` before any payment. Never fabricate `authResult`/`appInstance`.
-5. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
+4. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
 
 **VIC hard rules:** never create/sign without explicit user authorization; never invent mandates or authResult; an instruction must be `ACTIVE` before VIC payment execution; `update`/`cancel` require fresh `appInstance` + `authResult`; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
 

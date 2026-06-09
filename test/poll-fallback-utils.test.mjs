@@ -77,6 +77,16 @@ test('keeps DIRECT_SEND_POLL_REQUIRED only when a poll operation actually exists
   assert.doesNotMatch(unscheduled, /DIRECT_SEND_POLL_REQUIRED/);
 });
 
+test('omits missing wait content from direct-send directives', () => {
+  const directive = buildDirectSendDirective({
+    summary: 'Management link delivered.',
+    suffix: 'Use this page for instruction authorization management.',
+  });
+
+  assert.doesNotMatch(directive, /undefined/);
+  assert.match(directive, /Do NOT send another card\.\n\nUse this page/);
+});
+
 test('builds a timeout notification payload for bind-card poll fallback flows', () => {
   const message = buildPollFallbackTimeoutMessageRequest('bind_card');
 

@@ -275,6 +275,74 @@ function createPassiveActions(labels = []) {
   return labels.map((label) => ({ type: 'note', label }));
 }
 
+function optionalFact(label, value) {
+  const normalized = coerceString(value);
+  return normalized ? [label, normalized] : null;
+}
+
+function compactParts(parts, separator) {
+  return parts.map((part) => coerceString(part)).filter(Boolean).join(separator);
+}
+
+function normalizeMandateList(mandates) {
+  return Array.isArray(mandates)
+    ? mandates.filter((mandate) => mandate && typeof mandate === 'object' && !Array.isArray(mandate))
+    : [];
+}
+
+function formatMandateAmount(mandate) {
+  const amount = mandate.amountLimit ?? mandate.totalAmountLimit ?? mandate.amount;
+  const amountText = amount === undefined || amount === null || amount === '' ? '' : String(amount);
+  const currency = coerceString(mandate.currencyCode || mandate.currency);
+  return compactParts([amountText, currency], ' ');
+}
+
+function formatPurchaseInstructionMandates(mandates, locale) {
+  const normalized = normalizeMandateList(mandates);
+  if (normalized.length === 0) return '';
+  const chinese = coerceString(locale).toLowerCase().startsWith('zh');
+  const heading = chinese ? '授权范围' : 'Authorization Scope';
+  const unnamed = chinese ? '授权项' : 'Mandate';
+  const lineSeparator = chinese ? '；' : '; ';
+  const lines = normalized.map((mandate, index) => {
+    const title = coerceString(mandate.title) || `${unnamed} ${index + 1}`;
+    const amount = formatMandateAmount(mandate);
+    const merchant = coerceString(mandate.preferredMerchantName || mandate.merchantCategory);
+    const mcc = coerceString(mandate.merchantCategoryCode);
+    const expiry = coerceString(mandate.effectiveUntilTime);
+    const frequency = coerceString(mandate.recurringFrequency);
+    const description = coerceString(mandate.description);
+    const details = [
+      amount ? `${chinese ? '金额上限' : 'Amount limit'} ${amount}` : '',
+      merchant ? `${chinese ? '商户/类别' : 'Merchant/category'} ${merchant}` : '',
+      mcc ? `MCC ${mcc}` : '',
+      expiry ? `${chinese ? '有效期' : 'Effective until'} ${expiry}` : '',
+      frequency ? `${chinese ? '周期' : 'Frequency'} ${frequency}` : '',
+    ].filter(Boolean);
+    const summary = details.length > 0 ? `${title}: ${details.join(lineSeparator)}` : title;
+    return description ? `- ${summary}\n  ${description}` : `- ${summary}`;
+  });
+  return `${heading}:\n${lines.join('\n')}`;
+}
+
+function formatPurchaseInstructionShippingAddress(address, locale) {
+  if (!address || typeof address !== 'object' || Array.isArray(address)) return '';
+  const chinese = coerceString(locale).toLowerCase().startsWith('zh');
+  const heading = chinese ? '收货地址' : 'Shipping Address';
+  const name = coerceString(address.name);
+  const cityStateZip = compactParts([address.city, address.state, address.zip], ', ');
+  const countryCode = coerceString(address.countryCode).toUpperCase();
+  const lines = [
+    name,
+    coerceString(address.line1),
+    coerceString(address.line2),
+    coerceString(address.line3),
+    cityStateZip,
+    countryCode,
+  ].filter(Boolean);
+  return lines.length > 0 ? `${heading}:\n${lines.join('\n')}` : '';
+}
+
 const MESSAGE_CATALOG = Object.freeze({
   'payment.success': defineCatalogEntry({
     'zh-CN': (vars) => buildMessageModel({
@@ -486,9 +554,16 @@ const MESSAGE_CATALOG = Object.freeze({
         ['购买指令 ID', vars.instructionId || 'N/A'],
         ['支付方式', vars.cardDisplay || 'Visa 卡'],
         ['支付方式 ID', vars.paymentInstrumentId || 'N/A'],
+        optionalFact('指令标题', vars.title),
+        optionalFact('指令说明', vars.description),
+        optionalFact('指令有效期', vars.effectiveUntilTime),
         ['授权状态', '⏸ 等待 Passkey 授权'],
-      ],
-      sections: [`${vars.title || 'Purchase instruction'} 已创建为 draft，需要完成 Passkey 授权后才能变为 ACTIVE。`],
+      ].filter(Boolean),
+      sections: [
+        `${vars.title || 'Purchase instruction'} 已创建为 draft，需要完成 Passkey 授权后才能变为 ACTIVE。`,
+        formatPurchaseInstructionMandates(vars.mandates, 'zh-CN'),
+        formatPurchaseInstructionShippingAddress(vars.shippingAddress, 'zh-CN'),
+      ].filter(Boolean),
       actions: [{ type: 'url', label: '完成购买指令授权', url: vars.passkeyUrl }],
     }),
     'en-US': (vars) => buildMessageModel({
@@ -500,10 +575,35 @@ const MESSAGE_CATALOG = Object.freeze({
         ['Instruction ID', vars.instructionId || 'N/A'],
         ['Payment Method', vars.cardDisplay || 'Visa card'],
         ['Payment Instrument ID', vars.paymentInstrumentId || 'N/A'],
+        optionalFact('Instruction Title', vars.title),
+        optionalFact('Description', vars.description),
+        optionalFact('Effective Until', vars.effectiveUntilTime),
         ['Authorization Status', '⏸ Waiting for Passkey authorization'],
-      ],
-      sections: [`${vars.title || 'Purchase instruction'} was created as a draft and must be authorized with Passkey before it becomes ACTIVE.`],
+      ].filter(Boolean),
+      sections: [
+        `${vars.title || 'Purchase instruction'} was created as a draft and must be authorized with Passkey before it becomes ACTIVE.`,
+        formatPurchaseInstructionMandates(vars.mandates, 'en-US'),
+        formatPurchaseInstructionShippingAddress(vars.shippingAddress, 'en-US'),
+      ].filter(Boolean),
       actions: [{ type: 'url', label: 'Authorize Purchase Instruction', url: vars.passkeyUrl }],
+    }),
+  }),
+  'payment.purchase_instruction_manage_link': defineCatalogEntry({
+    'zh-CN': (vars) => buildMessageModel({
+      key: 'payment.purchase_instruction_manage_link',
+      locale: 'zh-CN',
+      title: '⚙️ 管理 instruction 授权',
+      theme: 'blue',
+      sections: ['打开授权管理页面，查看、修改或取消 purchase instruction 授权。'],
+      actions: [{ type: 'url', label: '管理 instruction 授权', url: vars.manageUrl }],
+    }),
+    'en-US': (vars) => buildMessageModel({
+      key: 'payment.purchase_instruction_manage_link',
+      locale: 'en-US',
+      title: '⚙️ Manage Instruction Authorization',
+      theme: 'blue',
+      sections: ['Open the authorization management page to view, modify, or cancel purchase instruction authorization.'],
+      actions: [{ type: 'url', label: 'Manage Instruction Authorization', url: vars.manageUrl }],
     }),
   }),
   'payment.vic_registration_complete': defineCatalogEntry({

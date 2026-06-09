@@ -6,6 +6,12 @@ import {
   isVisaRegistrationSucceeded,
   VIC_REGISTRATION_STATE_TTL_MS,
 } from '../vic-registration-state-utils.mjs';
+import {
+  createMessageRequest,
+  renderMessageFeishuCard,
+  renderMessageMarkdown,
+  renderMessagePlainText,
+} from '../notification-utils.js';
 
 const indexSource = await fs.readFile(new URL('../index.mjs', import.meta.url), 'utf8');
 const webhookSource = await fs.readFile(new URL('../hooks/my_payment_webhook.mjs', import.meta.url), 'utf8');
@@ -42,6 +48,42 @@ function extractFunction(source, name) {
 
 function optionalExtractFunction(source, name) {
   return source.includes(`function ${name}`) ? extractFunction(source, name) : '';
+}
+
+function buildCreatePurchaseInstructionDraftHarness() {
+  const sources = [
+    'buildRedirectUrl',
+    'buildPurchaseInstructionPasskeyUrl',
+    'buildPurchaseInstructionAuthNotification',
+    'isPlainObject',
+    'validatePurchaseInstructionShippingAddress',
+    'validatePurchaseInstructionScope',
+    'createPurchaseInstructionDraft',
+  ]
+    .map((name) => extractFunction(indexSource, name))
+    .join('\n\n');
+
+  return new Function('createMessageRequestImpl', `
+    const createMessageRequest = createMessageRequestImpl;
+    ${sources}
+    function parseNotifyDestinationArgs() { return null; }
+    function formatPaymentMethodDisplay(method) {
+      return [method.cardBrand || method.paymentMethodType || 'CARD', method.cardLast4 || ''].filter(Boolean).join(' ');
+    }
+    async function fetchInstruction(...args) { return globalThis.fetchInstruction(...args); }
+    async function logRequest(...args) { return globalThis.logRequest(...args); }
+    async function logError(...args) { return globalThis.logError(...args); }
+    async function resolvePurchaseInstructionBindingUrl() { return { bindingUrl: 'https://uat-agent.clinkbill.com/bind', cache: {} }; }
+    function getNotifyDestination() { return null; }
+    async function writePaymentMethodsCache() {}
+    function sendNotificationDirect() { throw new Error('direct send should not run'); }
+    async function logNotificationFallback(...args) { return globalThis.logNotificationFallback(...args); }
+    function buildDirectSendDirective({ summary }) { return '[SYSTEM DIRECTIVE] ' + summary; }
+    function formatNotificationInstruction({ summary, notifications, followUp }) {
+      return { summary, notifications, followUp };
+    }
+    return createPurchaseInstructionDraft;
+  `)(createMessageRequest);
 }
 
 function buildVicGateHarness() {
@@ -171,7 +213,7 @@ test('VIC registration notification exists and uses passkeyUrl', () => {
 });
 
 test('purchase instruction draft creation sends passkey auth URL with instructionId', () => {
-  const createHandler = extractFunction(indexSource, 'handle_create_purchase_instruction');
+  const createHandler = extractFunction(indexSource, 'createPurchaseInstructionDraft');
   const bindingResolver = extractFunction(indexSource, 'resolvePurchaseInstructionBindingUrl');
 
   assert.match(indexSource, /function buildPurchaseInstructionPasskeyUrl/);
@@ -190,6 +232,191 @@ test('purchase instruction draft creation sends passkey auth URL with instructio
   assert.match(notificationSource, /'payment\.purchase_instruction_auth_required'/);
   assert.match(notificationSource, /instructionId/);
   assert.match(notificationSource, /passkeyUrl/);
+});
+
+test('purchase instruction draft auth notification includes the requested instruction scope', async () => {
+  const createPurchaseInstructionDraft = buildCreatePurchaseInstructionDraftHarness();
+  const requestBody = {
+    paymentInstrumentId: 'cpi_9031',
+    title: '全季酒店住宿预订',
+    description: '明天入住，离上海迪士尼最近且交通方便',
+    effectiveUntilTime: '2026-06-10T23:59:59Z',
+    mandates: [{
+      title: 'Hotel Booking',
+      description: 'Booking for Ji Hotel near Shanghai Disney',
+      amountLimit: 500,
+      currencyCode: 'CNY',
+      merchantCategoryCode: '7011',
+      preferredMerchantName: '全季酒店',
+      effectiveUntilTime: '2026-06-10T23:59:59Z',
+    }],
+  };
+  let fallbackMessage = null;
+
+  globalThis.fetchInstruction = async (endpoint, method, body) => {
+    assert.equal(endpoint, '/agent/cwallet/instructions');
+    assert.equal(method, 'POST');
+    assert.deepEqual(body, requestBody);
+    return {
+      instructionId: 'inst_hotel',
+      paymentInstrumentId: 'cpi_9031',
+      cardScheme: 'Visa',
+      cardLastFour: '9031',
+      cardType: 'CREDIT',
+      status: 'CREATED',
+    };
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+  globalThis.logNotificationFallback = async (_context, payload) => {
+    fallbackMessage = payload.message;
+  };
+
+  try {
+    const result = await createPurchaseInstructionDraft(requestBody);
+
+    assert.equal(result.notifications.message_key, 'payment.purchase_instruction_auth_required');
+    assert.equal(result.notifications.vars.instructionId, 'inst_hotel');
+    assert.equal(result.notifications.vars.title, requestBody.title);
+    assert.equal(result.notifications.vars.description, requestBody.description);
+    assert.equal(result.notifications.vars.effectiveUntilTime, requestBody.effectiveUntilTime);
+    assert.deepEqual(result.notifications.vars.mandates, requestBody.mandates);
+    assert.deepEqual(fallbackMessage, result.notifications);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+    delete globalThis.logNotificationFallback;
+  }
+});
+
+test('purchase instruction draft creation passes US shipping address for delivered goods', async () => {
+  const createPurchaseInstructionDraft = buildCreatePurchaseInstructionDraftHarness();
+  const requestBody = {
+    paymentInstrumentId: 'cpi_9031',
+    title: 'Physical goods purchase',
+    description: 'One-time goods order that requires delivery',
+    shippingAddress: {
+      name: 'Jim',
+      line1: '123 Market St',
+      line2: 'Apt 201',
+      city: 'San Francisco',
+      state: 'CA',
+      zip: '94105',
+      countryCode: 'US',
+      deliveryContactDetails: { phone: '+14155550100' },
+    },
+    mandates: [{
+      title: 'Goods order',
+      description: 'Physical goods purchase',
+      amountLimit: 120,
+      currencyCode: 'USD',
+      merchantCategoryCode: '5311',
+      preferredMerchantName: 'Example Store',
+    }],
+  };
+
+  globalThis.fetchInstruction = async (endpoint, method, body) => {
+    assert.equal(endpoint, '/agent/cwallet/instructions');
+    assert.equal(method, 'POST');
+    assert.deepEqual(body, requestBody);
+    return {
+      instructionId: 'inst_goods',
+      paymentInstrumentId: 'cpi_9031',
+      cardScheme: 'Visa',
+      cardLastFour: '9031',
+      cardType: 'CREDIT',
+      status: 'CREATED',
+    };
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+  globalThis.logNotificationFallback = async () => {};
+
+  try {
+    const result = await createPurchaseInstructionDraft(requestBody);
+
+    assert.deepEqual(result.notifications.vars.shippingAddress, requestBody.shippingAddress);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+    delete globalThis.logNotificationFallback;
+  }
+});
+
+test('purchase instruction authorization card renders mandate amount and merchant scope', () => {
+  const request = createMessageRequest({
+    messageKey: 'payment.purchase_instruction_auth_required',
+    locale: 'zh-CN',
+    vars: {
+      paymentInstrumentId: 'cpi_9031',
+      instructionId: 'inst_hotel',
+      cardDisplay: 'VISA 9031',
+      title: '全季酒店住宿预订',
+      description: '明天入住，离上海迪士尼最近且交通方便',
+      effectiveUntilTime: '2026-06-10T23:59:59Z',
+      passkeyUrl: 'https://uat-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_hotel',
+      mandates: [{
+        title: 'Hotel Booking',
+        description: 'Booking for Ji Hotel near Shanghai Disney',
+        amountLimit: 500,
+        currencyCode: 'CNY',
+        merchantCategoryCode: '7011',
+        preferredMerchantName: '全季酒店',
+        effectiveUntilTime: '2026-06-10T23:59:59Z',
+      }],
+    },
+  });
+
+  const text = renderMessagePlainText(request, { preferredLocale: 'zh-CN' });
+
+  assert.match(text, /全季酒店住宿预订/);
+  assert.match(text, /明天入住，离上海迪士尼最近且交通方便/);
+  assert.match(text, /500/);
+  assert.match(text, /CNY/);
+  assert.match(text, /7011/);
+  assert.match(text, /全季酒店/);
+  assert.match(text, /2026-06-10T23:59:59Z/);
+});
+
+test('purchase instruction authorization card renders shipping address', () => {
+  const request = createMessageRequest({
+    messageKey: 'payment.purchase_instruction_auth_required',
+    locale: 'zh-CN',
+    vars: {
+      paymentInstrumentId: 'cpi_9031',
+      instructionId: 'inst_goods',
+      cardDisplay: 'VISA 9031',
+      title: 'Physical goods purchase',
+      passkeyUrl: 'https://uat-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_goods',
+      shippingAddress: {
+        name: 'Jim',
+        line1: '123 Market St',
+        line2: 'Apt 201',
+        city: 'San Francisco',
+        state: 'CA',
+        zip: '94105',
+        countryCode: 'US',
+      },
+      mandates: [{
+        amountLimit: 120,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+    },
+  });
+
+  const text = renderMessagePlainText(request, { preferredLocale: 'zh-CN' });
+
+  assert.match(text, /收货地址/);
+  assert.match(text, /Jim/);
+  assert.match(text, /123 Market St/);
+  assert.match(text, /Apt 201/);
+  assert.match(text, /San Francisco/);
+  assert.match(text, /CA/);
+  assert.match(text, /94105/);
+  assert.match(text, /US/);
 });
 
 test('purchase instruction passkey URL keeps instructionId inside redirectUrl', () => {
@@ -231,6 +458,42 @@ test('purchase instruction APIs use the agent cwallet instruction path', () => {
   assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}`/);
   assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}\/cancel`/);
   assert.doesNotMatch(indexSource, /\/a\/cwallet\/instructions/);
+});
+
+test('purchase instruction manage link notification renders Feishu button and markdown link', () => {
+  const request = createMessageRequest({
+    messageKey: 'payment.purchase_instruction_manage_link',
+    locale: 'zh-CN',
+    vars: {
+      manageUrl: 'https://uat-agent.clinkbill.com',
+    },
+  });
+
+  const card = renderMessageFeishuCard(request, { preferredLocale: 'zh-CN' });
+  const cardJson = JSON.stringify(card);
+  const markdown = renderMessageMarkdown(request, { preferredLocale: 'zh-CN' });
+
+  assert.match(cardJson, /"tag":"button"/);
+  assert.match(cardJson, /https:\/\/uat-agent\.clinkbill\.com/);
+  assert.match(cardJson, /管理 instruction 授权/);
+  assert.match(markdown, /\[管理 instruction 授权\]\(https:\/\/uat-agent\.clinkbill\.com\)/);
+});
+
+test('instruction authorization manage intents route to the agent UI link tool', () => {
+  assert.match(indexSource, /name: "get_purchase_instruction_manage_link"/);
+  assert.match(indexSource, /https:\/\/uat-agent\.clinkbill\.com/);
+  assert.match(indexSource, /修改授权[\s\S]*查看授权[\s\S]*取消 instruction 授权/);
+  assert.match(indexSource, /case "get_purchase_instruction_manage_link"/);
+  assert.match(notificationSource, /'payment\.purchase_instruction_manage_link'/);
+  assert.match(skillSource, /修改授权[\s\S]*查看授权[\s\S]*取消 instruction 授权/);
+  assert.match(skillSource, /get_purchase_instruction_manage_link/);
+});
+
+test('create purchase instruction is not exposed as a public tool', () => {
+  assert.doesNotMatch(indexSource, /name: "create_purchase_instruction"/);
+  assert.doesNotMatch(indexSource, /case "create_purchase_instruction"/);
+  assert.doesNotMatch(skillSource, /\n  - name: create_purchase_instruction/);
+  assert.match(indexSource, /function createPurchaseInstructionDraft/);
 });
 
 test('list purchase instructions filters by status and paymentInstrumentId', async () => {
@@ -281,7 +544,7 @@ test('empty active Visa instruction list directs agent to create a draft when sc
 
     assert.match(result, /Purchase instructions:\n\[\]/);
     assert.match(result, /No matching ACTIVE purchase instruction/i);
-    assert.match(result, /immediately call create_purchase_instruction/i);
+    assert.match(result, /call prepare_visa_purchase_instruction/i);
     assert.match(result, /Do NOT ask for a payment link/i);
   } finally {
     delete globalThis.fetchInstruction;
@@ -289,15 +552,358 @@ test('empty active Visa instruction list directs agent to create a draft when sc
   }
 });
 
-test('skill routes explicit Visa purchase intent to VIC before merchant plugin fallback', () => {
-  assert.match(skillSource, /description: .*Visa.*purchase.*book.*VIC/i);
-  assert.match(skillSource, /Explicit Visa Purchase Intent/i);
-  assert.match(skillSource, /visa.*purchase.*intent/i);
-  assert.match(skillSource, /Visa card|Visa 卡/);
-  assert.match(skillSource, /buy|purchase|order|book|reserve|下单|购买|预订|订酒店/);
+function buildPrepareInstructionHarness() {
+  const sources = [
+    'normalizeCache',
+    'normalizePaymentMethods',
+    'findPaymentMethodById',
+    'resolveSelectedPaymentMethod',
+    'normalizeInstructionComparableText',
+    'parseInstructionTimeMs',
+    'isPlainObject',
+    'validatePurchaseInstructionShippingAddress',
+    'validatePurchaseInstructionScope',
+    'mandateMatchesPurchaseScope',
+    'findReusablePurchaseInstruction',
+    'isPurchaseInstructionDraftCreateSuccess',
+    'handle_prepare_visa_purchase_instruction',
+  ]
+    .map((name) => extractFunction(indexSource, name))
+    .join('\n\n');
+
+  return new Function(`
+    function isVisaRegistrationSucceeded(method) { return method?.visaRegistrationSucceeded === true; }
+    ${sources}
+    return handle_prepare_visa_purchase_instruction;
+  `)();
+}
+
+test('prepare visa purchase instruction state machine lists before creating a draft', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  const calls = [];
+
+  globalThis.readPaymentMethodsCache = async () => ({
+    defaultPaymentMethodId: 'pi_vic',
+    paymentMethods: [{
+      paymentInstrumentId: 'pi_vic',
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+      isDefault: true,
+    }],
+  });
+  globalThis.fetchBindingData = async () => {
+    throw new Error('fetchBindingData should not be needed');
+  };
+  globalThis.ensureVisaVicReadyForUse = async ({ paymentInstrumentId }) => ({
+    blocked: true,
+    route: 'vic_instruction_required',
+    paymentMethod: {
+      paymentInstrumentId,
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+    },
+    response: 'VIC-ready',
+  });
+  globalThis.fetchInstruction = async (endpoint, method) => {
+    calls.push({ type: 'fetchInstruction', endpoint, method });
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async (args) => {
+    calls.push({ type: 'create', args });
+    return 'Purchase instruction draft created.\nInstruction ID: inst_created';
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: '全季酒店住宿预订',
+      mandates: [{
+        description: '全季酒店住宿预订，靠近上海迪士尼',
+        amountLimit: 500,
+        currencyCode: 'CNY',
+        merchantCategoryCode: '7011',
+        preferredMerchantName: '全季酒店',
+      }],
+    });
+
+    assert.equal(calls[0].type, 'fetchInstruction');
+    assert.equal(calls[0].endpoint, '/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_vic');
+    assert.equal(calls[1].type, 'create');
+    assert.equal(calls[1].args.paymentInstrumentId, 'pi_vic');
+    assert.match(result, /state=CREATED_DRAFT/);
+    assert.match(result, /Purchase instruction draft created/);
+  } finally {
+    delete globalThis.readPaymentMethodsCache;
+    delete globalThis.fetchBindingData;
+    delete globalThis.ensureVisaVicReadyForUse;
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine returns missing scope before list or create', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let listed = false;
+  let created = false;
+
+  globalThis.fetchInstruction = async () => {
+    listed = true;
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async () => {
+    created = true;
+    return 'unexpected create';
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: '全季酒店住宿预订',
+      mandates: [{
+        description: '全季酒店住宿预订',
+        currencyCode: 'CNY',
+      }],
+    });
+
+    assert.equal(listed, false);
+    assert.equal(created, false);
+    assert.match(result, /state=MISSING_SCOPE/);
+    assert.match(result, /amountLimit/i);
+    assert.match(result, /merchantCategoryCode or preferredMerchantName/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine requires shipping address for delivered goods', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let listed = false;
+  let created = false;
+
+  globalThis.fetchInstruction = async () => {
+    listed = true;
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async () => {
+    created = true;
+    return 'unexpected create';
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: 'Physical goods purchase',
+      requiresShipping: true,
+      mandates: [{
+        description: 'Physical goods purchase',
+        amountLimit: 120,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+    });
+
+    assert.equal(listed, false);
+    assert.equal(created, false);
+    assert.match(result, /state=MISSING_SCOPE/);
+    assert.match(result, /shippingAddress/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine rejects non-US shipping address', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let listed = false;
+  let created = false;
+
+  globalThis.fetchInstruction = async () => {
+    listed = true;
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async () => {
+    created = true;
+    return 'unexpected create';
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: 'Physical goods purchase',
+      requiresShipping: true,
+      shippingAddress: {
+        name: 'Jim',
+        line1: 'xxx road',
+        city: 'Shanghai',
+        state: 'Shanghai',
+        zip: '200000',
+        countryCode: 'CN',
+      },
+      mandates: [{
+        description: 'Physical goods purchase',
+        amountLimit: 120,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+    });
+
+    assert.equal(listed, false);
+    assert.equal(created, false);
+    assert.match(result, /state=MISSING_SCOPE/);
+    assert.match(result, /shippingAddress\.countryCode must be US/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine does not mark failed draft creation as created', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+
+  globalThis.readPaymentMethodsCache = async () => ({
+    defaultPaymentMethodId: 'pi_vic',
+    paymentMethods: [{
+      paymentInstrumentId: 'pi_vic',
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+      isDefault: true,
+    }],
+  });
+  globalThis.fetchBindingData = async () => {
+    throw new Error('fetchBindingData should not be needed');
+  };
+  globalThis.ensureVisaVicReadyForUse = async ({ paymentInstrumentId }) => ({
+    blocked: true,
+    route: 'vic_instruction_required',
+    paymentMethod: {
+      paymentInstrumentId,
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+    },
+    response: 'VIC-ready',
+  });
+  globalThis.fetchInstruction = async () => [];
+  globalThis.createPurchaseInstructionDraft = async () => 'Failed to create purchase instruction: backend unavailable';
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: '全季酒店住宿预订',
+      mandates: [{
+        description: '全季酒店住宿预订',
+        amountLimit: 500,
+        currencyCode: 'CNY',
+        merchantCategoryCode: '7011',
+      }],
+    });
+
+    assert.match(result, /state=CREATE_FAILED/);
+    assert.doesNotMatch(result, /state=CREATED_DRAFT/);
+  } finally {
+    delete globalThis.readPaymentMethodsCache;
+    delete globalThis.fetchBindingData;
+    delete globalThis.ensureVisaVicReadyForUse;
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine reuses a matching active instruction', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let createCalled = false;
+
+  globalThis.readPaymentMethodsCache = async () => ({
+    defaultPaymentMethodId: 'pi_vic',
+    paymentMethods: [{
+      paymentInstrumentId: 'pi_vic',
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+      isDefault: true,
+    }],
+  });
+  globalThis.fetchBindingData = async () => {
+    throw new Error('fetchBindingData should not be needed');
+  };
+  globalThis.ensureVisaVicReadyForUse = async ({ paymentInstrumentId }) => ({
+    blocked: true,
+    route: 'vic_instruction_required',
+    paymentMethod: {
+      paymentInstrumentId,
+      paymentMethodType: 'CARD',
+      cardBrand: 'visa',
+      visaRegistrationSucceeded: true,
+    },
+    response: 'VIC-ready',
+  });
+  globalThis.fetchInstruction = async () => [{
+    instructionId: 'ins_hotel',
+    paymentInstrumentId: 'pi_vic',
+    status: 'ACTIVE',
+    mandates: [{
+      amountLimit: 800,
+      currencyCode: 'CNY',
+      merchantCategoryCode: '7011',
+      effectiveUntilTime: '2026-06-10T23:59:59Z',
+    }],
+  }];
+  globalThis.createPurchaseInstructionDraft = async () => {
+    createCalled = true;
+    return 'unexpected create';
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: '全季酒店住宿预订',
+      mandates: [{
+        description: '全季酒店住宿预订，靠近上海迪士尼',
+        amountLimit: 500,
+        currencyCode: 'CNY',
+        merchantCategoryCode: '7011',
+        preferredMerchantName: '全季酒店',
+        effectiveUntilTime: '2026-06-10T23:00:00Z',
+      }],
+    });
+
+    assert.equal(createCalled, false);
+    assert.match(result, /state=REUSED_ACTIVE_INSTRUCTION/);
+    assert.match(result, /Instruction ID: ins_hotel/);
+  } finally {
+    delete globalThis.readPaymentMethodsCache;
+    delete globalThis.fetchBindingData;
+    delete globalThis.ensureVisaVicReadyForUse;
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('skill routes current Visa card purchase intents to VIC before merchant plugin fallback', () => {
+  assert.match(skillSource, /description: .*purchase\/book.*VIC.*current card is Visa/i);
+  assert.match(skillSource, /Current Visa Card \+ Purchase Intent/i);
+  assert.match(skillSource, /current\/selected\/default payment method is a Visa card/i);
+  assert.match(skillSource, /even when the message does not mention Visa/i);
+  assert.match(skillSource, /current payment method is not already known[\s\S]*prepare_visa_purchase_instruction/i);
+  assert.match(skillSource, /Purchase intent signals include:[\s\S]*buy[\s\S]*purchase[\s\S]*order[\s\S]*book[\s\S]*reserve[\s\S]*下单[\s\S]*购买[\s\S]*预订[\s\S]*订酒店[\s\S]*买票/i);
+  assert.match(skillSource, /prepare_visa_purchase_instruction/);
   assert.match(skillSource, /list_purchase_instructions/);
-  assert.match(skillSource, /pre_check_account/);
-  assert.match(skillSource, /create_purchase_instruction/);
   assert.match(skillSource, /VIC registration/i);
   assert.match(skillSource, /Do NOT call clink_pay for Visa/i);
   assert.match(skillSource, /do not answer only that the merchant booking plugin is missing/i);
@@ -305,18 +911,25 @@ test('skill routes explicit Visa purchase intent to VIC before merchant plugin f
   assert.match(skillSource, /Session ID/i);
 });
 
-test('tool descriptions route scoped Visa booking requests into account pre-check before fallback', () => {
-  assert.match(indexSource, /name: "pre_check_account"[\s\S]*Visa purchase\/book\/order intents/);
-  assert.match(indexSource, /name: "pre_check_account"[\s\S]*list_purchase_instructions/);
-  assert.match(indexSource, /name: "pre_check_account"[\s\S]*create_purchase_instruction/);
-  assert.match(skillSource, /For this exact request, first call `pre_check_account`/);
-  assert.match(skillSource, /then `list_purchase_instructions`/);
-  assert.match(skillSource, /then `create_purchase_instruction`/);
+test('tool descriptions route scoped Visa booking requests into the state machine before fallback', () => {
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*VIC state machine/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*purchase\/book\/order intents/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*current\/default card/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*requiresShipping/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*shippingAddress/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*countryCode[\s\S]*US/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*do not manually chain pre_check_account\/list\/create first/);
+  assert.match(skillSource, /For this exact request, when the current\/default card is Visa, call `prepare_visa_purchase_instruction`/);
+  assert.match(skillSource, /state machine then resolves the card/);
+  assert.match(skillSource, /creates a draft if no semantic match is returned/);
+  assert.match(skillSource, /requiresShipping/);
+  assert.match(skillSource, /shippingAddress/);
+  assert.match(skillSource, /countryCode.*US/s);
 });
 
 test('skill forces list-then-create flow for scoped Visa hotel booking intents', () => {
-  assert.match(skillSource, /list_purchase_instructions must be the next purchase-instruction tool call/i);
-  assert.match(skillSource, /Do NOT create_purchase_instruction before list_purchase_instructions/i);
+  assert.match(skillSource, /prepare_visa_purchase_instruction` must be the next tool call/i);
+  assert.match(skillSource, /Do NOT call `create_purchase_instruction` before the state machine list step/i);
   assert.match(skillSource, /semantic match/i);
   assert.match(skillSource, /paymentInstrumentId/);
   assert.match(skillSource, /amountLimit/);
@@ -369,9 +982,10 @@ test('routes Visa cards with visaRegistrationSucceeded to purchase instruction f
   assert.equal(result.route, 'vic_instruction_required');
   assert.match(result.response, /VIC purchase instruction flow/);
   assert.match(result.response, /Do NOT call clink_pay/);
-  assert.match(result.response, /list_purchase_instructions must be the next purchase-instruction tool call/i);
+  assert.match(result.response, /prepare_visa_purchase_instruction/i);
+  assert.match(result.response, /state machine must list ACTIVE instructions/i);
   assert.match(result.response, /paymentInstrumentId=pi_vic/);
-  assert.match(result.response, /Do NOT create_purchase_instruction before list_purchase_instructions/i);
+  assert.match(result.response, /Do NOT manually call create_purchase_instruction before the state machine list step/i);
 });
 
 test('does not treat isVic as VIC registration completion', async () => {

@@ -31,9 +31,14 @@ export function buildDirectSendDirective({ summary, pollFallback, pollFallbackLi
   const hasScheduledPollFallback = Boolean(pollFallback?.required && pollFallback?.operation);
   const directive = hasScheduledPollFallback ? 'DIRECT_SEND_POLL_REQUIRED' : 'DIRECT_SEND';
   const waitContent = pollFallback?.required
-    ? pollFallbackLines.join('\n')
-    : webhookWaitMessage;
-  let result = `[SYSTEM DIRECTIVE] ${directive}: ${summary}\nThe notification has been sent. Do NOT send another card.\n${waitContent}`;
+    ? (Array.isArray(pollFallbackLines) ? pollFallbackLines.join('\n') : '')
+    : String(webhookWaitMessage || '').trim();
+  const sections = [
+    `[SYSTEM DIRECTIVE] ${directive}: ${summary}`,
+    'The notification has been sent. Do NOT send another card.',
+  ];
+  if (waitContent) sections.push(waitContent);
+  let result = sections.join('\n');
   if (suffix) result += '\n\n' + suffix;
   return result;
 }
