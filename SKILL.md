@@ -43,7 +43,7 @@ tools:
   - name: get_refund_status
     description: Query the latest status of an ALREADY SUBMITTED Clink refund order via `refundOrderId` (starts with `rfd_`). Use this tool when the user asks for the "status" or "progress" of a refund.
   - name: prepare_visa_purchase_instruction
-    description: "VIC state machine: primary entrypoint for purchase/book/order intents. Resolves the current/default card; if it is Visa, handles VIC registration or lists ACTIVE instructions filtered by paymentInstrumentId and reuses/creates a draft. For physical goods that require delivery, set requiresShipping=true and provide a US shippingAddress. Use this instead of manually chaining pre_check_account, list_purchase_instructions, and create_purchase_instruction."
+    description: "VIC state machine: primary entrypoint for purchase/book/order intents. Resolves the current/default card; if it is Visa, handles VIC registration or lists ACTIVE instructions filtered by paymentInstrumentId and reuses/creates a draft. Always provide fulfillmentType. Use PHYSICAL_GOODS_REQUIRES_SHIPPING plus a US shippingAddress only for shipped physical goods; use NO_SHIPPING_REQUIRED for hotels, tickets, services, subscriptions, digital goods, bookings, and reservations. Use this instead of manually chaining pre_check_account, list_purchase_instructions, and create_purchase_instruction."
   - name: sign_purchase_instruction
     description: "VIC: submit the user's Passkey/FIDO result + app/device context to activate a purchase instruction (CREATED -> ACTIVE). authResult/appInstance come from the front-end Passkey flow; never fabricate them."
   - name: list_purchase_instructions
@@ -100,7 +100,10 @@ When this rule fires:
 5. If the selected/default/current Visa card has `visaRegistrationSucceeded=true`, the state machine lists ACTIVE purchase instructions with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`. It reuses a matching ACTIVE instruction when possible; otherwise it creates an instruction draft. The model must not call `create_purchase_instruction` before this state machine list step.
 6. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
 7. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices. If the user already supplied merchant/merchant class, amount limit, currency, and timing constraints, the scope is complete enough to list and then create a draft.
-8. If the intent is to buy physical goods that require delivery, collect a US shipping address before draft creation and call `prepare_visa_purchase_instruction` with `requiresShipping=true` plus `shippingAddress`. Only US shipping addresses are supported; `shippingAddress.countryCode` must be `US`. Do not require `shippingAddress` for services, subscriptions, hotels, tickets, bookings, or reservations that do not ship a physical item.
+8. Before calling `prepare_visa_purchase_instruction`, classify fulfillment explicitly with `fulfillmentType`.
+   - Use `PHYSICAL_GOODS_REQUIRES_SHIPPING` only for shipped physical goods. Collect a US shipping address before draft creation and pass `shippingAddress`; `shippingAddress.countryCode` must be `US`.
+   - Use `NO_SHIPPING_REQUIRED` for services, subscriptions, hotels, tickets, bookings, reservations, and digital goods that do not ship a physical item.
+   - If it is unclear whether the purchase ships physical goods, use `UNKNOWN` only long enough to ask the user to clarify. The state machine will not list or create an instruction while fulfillment is unknown.
 9. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
 
 ## PRIORITY RULE: Instruction Authorization Management Link
@@ -122,11 +125,11 @@ Evaluate existing ACTIVE instructions by semantic match, not exact string equali
 
 If no ACTIVE instruction semantically matches, the state machine creates a draft mandate based on the user-supplied scope.
 
-For physical goods that require delivery, include the user-provided US `shippingAddress` in the draft request. The address shape is:
+For physical goods that require delivery, call `prepare_visa_purchase_instruction` with `fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING` and include the user-provided US `shippingAddress`. The address shape is:
 
 ```json
 {
-  "requiresShipping": true,
+  "fulfillmentType": "PHYSICAL_GOODS_REQUIRES_SHIPPING",
   "shippingAddress": {
     "addressId": "addr_001",
     "name": "Jim",
@@ -152,6 +155,7 @@ For that request, after the state machine finds no semantic match, it creates a 
 {
   "paymentInstrumentId": "<selected Visa paymentInstrumentId>",
   "title": "全季酒店住宿预订",
+  "fulfillmentType": "NO_SHIPPING_REQUIRED",
   "mandates": [
     {
       "title": "Hotel Booking",
@@ -483,10 +487,11 @@ Use this for every selected Visa card before payment execution. Non-Visa cards u
 
 1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
    ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
    ```
 2. **State machine outcomes:**
    - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
+   - `state=MISSING_FULFILLMENT_TYPE` means the agent must determine whether the purchase is shipped physical goods before listing or creating instructions.
    - `state=vic_registration_required` or `state=vic_registration_pending` means the user must finish `/passkey-auth/{paymentInstrumentId}?type=visa`; wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
    - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
    - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.

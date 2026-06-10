@@ -3030,11 +3030,32 @@ function isPlainObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
 }
 
+function normalizePurchaseInstructionFulfillmentType(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function validatePurchaseInstructionFulfillmentType(args = {}) {
+  const fulfillmentType = normalizePurchaseInstructionFulfillmentType(args.fulfillmentType);
+  const allowed = ['PHYSICAL_GOODS_REQUIRES_SHIPPING', 'NO_SHIPPING_REQUIRED', 'UNKNOWN'];
+  if (!fulfillmentType) return ['fulfillmentType'];
+  if (!allowed.includes(fulfillmentType)) {
+    return ['fulfillmentType must be PHYSICAL_GOODS_REQUIRES_SHIPPING, NO_SHIPPING_REQUIRED, or UNKNOWN'];
+  }
+  if (fulfillmentType === 'UNKNOWN') {
+    return ['fulfillmentType must be resolved before listing or creating instructions'];
+  }
+  return [];
+}
+
+function purchaseInstructionNeedsShippingAddress(args = {}) {
+  return normalizePurchaseInstructionFulfillmentType(args.fulfillmentType) === 'PHYSICAL_GOODS_REQUIRES_SHIPPING';
+}
+
 function validatePurchaseInstructionShippingAddress(args = {}) {
   const missing = [];
-  const requiresShipping = args.requiresShipping === true;
+  const needsShippingAddress = purchaseInstructionNeedsShippingAddress(args);
   const hasShippingAddress = args.shippingAddress !== undefined && args.shippingAddress !== null;
-  if (!requiresShipping && !hasShippingAddress) return missing;
+  if (!needsShippingAddress && !hasShippingAddress) return missing;
   if (!isPlainObject(args.shippingAddress)) return ['shippingAddress'];
 
   const address = args.shippingAddress;
@@ -3134,6 +3155,14 @@ async function handle_prepare_visa_purchase_instruction(args = {}) {
     return "ERROR: prepare_visa_purchase_instruction requires a non-empty 'mandates' array with amountLimit and currencyCode.";
   }
 
+  const missingFulfillmentType = validatePurchaseInstructionFulfillmentType(args);
+  if (missingFulfillmentType.length > 0) {
+    return `[VIC_STATE_MACHINE] state=MISSING_FULFILLMENT_TYPE
+The fulfillment type is not resolved yet. Before listing or creating a purchase instruction, determine whether this purchase is a physical goods order that requires shipping.
+Use fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING only for shipped physical goods, fulfillmentType=NO_SHIPPING_REQUIRED for hotels, tickets, services, subscriptions, digital goods, bookings, and reservations, or ask the user to clarify when uncertain.
+Missing fields: ${missingFulfillmentType.join(', ')}`;
+  }
+
   const missingScope = validatePurchaseInstructionScope(args);
   if (missingScope.length > 0) {
     return `[VIC_STATE_MACHINE] state=MISSING_SCOPE
@@ -3221,6 +3250,8 @@ async function createPurchaseInstructionDraft(args = {}) {
   if (!args.paymentInstrumentId) return "ERROR: create_purchase_instruction requires 'paymentInstrumentId' (a VIC-ready Visa card).";
   if (!args.title) return "ERROR: create_purchase_instruction requires 'title'.";
   if (!Array.isArray(args.mandates) || args.mandates.length === 0) return "ERROR: create_purchase_instruction requires a non-empty 'mandates' array (each with description, amountLimit, currencyCode).";
+  const missingFulfillmentType = validatePurchaseInstructionFulfillmentType(args);
+  if (missingFulfillmentType.length > 0) return `ERROR: create_purchase_instruction fulfillment classification is incomplete: ${missingFulfillmentType.join(', ')}`;
   const missingScope = validatePurchaseInstructionScope(args);
   if (missingScope.length > 0) return `ERROR: create_purchase_instruction spend scope is incomplete: ${missingScope.join(', ')}`;
   let requestNotifyDestination = null;
@@ -3896,7 +3927,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "prepare_visa_purchase_instruction",
-      description: "VIC state machine: for purchase/book/order intents, resolve the current/default card; if it is Visa, handle VIC registration or list ACTIVE instructions by paymentInstrumentId and reuse/create a draft. For physical goods that require delivery, set requiresShipping=true and provide a US shippingAddress before draft creation. This is the primary entrypoint for Visa purchase authorization; do not manually chain pre_check_account/list/create first.",
+      description: "VIC state machine: for purchase/book/order intents, resolve the current/default card; if it is Visa, handle VIC registration or list ACTIVE instructions by paymentInstrumentId and reuse/create a draft. fulfillmentType is required so the model cannot silently skip shipping-address collection for physical goods. This is the primary entrypoint for Visa purchase authorization; do not manually chain pre_check_account/list/create first.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3906,10 +3937,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           effectiveUntilTime: { type: "string", description: "Optional instruction expiry, UTC string \"yyyy-MM-dd HH:mm:ss\"." },
           isRecurring: { type: "boolean", description: "Optional. Default false unless the user clearly authorizes recurring payments." },
           mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
-          requiresShipping: { type: "boolean", description: "Set true only for physical goods that require delivery. This is local validation metadata and is not sent to the backend." },
+          fulfillmentType: {
+            type: "string",
+            enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"],
+            description: "Required local classification. Use PHYSICAL_GOODS_REQUIRES_SHIPPING only for shipped physical goods, NO_SHIPPING_REQUIRED for hotels/tickets/services/subscriptions/digital goods/bookings/reservations, and UNKNOWN only when the user must clarify before list/create."
+          },
           shippingAddress: {
             type: "object",
-            description: "Required when requiresShipping=true. Only US shipping addresses are supported; countryCode must be US. Passed to POST /agent/cwallet/instructions as shippingAddress.",
+            description: "Required when fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING. Only US shipping addresses are supported; countryCode must be US. Passed to POST /agent/cwallet/instructions as shippingAddress.",
             properties: {
               addressId: { type: "string" },
               name: { type: "string" },
@@ -3929,7 +3964,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
           locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         },
-        required: ["title", "mandates"]
+        required: ["title", "fulfillmentType", "mandates"]
       }
     },
     {

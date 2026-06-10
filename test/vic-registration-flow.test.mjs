@@ -56,6 +56,9 @@ function buildCreatePurchaseInstructionDraftHarness() {
     'buildPurchaseInstructionPasskeyUrl',
     'buildPurchaseInstructionAuthNotification',
     'isPlainObject',
+    'normalizePurchaseInstructionFulfillmentType',
+    'validatePurchaseInstructionFulfillmentType',
+    'purchaseInstructionNeedsShippingAddress',
     'validatePurchaseInstructionShippingAddress',
     'validatePurchaseInstructionScope',
     'createPurchaseInstructionDraft',
@@ -251,6 +254,10 @@ test('purchase instruction draft auth notification includes the requested instru
       effectiveUntilTime: '2026-06-10T23:59:59Z',
     }],
   };
+  const args = {
+    ...requestBody,
+    fulfillmentType: 'NO_SHIPPING_REQUIRED',
+  };
   let fallbackMessage = null;
 
   globalThis.fetchInstruction = async (endpoint, method, body) => {
@@ -273,7 +280,7 @@ test('purchase instruction draft auth notification includes the requested instru
   };
 
   try {
-    const result = await createPurchaseInstructionDraft(requestBody);
+    const result = await createPurchaseInstructionDraft(args);
 
     assert.equal(result.notifications.message_key, 'payment.purchase_instruction_auth_required');
     assert.equal(result.notifications.vars.instructionId, 'inst_hotel');
@@ -315,6 +322,10 @@ test('purchase instruction draft creation passes US shipping address for deliver
       preferredMerchantName: 'Example Store',
     }],
   };
+  const args = {
+    ...requestBody,
+    fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
+  };
 
   globalThis.fetchInstruction = async (endpoint, method, body) => {
     assert.equal(endpoint, '/agent/cwallet/instructions');
@@ -334,7 +345,7 @@ test('purchase instruction draft creation passes US shipping address for deliver
   globalThis.logNotificationFallback = async () => {};
 
   try {
-    const result = await createPurchaseInstructionDraft(requestBody);
+    const result = await createPurchaseInstructionDraft(args);
 
     assert.deepEqual(result.notifications.vars.shippingAddress, requestBody.shippingAddress);
   } finally {
@@ -561,6 +572,9 @@ function buildPrepareInstructionHarness() {
     'normalizeInstructionComparableText',
     'parseInstructionTimeMs',
     'isPlainObject',
+    'normalizePurchaseInstructionFulfillmentType',
+    'validatePurchaseInstructionFulfillmentType',
+    'purchaseInstructionNeedsShippingAddress',
     'validatePurchaseInstructionShippingAddress',
     'validatePurchaseInstructionScope',
     'mandateMatchesPurchaseScope',
@@ -620,6 +634,7 @@ test('prepare visa purchase instruction state machine lists before creating a dr
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: '全季酒店住宿预订',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
       mandates: [{
         description: '全季酒店住宿预订，靠近上海迪士尼',
         amountLimit: 500,
@@ -664,6 +679,7 @@ test('prepare visa purchase instruction state machine returns missing scope befo
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: '全季酒店住宿预订',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
       mandates: [{
         description: '全季酒店住宿预订',
         currencyCode: 'CNY',
@@ -675,6 +691,81 @@ test('prepare visa purchase instruction state machine returns missing scope befo
     assert.match(result, /state=MISSING_SCOPE/);
     assert.match(result, /amountLimit/i);
     assert.match(result, /merchantCategoryCode or preferredMerchantName/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine requires explicit fulfillment type before list or create', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let listed = false;
+  let created = false;
+
+  globalThis.fetchInstruction = async () => {
+    listed = true;
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async () => {
+    created = true;
+    return 'unexpected create';
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: 'Physical goods purchase',
+      mandates: [{
+        description: 'Physical goods purchase',
+        amountLimit: 120,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+    });
+
+    assert.equal(listed, false);
+    assert.equal(created, false);
+    assert.match(result, /state=MISSING_FULFILLMENT_TYPE/);
+    assert.match(result, /fulfillmentType/i);
+  } finally {
+    delete globalThis.fetchInstruction;
+    delete globalThis.createPurchaseInstructionDraft;
+    delete globalThis.logError;
+  }
+});
+
+test('prepare visa purchase instruction state machine blocks unknown fulfillment type before list or create', async () => {
+  const handlePrepareVisaPurchaseInstruction = buildPrepareInstructionHarness();
+  let listed = false;
+  let created = false;
+
+  globalThis.fetchInstruction = async () => {
+    listed = true;
+    return [];
+  };
+  globalThis.createPurchaseInstructionDraft = async () => {
+    created = true;
+    return 'unexpected create';
+  };
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handlePrepareVisaPurchaseInstruction({
+      title: 'Ambiguous purchase',
+      fulfillmentType: 'UNKNOWN',
+      mandates: [{
+        description: 'Ambiguous purchase',
+        amountLimit: 120,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+    });
+
+    assert.equal(listed, false);
+    assert.equal(created, false);
+    assert.match(result, /state=MISSING_FULFILLMENT_TYPE/);
+    assert.match(result, /must be resolved/i);
   } finally {
     delete globalThis.fetchInstruction;
     delete globalThis.createPurchaseInstructionDraft;
@@ -700,7 +791,7 @@ test('prepare visa purchase instruction state machine requires shipping address 
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: 'Physical goods purchase',
-      requiresShipping: true,
+      fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
       mandates: [{
         description: 'Physical goods purchase',
         amountLimit: 120,
@@ -738,7 +829,7 @@ test('prepare visa purchase instruction state machine rejects non-US shipping ad
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: 'Physical goods purchase',
-      requiresShipping: true,
+      fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
       shippingAddress: {
         name: 'Jim',
         line1: 'xxx road',
@@ -801,6 +892,7 @@ test('prepare visa purchase instruction state machine does not mark failed draft
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: '全季酒店住宿预订',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
       mandates: [{
         description: '全季酒店住宿预订',
         amountLimit: 500,
@@ -871,6 +963,7 @@ test('prepare visa purchase instruction state machine reuses a matching active i
   try {
     const result = await handlePrepareVisaPurchaseInstruction({
       title: '全季酒店住宿预订',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
       mandates: [{
         description: '全季酒店住宿预订，靠近上海迪士尼',
         amountLimit: 500,
@@ -915,14 +1008,20 @@ test('tool descriptions route scoped Visa booking requests into the state machin
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*VIC state machine/);
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*purchase\/book\/order intents/);
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*current\/default card/);
-  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*requiresShipping/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*fulfillmentType/);
+  assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*PHYSICAL_GOODS_REQUIRES_SHIPPING/);
+  assert.match(indexSource, /required: \["title", "fulfillmentType", "mandates"\]/);
+  assert.doesNotMatch(indexSource, /requiresShipping/);
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*shippingAddress/);
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*countryCode[\s\S]*US/);
   assert.match(indexSource, /name: "prepare_visa_purchase_instruction"[\s\S]*do not manually chain pre_check_account\/list\/create first/);
   assert.match(skillSource, /For this exact request, when the current\/default card is Visa, call `prepare_visa_purchase_instruction`/);
   assert.match(skillSource, /state machine then resolves the card/);
   assert.match(skillSource, /creates a draft if no semantic match is returned/);
-  assert.match(skillSource, /requiresShipping/);
+  assert.match(skillSource, /fulfillmentType/);
+  assert.match(skillSource, /NO_SHIPPING_REQUIRED/);
+  assert.match(skillSource, /PHYSICAL_GOODS_REQUIRES_SHIPPING/);
+  assert.doesNotMatch(skillSource, /requiresShipping/);
   assert.match(skillSource, /shippingAddress/);
   assert.match(skillSource, /countryCode.*US/s);
 });
