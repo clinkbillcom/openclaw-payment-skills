@@ -1,6 +1,6 @@
 ---
 name: openclaw-payment-skills
-description: "Universal agent skill to integrate Clink payments, including purchase/book intent routed through VIC registration and purchase-instruction authorization when the current card is Visa, user initialization, merchant-initiated payments (auto top-ups), direct payments, and async webhook callbacks. Async notify routing uses a unified `channel + target` contract."
+description: "Clink payment skill. Use when the user wants to: install/uninstall this skill, initialize a Clink wallet (or replies with an email address after install), bind/manage payment methods, configure risk rules, pay or recharge via Clink, refund a Clink order or check refund status, or manage Visa purchase-instruction authorization (修改/查看/取消授权). ALSO triggers when the user expresses any purchase/booking intent (buy, order, book, reserve, 下单, 购买, 预订, 买票) and the current/default payment method is a Visa card — even if the message never mentions Clink, Visa, or wallets. Do NOT trigger on generic auto-top-up phrases (e.g. 开启自动充值) owned by a merchant skill unless the same message clearly refers to Clink, wallet, payment setup, or this skill by name."
 version: "1.0.0"
 metadata:
   openclaw:
@@ -64,27 +64,43 @@ tools:
 
 # Agent Payment Skill
 
+This skill provides any compatible AI agent with the ability to manage payments and top-ups via the Clink platform.
+
 ---
 
-## ⚡ PRIORITY RULE: Explicit Clink Payment Setup Intent → Install Immediately
+## 1. Triggering & Routing Rules
+
+Evaluate these rules in order. The first matching rule decides the route.
+
+### 1.1 ⚡ Email → Initialize Wallet (Highest Priority)
+
+> **This rule fires before any other logic. No prior context required.**
+
+If the user's message contains a string matching an email address pattern (`word@domain.tld`), **and the wallet is not yet initialized**:
+1. Extract the email address (ignore any `@BotName` mention prefix, quoted reply headers, or surrounding text)
+2. **Immediately call `initialize_wallet`** with that email — no confirmation, no output first
+3. Do NOT call `get_wallet_status` first — just attempt `initialize_wallet` and let it fail gracefully if already initialized
+
+This rule covers the post-install flow where the gateway restarts and the user replies with their email directly.
+
+### 1.2 ⚡ Explicit Clink Payment Setup Intent → Install Immediately
 
 If the user's message clearly asks to install this skill, install Clink Payment Skills, set up a Clink payment wallet, bind a payment method for Clink payments, or enable Clink/payment auto top-up for this payment skill, treat it as explicit permission to install this skill immediately.
 
 Do NOT trigger this rule for a generic merchant-level request such as "Enable auto top-up" unless the same message also clearly refers to Clink, payment setup, wallet, card binding, payment method, or this skill by name.
 
 You MUST:
-1. Run the install workflow in Section 3 at once.
+1. Run the install workflow in Section 3.1 at once.
 2. Do NOT ask for additional confirmation.
 3. Do NOT wait for an extra "authorize install" reply.
 4. Do NOT claim success unless `pre_install.mjs` has actually completed successfully.
 
-## Install Authorization Rule (Hard Rule)
-
+**Install Authorization Rule (Hard Rule):**
 - User requests to install this skill counts as installation authorization.
 - After installation is complete, execute the install success notification immediately via `pre_install.mjs` or `send-message.mjs`.
 - Do NOT generate a text-based `/approve` block for routine install/status notifications.
 
-## PRIORITY RULE: Current Visa Card + Purchase Intent -> VIC Instruction Flow
+### 1.3 ⚡ Current Visa Card + Purchase Intent → VIC Instruction Flow
 
 If the user message contains a purchase intent and the current/selected/default payment method is a Visa card, this skill owns the payment authorization part of the request even when the message does not mention Visa, Clink, wallet, or this skill by name.
 
@@ -106,13 +122,220 @@ When this rule fires:
    - If it is unclear whether the purchase ships physical goods, use `UNKNOWN` only long enough to ask the user to clarify. The state machine will not list or create an instruction while fulfillment is unknown.
 9. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
 
-## PRIORITY RULE: Instruction Authorization Management Link
+See Section 3.4 for the full VIC workflow, the instruction matching rule, and payload examples.
+
+### 1.4 Instruction Authorization Management Link
 
 If the user asks to 修改授权, 查看授权, 取消 instruction 授权, manage instruction authorization, view instruction authorization, edit instruction authorization, cancel instruction authorization, or uses semantically similar wording for purchase instruction authorization management, call `get_purchase_instruction_manage_link`.
 
 This returns `https://uat-agent.clinkbill.com`. In Feishu it is delivered as a button through the normal notification renderer; in other channels it is shown as a link. Do not ask the user for `appInstance`, `authResult`, or call the backend `get_purchase_instruction`, `update_purchase_instruction`, or `cancel_purchase_instruction` APIs for this user-facing management intent.
 
-### Current Visa Card Purchase Matching Rule
+### 1.5 Routing Boundary Rule (Hard Rule)
+
+Route generic auto-top-up language by product ownership, not by keyword alone.
+
+- Merchant-skill context wins for generic phrases such as "Enable auto top-up", "开启自动充值", or equivalent wording in the user's language.
+- `agent-payment-skills` owns the request only when the same turn clearly refers to Clink, payment setup, wallet initialization, card binding, payment method management, payment confirmation, or this skill by name.
+- Do NOT hijack a merchant-owned request just because it contains a generic auto-top-up phrase.
+- If a merchant skill installs `agent-payment-skills` as a dependency, complete the payment-skill setup work, then let the merchant skill resume and own the original merchant intent.
+
+---
+
+## 2. Hard Rules
+
+### 2.1 Card Ownership Matrix
+
+Exactly one layer owns each card. Do NOT duplicate card delivery across tool, webhook, and agent layers.
+
+| Event | Owner | Required behavior |
+|---|---|---|
+| `initialize_wallet` + existing/new binding confirmation | agent/tool result | Send only the returned initialization card(s) |
+| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ Payment Successful` and trigger merchant confirmation in the same idempotent success path; agent MUST NOT send another or re-trigger merchant confirm |
+| `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ Payment Failed` or `🛡️ Risk Rule Triggered`; agent MUST NOT send another |
+| `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS Verification Required` card from the returned directive |
+| `clink_refund` submission success | payment tool | Payment tool may already send `⏳ Refund Request Submitted`; agent MUST NOT send a duplicate submission card |
+| `agent_refund.succeeded/approved` webhook | payment webhook | Webhook owns the final success notification for the refund lifecycle when webhook delivery is available |
+| `agent_refund.failed/rejected` webhook | payment webhook | Webhook owns the final failure notification for the refund lifecycle when webhook delivery is available |
+| `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ Payment Successful` only if it was not already sent |
+| `agent_order.failed` webhook | payment webhook | Webhook may send failure card only if it was not already sent |
+| Merchant recharge success/failure | merchant confirmation tool | Payment skill MUST NOT send merchant-layer `✅ Recharge Successful` or `❌ Recharge Failed` cards |
+
+### 2.2 Tool Return Contract
+
+- `DIRECT_SEND`
+  - Meaning: the tool/webhook has already sent the card itself
+  - Agent MUST NOT send a second semantic-equivalent card
+- `DIRECT_SEND_POLL_REQUIRED`
+  - Meaning: the tool has sent the notification AND started a mandatory poll fallback because `webhookAvailable=false`
+  - Agent MUST NOT send a second card
+  - Agent MUST NOT treat this as a completed flow or stop here
+  - Agent MUST inform the user that active monitoring is in progress and continue until the poll fallback reports success, failure, or timeout
+  - This directive supersedes `DIRECT_SEND` semantics — the notification is delivered but the workflow is still open
+- `EXEC_REQUIRED`
+  - Meaning: the tool explicitly returned a card exec directive
+  - Agent MUST execute it exactly once
+- `WAIT_FOR_WEBHOOK`
+  - Meaning: do nothing now; wait for async webhook handoff
+- `WAIT_FOR_WEBHOOK_WHEN_AVAILABLE`
+  - Meaning: waiting on webhook is valid only when `webhookAvailable !== false`
+  - If `webhookAvailable === false`, the tool MUST NOT end in a pure webhook wait state for wallet-binding, card-change, or risk-rule-update flows
+- `DATA_ONLY`
+  - Meaning: the tool returned data only; no notification was sent
+  - Agent may use the data to construct the next required response
+
+### 2.3 Async Completion Fallback
+
+If webhookAvailable is false, the agent MUST NOT stop at DIRECT_SEND or WAIT_FOR_WEBHOOK. It MUST immediately start the poll fallback flow and continue checking until success, failure, or timeout.
+
+Current required poll-fallback flows:
+
+- payment-method binding completion until `payment_method.added`
+- payment-method change completion until `payment_method.added`
+- risk-rule update completion until `risk_rule.updated`
+
+Do not add poll fallback for `clink_pay`: order payment execution is synchronous in the payment tool response, and the agent must follow the returned payment directive exactly.
+
+### 2.4 Amount Selection Rule
+
+There are only two valid amount sources for `clink_pay`:
+
+1. User override
+   - If the user explicitly provides a concrete recharge amount in the current turn, you MUST use that amount.
+   - This user-specified amount overrides the merchant default.
+
+2. Merchant default (Direct Mode)
+   - In Direct Mode, if the user does not explicitly provide a concrete amount in the current turn, you MUST use the exact `default_amount` returned by the merchant's payment-config tool.
+   - In Session Mode, the amount is already bound to the `sessionId`. You MUST NOT provide an `amount` parameter.
+
+You MUST NOT invent a third amount from memory, prior turns, habit, or judgment.
+You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary amount unless the user explicitly asked for that amount in the current turn.
+
+### 2.5 Prohibited Behaviors
+
+- Do NOT send the same semantic card twice for the same `order_id`.
+- Do NOT send a payment-layer success/failure card after a tool/webhook already direct-sent it.
+- Do NOT treat a refund submission card as a final refund result.
+- Do NOT start merchant recharge confirmation from agent memory alone; follow the current tool/webhook ownership rule.
+- Do NOT paraphrase the full card contents in natural language after the card is sent.
+- Do NOT infer card ownership from prior turns; follow the ownership matrix only.
+
+---
+
+## 3. Workflows
+
+Shell examples below assume:
+
+```bash
+MCPORTER_CONFIG_PATH="${OPENCLAW_HOME:-$HOME}/.openclaw/config/mcporter.json"
+```
+
+### 3.1 Install (Strict Single-Step Workflow)
+
+The skill is pre-bundled. Do NOT run `npm install`.
+
+When the user asks to install this skill, follow `README.md` / `README-zh.md` only:
+
+- Use the documented manual install command there.
+- Do not substitute a partial MCP-only setup for the documented install flow.
+- Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
+- `pre_install.mjs` already schedules the gateway restart in the background; do not trigger a second manual restart after it succeeds.
+- Installation success is notified immediately; do not wait for or promise a later restart-success card.
+
+**Truthfulness guardrail**
+   The agent MUST NOT say any of the following unless `pre_install.mjs` has actually succeeded in the current session:
+   - `Webhook route is ready`
+   - `Installation completed`
+   - `Wallet initialization can begin`
+   - `A later restart-success card is definitely configured successfully`
+
+   A delayed card or notify log entry alone is NOT sufficient proof that installation completed correctly.
+
+### 3.2 Initialization (Runs once per user)
+
+When a user installs or uses this skill for the first time:
+1. **Request Email:** Prompt the user to input their email address.
+2. **Initialize Wallet:** Call `initialize_wallet` with the user's email. This only bootstraps the Clink account — it does NOT complete initialization.
+   If calling via shell (do NOT omit --args):
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills initialize_wallet --args '{"email":"<USER_EMAIL>"}'
+   ```
+   You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so later async events can route back to the current conversation.
+3. **Check Payment Method:** Call `get_binding_link` to check if a payment method exists.
+   If calling via shell:
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_binding_link --args '{}'
+   ```
+   - If none and `webhookAvailable !== false` → the user gets a card with a link to bind one. Wait for the `payment_method.added` webhook callback before proceeding.
+   - If none and `webhookAvailable === false` → `get_binding_link` MUST start the poll fallback flow immediately after issuing the bind-card instruction. The agent MUST continue waiting for `payment_method.added` or timeout; it MUST NOT stop at `DIRECT_SEND` or a pure webhook wait.
+   - If exists and notify routing is available → `get_binding_link` will directly send both the "Payment Method Already Bound" card and the optional risk-rules follow-up card in the same flow. Do NOT call `get_risk_rules_link` again in that turn.
+   - If exists but direct notify routing is unavailable → send the returned notifications in order, then skip to step 5.
+4. **View Risk Rules (Optional):** Call `get_risk_rules_link` to let the user view and optionally configure risk rules. This step is NOT required — initialization is complete once a payment method is bound. Risk rules can be configured at any time.
+   If calling via shell:
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_risk_rules_link --args '{}'
+   ```
+   This step is mainly for standalone "modify/view risk rules" requests or for fallback paths where `get_binding_link` could not deliver the optional risk-rules follow-up directly.
+   - If `webhookAvailable === false`, `get_risk_rules_link` MUST start the poll fallback flow immediately and continue until `risk_rule.updated` or timeout.
+5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or `payment_method.added` webhook received), send the "🎉 Clink Setup Complete!" card. Do NOT wait for risk rules.
+
+### 3.3 Execute Payment (Direct or Auto Top-Up)
+
+When the user requests a recharge or another skill triggers an auto top-up:
+1. **Pre-Check:** Call `pre_check_account` to verify the account is ready. Do NOT send any "🔍 Clink Account Check Passed" card when this check passes.
+   If calling via shell (do NOT omit --args):
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills pre_check_account --args '{}'
+   ```
+   - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
+2. **Route by selected payment method:**
+   - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
+   - Visa payment methods never use the normal charge path directly.
+   - If the selected Visa payment method has `visaRegistrationSucceeded !== true`, the payment skill sends a VIC registration link once for that pending state and waits for the same `paymentInstrumentId` to appear with `visaRegistrationSucceeded=true`.
+   - The VIC registration link path is `/passkey-auth/{paymentInstrumentId}?type=visa`.
+   - The updated payment method list may arrive through agent refresh (`get_binding_link`, payment-method tools, or a later payment call) or through the OpenClaw payment-method webhook (`payment_method.added` or `payment_method.update`). If `webhookAvailable=false`, the skill starts the `vic_registration` poll fallback and the agent must keep monitoring until success, failure, or timeout.
+   - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow (Section 3.4). Do NOT call `clink_pay` for that Visa card.
+3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
+   If calling via shell (do NOT omit --args, replace placeholders):
+   ```
+   # Direct mode:
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"merchant_id":"<MERCHANT_ID>","amount":<AMOUNT>,"currency":"USD","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
+   # Session mode:
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
+   ```
+4. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
+5. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
+   - `agent_order.succeeded` → Payment webhook may send `✅ Payment Successful` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
+   - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
+   - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS Verification Required` card, then waits for webhook
+6. **Handle Failures:**
+   - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
+   - Email mismatch → Show the security block card. Do NOT retry.
+   - Risk rule triggered → Show options (override / modify rules / pause).
+
+### 3.4 VIC Agentic Authorization (Purchase Instruction)
+
+Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
+
+1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
+   ```
+2. **State machine outcomes:**
+   - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
+   - `state=MISSING_FULFILLMENT_TYPE` means the agent must determine whether the purchase is shipped physical goods before listing or creating instructions.
+   - `state=vic_registration_required` or `state=vic_registration_pending` means the user must finish `/passkey-auth/{paymentInstrumentId}?type=visa`; wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
+   - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
+   - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
+3. **Sign (after the user completes Passkey on the front-end):**
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills sign_purchase_instruction --args '{"instructionId":"<INSTRUCTION_ID>","appInstance":{"deviceData":{"type":"Laptop","brand":"Chrome"}},"authResult":{"identifier":"<FIDO_ID>","fidoBlob":"<BLOB>","dfpSessionId":"<DFP>"}}'
+   ```
+   Status must become `ACTIVE` before any payment. Never fabricate `authResult`/`appInstance`.
+4. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
+
+**VIC hard rules:** never create/sign without explicit user authorization; never invent mandates or authResult; an instruction must be `ACTIVE` before VIC payment execution; `update`/`cancel` require fresh `appInstance` + `authResult`; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
+
+#### Current Visa Card Purchase Matching Rule
 
 For a scoped purchase intent where the selected/default/current payment method is a Visa card, `prepare_visa_purchase_instruction` must be the next tool call after the mandate scope is complete. Inside that state machine, the ACTIVE instruction list call uses `status=ACTIVE` and the selected card's exact `paymentInstrumentId`, for example `GET /agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456`. Do NOT call `create_purchase_instruction` before the state machine list step, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
 
@@ -145,6 +368,8 @@ For physical goods that require delivery, call `prepare_visa_purchase_instructio
 }
 ```
 
+#### Worked Example
+
 For example, if the current/default card is Visa, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
 
 For this exact request, when the current/default card is Visa, call `prepare_visa_purchase_instruction` with the selected scope. The state machine then resolves the card, lists ACTIVE instructions with `status=ACTIVE` and the selected Visa `paymentInstrumentId`, and creates a draft if no semantic match is returned.
@@ -170,151 +395,77 @@ For that request, after the state machine finds no semantic match, it creates a 
 }
 ```
 
-## Routing Boundary Rule (Hard Rule)
+### 3.5 Payment Method Management
 
-Route generic auto-top-up language by product ownership, not by keyword alone.
+When the user asks to view or manage their payment methods:
+1. **Show Current Status:** Call `get_binding_link` to display current payment method and email as an informational card.
+2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. Send a "⚙️ Payment Method Management" card with the link.
+3. **Confirm Update:** After the user returns from the external page, send a "✅ Payment Method Updated" card showing:
+   - Current payment method: updated ✓
+   - Notification email: confirmed ✓
+   - Risk rules: unchanged ✓
 
-- Merchant-skill context wins for generic phrases such as "Enable auto top-up", "开启自动充值", or equivalent wording in the user's language.
-- `agent-payment-skills` owns the request only when the same turn clearly refers to Clink, payment setup, wallet initialization, card binding, payment method management, payment confirmation, or this skill by name.
-- Do NOT hijack a merchant-owned request just because it contains a generic auto-top-up phrase.
-- If a merchant skill installs `agent-payment-skills` as a dependency, complete the payment-skill setup work, then let the merchant skill resume and own the original merchant intent.
+### 3.6 Request Refund
+
+When the user asks to refund an existing Clink order:
+1. **Require Order Context:** Collect or confirm the target `orderId`. Do NOT guess it from memory.
+2. **Call `clink_refund`:** Submit the refund request with the `orderId`.
+   If calling via shell (do NOT omit --args):
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_refund --args '{"orderId":"<ORDER_ID>"}'
+   ```
+   You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so the later webhook can route back to the current conversation.
+3. **Interpret Scope Correctly:** `clink_refund` currently applies for a full refund only. Do NOT claim partial-refund support unless the tool schema or backend API is updated.
+4. **Wait For Final Result:** A successful submission only means the refund request was accepted for processing. The final refund outcome is delivered asynchronously through refund webhooks.
+5. **Follow Webhook Ownership:** Final states are owned by:
+   - `agent_refund.succeeded`
+   - `agent_refund.approved`
+   - `agent_refund.failed`
+   - `agent_refund.rejected`
+   Do NOT send a second semantic-equivalent card after the webhook notification arrives.
+
+### 3.7 Query Refund Status
+
+When the user asks to check an existing refund:
+1. **Require Refund Context:** Collect or confirm the target `refundOrderId`. Do NOT guess it from memory.
+2. **Call `get_refund_status`:** Query the current refund state with the `refundOrderId` only when the user explicitly asks about refund progress/status.
+   If calling via shell (do NOT omit --args):
+   ```
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_refund_status --args '{"refundOrderId":"<REFUND_ORDER_ID>"}'
+   ```
+3. **Return The Status Card:** The tool returns a status card for current states such as `pending_review`, `refunding`, `success`, `failed`, or `review_rejected`.
+4. **Handle Missing Refunds Carefully:** If the backend returns `71160007`, tell the user the refund order was not found and ask them to confirm the refund order ID.
+
+### 3.8 Uninstall (Text-Based Workflow)
+
+When the user asks to uninstall this skill, the agent MUST follow the same strict workflow:
+
+1. **Send Uninstall Authorization Card**:
+   - Send exactly one uninstall authorization notification appropriate for the current channel.
+   - All channels should use the unified notification payload via `send-message.mjs`, for example: `{"message_key":"uninstall.in_progress","vars":{"results":["Webhook: pending removal","Configuration: pending removal","Skill directory: pending removal","Gateway restart: pending"]}}`
+   - If direct delivery is unavailable, send the equivalent markdown/text rendered from the same `message_key`; do not construct a legacy raw card payload.
+   - Do NOT execute any destructive operations yet. After sending the notification, you may add a short natural-language reminder that uninstall is waiting for text confirmation.
+
+2. **Wait for Text Approval**:
+   Pause execution. **Wait for the user to explicitly reply with "Confirm uninstall" or similar approval in the chat.**
+
+3. **Execute Uninstall**:
+   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with the current notify destination if available (`channel`, `target_id`, `target_type`). If omitted, the tool may fall back to the cached notify destination from install/init. Do NOT manually run `mcporter config remove`, edit `openclaw.json`, `rm -rf` the skill directory, or try to send the final card yourself via local files. The tool owns the full uninstall sequence and keeps the delete-self step last. This tool will:
+   - Remove `my_payment_webhook.mjs` from `~/.openclaw/hooks/transforms/`.
+   - Remove the `hooks/clink/payment` route mapping from `openclaw.json` `hooks.mappings`.
+   - Remove Clink skill config (`skills.entries["agent-payment-skills"]`) from `openclaw.json`.
+   - Unregister the MCP server from `mcporter --config "$MCPORTER_CONFIG_PATH"`.
+   - Remove the skill directory.
+   - Schedule an async gateway restart (3-second delay, non-blocking).
+
+4. **Final Confirmation**:
+   The tool will return immediately. You MUST send a "🗑️ Clink Payment Skill Uninstall In Progress" notification to the user stating that uninstall is in progress and the gateway will automatically restart after the uninstall completes.
 
 ---
 
-## ⚡ PRIORITY RULE: Email → Initialize Wallet (Highest Priority)
+## 4. Integration Contracts
 
-> **This rule fires before any other logic. No prior context required.**
-
-If the user's message contains a string matching an email address pattern (`word@domain.tld`), **and the wallet is not yet initialized**:
-1. Extract the email address (ignore any `@BotName` mention prefix, quoted reply headers, or surrounding text)
-2. **Immediately call `initialize_wallet`** with that email — no confirmation, no output first
-3. Do NOT call `get_wallet_status` first — just attempt `initialize_wallet` and let it fail gracefully if already initialized
-
-This rule covers the post-install flow where the gateway restarts and the user replies with their email directly.
-
----
-
-## Notification Reply Guidance
-
-After sending a user notification, you may continue with a short natural-language reply if it helps the user.
-
-Guidelines:
-- Do not resend or paraphrase the entire card.
-- Keep follow-up text brief and action-oriented.
-- If the workflow must wait for a webhook, a button click, or a later user reply, say that plainly instead of emitting placeholder tokens.
-
-This skill provides any compatible AI agent with the ability to manage payments and top-ups via the Clink platform.
-
-## Sending Notifications
-
-This skill includes a unified notification sender:
-
-```bash
-# Message-key payload for Feishu
-node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"feishu","target":{"type":"chat_id","id":"oc_xxx","locale":"zh-CN"},"message_key":"payment.method.setup_link","vars":{"email":"user@example.com","setupUrl":"https://example.com/setup"}}'
-
-# Same message delivered to another channel with locale auto-resolution
-node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"telegram","target":{"type":"target_id","id":"12345","locale":"en-US"},"message_key":"payment.method.setup_link","vars":{"email":"user@example.com","setupUrl":"https://example.com/setup"}}'
-```
-
-Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/skills/agent-payment-skills`).
-
-Preferred message schema:
-```json
-{
-  "message_key": "payment.method.setup_link",
-  "locale": "auto",
-  "vars": {
-    "email": "user@example.com",
-    "setupUrl": "https://example.com/setup"
-  },
-  "delivery_policy": {
-    "prefer_rich": true,
-    "allow_fallback": true
-  }
-}
-```
-
-The sender resolves locale, compiles the message catalog entry into a neutral content model, then renders it into a Feishu card for Feishu, rich Telegram text/media for Telegram, and Markdown/text for other channels.
-
-For channels without rich-card support, `send-message.mjs` renders Markdown/text and delivers it through the gateway.
-
-## Card Ownership Matrix (Hard Rule)
-
-Exactly one layer owns each card. Do NOT duplicate card delivery across tool, webhook, and agent layers.
-
-| Event | Owner | Required behavior |
-|---|---|---|
-| `initialize_wallet` + existing/new binding confirmation | agent/tool result | Send only the returned initialization card(s) |
-| `clink_pay` sync `status=1` | payment tool | Payment tool may already send `✅ Payment Successful` and trigger merchant confirmation in the same idempotent success path; agent MUST NOT send another or re-trigger merchant confirm |
-| `clink_pay` sync `status=3/4/6` | payment tool | Payment tool may already send `❌ Payment Failed` or `🛡️ Risk Rule Triggered`; agent MUST NOT send another |
-| `clink_pay` sync `flag3DS=1` | agent | Agent MUST send exactly one `🔐 3DS Verification Required` card from the returned directive |
-| `clink_refund` submission success | payment tool | Payment tool may already send `⏳ Refund Request Submitted`; agent MUST NOT send a duplicate submission card |
-| `agent_refund.succeeded/approved` webhook | payment webhook | Webhook owns the final success notification for the refund lifecycle when webhook delivery is available |
-| `agent_refund.failed/rejected` webhook | payment webhook | Webhook owns the final failure notification for the refund lifecycle when webhook delivery is available |
-| `agent_order.succeeded` webhook | payment webhook | Webhook may send `✅ Payment Successful` only if it was not already sent |
-| `agent_order.failed` webhook | payment webhook | Webhook may send failure card only if it was not already sent |
-| Merchant recharge success/failure | merchant confirmation tool | Payment skill MUST NOT send merchant-layer `✅ Recharge Successful` or `❌ Recharge Failed` cards |
-
-## Tool Return Contract (Hard Rule)
-
-- `DIRECT_SEND`
-  - Meaning: the tool/webhook has already sent the card itself
-  - Agent MUST NOT send a second semantic-equivalent card
-- `DIRECT_SEND_POLL_REQUIRED`
-  - Meaning: the tool has sent the notification AND started a mandatory poll fallback because `webhookAvailable=false`
-  - Agent MUST NOT send a second card
-  - Agent MUST NOT treat this as a completed flow or stop here
-  - Agent MUST inform the user that active monitoring is in progress and continue until the poll fallback reports success, failure, or timeout
-  - This directive supersedes `DIRECT_SEND` semantics — the notification is delivered but the workflow is still open
-- `EXEC_REQUIRED`
-  - Meaning: the tool explicitly returned a card exec directive
-  - Agent MUST execute it exactly once
-- `WAIT_FOR_WEBHOOK`
-  - Meaning: do nothing now; wait for async webhook handoff
-- `WAIT_FOR_WEBHOOK_WHEN_AVAILABLE`
-  - Meaning: waiting on webhook is valid only when `webhookAvailable !== false`
-  - If `webhookAvailable === false`, the tool MUST NOT end in a pure webhook wait state for wallet-binding, card-change, or risk-rule-update flows
-- `DATA_ONLY`
-  - Meaning: the tool returned data only; no notification was sent
-  - Agent may use the data to construct the next required response
-
-## Async Completion Fallback (Hard Rule)
-
-If webhookAvailable is false, the agent MUST NOT stop at DIRECT_SEND or WAIT_FOR_WEBHOOK. It MUST immediately start the poll fallback flow and continue checking until success, failure, or timeout.
-
-Current required poll-fallback flows:
-
-- payment-method binding completion until `payment_method.added`
-- payment-method change completion until `payment_method.added`
-- risk-rule update completion until `risk_rule.updated`
-Do not add poll fallback for `clink_pay`: order payment execution is synchronous in the payment tool response, and the agent must follow the returned payment directive exactly.
-
-## Prohibited Behaviors (Hard Rule)
-
-- Do NOT send the same semantic card twice for the same `order_id`.
-- Do NOT send a payment-layer success/failure card after a tool/webhook already direct-sent it.
-- Do NOT treat a refund submission card as a final refund result.
-- Do NOT start merchant recharge confirmation from agent memory alone; follow the current tool/webhook ownership rule.
-- Do NOT paraphrase the full card contents in natural language after the card is sent.
-- Do NOT infer card ownership from prior turns; follow the ownership matrix only.
-
-## Amount Selection Rule (Hard Rule)
-
-There are only two valid amount sources for `clink_pay`:
-
-1. User override
-   - If the user explicitly provides a concrete recharge amount in the current turn, you MUST use that amount.
-   - This user-specified amount overrides the merchant default.
-
-2. Merchant default (Direct Mode)
-   - In Direct Mode, if the user does not explicitly provide a concrete amount in the current turn, you MUST use the exact `default_amount` returned by the merchant's payment-config tool.
-   - In Session Mode, the amount is already bound to the `sessionId`. You MUST NOT provide an `amount` parameter.
-
-You MUST NOT invent a third amount from memory, prior turns, habit, or judgment.
-You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary amount unless the user explicitly asked for that amount in the current turn.
-
-## Merchant Payment Handoff Contract
+### 4.1 Merchant Payment Handoff Contract
 
 `agent-payment-skills` must remain merchant-agnostic. It must not maintain a centralized supported-merchant list in this prompt.
 
@@ -349,7 +500,7 @@ The merchant confirmation tool will receive a structured `payment_handoff` objec
 
 `clink_pay` is the low-level payment executor. It should not discover merchant tools, fetch merchant config, guess merchant routing, or own merchant orchestration logic. When it hands success off to the merchant confirmation tool, it sends a structured `payment_handoff` payload instead of ad hoc top-level fields.
 
-## Notify Destination Contract
+### 4.2 Notify Destination Contract
 
 Async routing metadata is stored in one unified shape:
 
@@ -375,182 +526,56 @@ Current scope:
 - `payment_handoff.notify_target` uses the same `{type,id}` shape across channels. For Feishu, `type` is `chat_id` or `open_id`; for other channels it is usually `target_id`.
 - `initialize_wallet`, `install_system_hooks`, and `uninstall_system_hooks` accept the unified notify destination contract.
 
-## Instructions & Workflows
+---
 
-Shell examples below assume:
+## 5. Notifications
+
+### 5.1 Sending Notifications
+
+This skill includes a unified notification sender:
 
 ```bash
-MCPORTER_CONFIG_PATH="${OPENCLAW_HOME:-$HOME}/.openclaw/config/mcporter.json"
+# Message-key payload for Feishu
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"feishu","target":{"type":"chat_id","id":"oc_xxx","locale":"zh-CN"},"message_key":"payment.method.setup_link","vars":{"email":"user@example.com","setupUrl":"https://example.com/setup"}}'
+
+# Same message delivered to another channel with locale auto-resolution
+node {SKILL_DIR}/scripts/send-message.mjs --payload '{"channel":"telegram","target":{"type":"target_id","id":"12345","locale":"en-US"},"message_key":"payment.method.setup_link","vars":{"email":"user@example.com","setupUrl":"https://example.com/setup"}}'
 ```
 
-### 1. Initialization (Runs once per user)
-When a user installs or uses this skill for the first time:
-1. **Request Email:** Prompt the user to input their email address.
-2. **Initialize Wallet:** Call `initialize_wallet` with the user's email. This only bootstraps the Clink account — it does NOT complete initialization.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills initialize_wallet --args '{"email":"<USER_EMAIL>"}'
-   ```
-   You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so later async events can route back to the current conversation.
-3. **Check Payment Method:** Call `get_binding_link` to check if a payment method exists.
-   If calling via shell:
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_binding_link --args '{}'
-   ```
-   - If none and `webhookAvailable !== false` → the user gets a card with a link to bind one. Wait for the `payment_method.added` webhook callback before proceeding.
-   - If none and `webhookAvailable === false` → `get_binding_link` MUST start the poll fallback flow immediately after issuing the bind-card instruction. The agent MUST continue waiting for `payment_method.added` or timeout; it MUST NOT stop at `DIRECT_SEND` or a pure webhook wait.
-   - If exists and notify routing is available → `get_binding_link` will directly send both the "Payment Method Already Bound" card and the optional risk-rules follow-up card in the same flow. Do NOT call `get_risk_rules_link` again in that turn.
-   - If exists but direct notify routing is unavailable → send the returned notifications in order, then skip to step 5.
-4. **View Risk Rules (Optional):** Call `get_risk_rules_link` to let the user view and optionally configure risk rules. This step is NOT required — initialization is complete once a payment method is bound. Risk rules can be configured at any time.
-   If calling via shell:
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_risk_rules_link --args '{}'
-   ```
-   This step is mainly for standalone "modify/view risk rules" requests or for fallback paths where `get_binding_link` could not deliver the optional risk-rules follow-up directly.
-   - If `webhookAvailable === false`, `get_risk_rules_link` MUST start the poll fallback flow immediately and continue until `risk_rule.updated` or timeout.
-5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or `payment_method.added` webhook received), send the "🎉 Clink Setup Complete!" card. Do NOT wait for risk rules.
+Replace `{SKILL_DIR}` with the actual skill path (e.g. `~/.openclaw/workspace/skills/agent-payment-skills`).
 
-### 2. Execute Payment (Direct or Auto Top-Up)
-When the user requests a recharge or another skill triggers an auto top-up:
-1. **Pre-Check:** Call `pre_check_account` to verify the account is ready. Do NOT send any "🔍 Clink Account Check Passed" card when this check passes.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills pre_check_account --args '{}'
-   ```
-   - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
-2. **Route by selected payment method:**
-   - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
-   - Visa payment methods never use the normal charge path directly.
-   - If the selected Visa payment method has `visaRegistrationSucceeded !== true`, the payment skill sends a VIC registration link once for that pending state and waits for the same `paymentInstrumentId` to appear with `visaRegistrationSucceeded=true`.
-   - The VIC registration link path is `/passkey-auth/{paymentInstrumentId}?type=visa`.
-   - The updated payment method list may arrive through agent refresh (`get_binding_link`, payment-method tools, or a later payment call) or through the OpenClaw payment-method webhook (`payment_method.added` or `payment_method.update`). If `webhookAvailable=false`, the skill starts the `vic_registration` poll fallback and the agent must keep monitoring until success, failure, or timeout.
-   - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow. Do NOT call `clink_pay` for that Visa card.
-3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
-   If calling via shell (do NOT omit --args, replace placeholders):
-   ```
-   # Direct mode:
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"merchant_id":"<MERCHANT_ID>","amount":<AMOUNT>,"currency":"USD","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
-   # Session mode:
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
-   ```
-4. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
-5. **Webhook ownership rule:** Pending / 3DS flows wait for async webhook fallback; sync `status=1` success should already hand off merchant confirmation inside the payment tool success path:
-   - `agent_order.succeeded` → Payment webhook may send `✅ Payment Successful` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
-   - `agent_order.failed` → Payment webhook may send payment-layer failure feedback if needed
-   - `flag3DS=1` (synchronous) → Agent sends exactly one `🔐 3DS Verification Required` card, then waits for webhook
-6. **Handle Failures:**
-   - Card declined → Send switch payment method card. After receiving `payment_method.defaultChange` webhook, inform the user the new card is active and **ask if they want to retry the payment**. Do NOT retry automatically.
-   - Email mismatch → Show the security block card. Do NOT retry.
-   - Risk rule triggered → Show options (override / modify rules / pause).
+Preferred message schema:
+```json
+{
+  "message_key": "payment.method.setup_link",
+  "locale": "auto",
+  "vars": {
+    "email": "user@example.com",
+    "setupUrl": "https://example.com/setup"
+  },
+  "delivery_policy": {
+    "prefer_rich": true,
+    "allow_fallback": true
+  }
+}
+```
 
-### 2.5 Payment Method Management
-When the user asks to view or manage their payment methods:
-1. **Show Current Status:** Call `get_binding_link` to display current payment method and email as an informational card.
-2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. Send a "⚙️ Payment Method Management" card with the link.
-3. **Confirm Update:** After the user returns from the external page, send a "✅ Payment Method Updated" card showing:
-   - Current payment method: updated ✓
-   - Notification email: confirmed ✓
-   - Risk rules: unchanged ✓
+The sender resolves locale, compiles the message catalog entry into a neutral content model, then renders it into a Feishu card for Feishu, rich Telegram text/media for Telegram, and Markdown/text for other channels.
 
-### 2.6 Request Refund
-When the user asks to refund an existing Clink order:
-1. **Require Order Context:** Collect or confirm the target `orderId`. Do NOT guess it from memory.
-2. **Call `clink_refund`:** Submit the refund request with the `orderId`.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_refund --args '{"orderId":"<ORDER_ID>"}'
-   ```
-   You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so the later webhook can route back to the current conversation.
-3. **Interpret Scope Correctly:** `clink_refund` currently applies for a full refund only. Do NOT claim partial-refund support unless the tool schema or backend API is updated.
-4. **Wait For Final Result:** A successful submission only means the refund request was accepted for processing. The final refund outcome is delivered asynchronously through refund webhooks.
-5. **Follow Webhook Ownership:** Final states are owned by:
-   - `agent_refund.succeeded`
-   - `agent_refund.approved`
-   - `agent_refund.failed`
-   - `agent_refund.rejected`
-   Do NOT send a second semantic-equivalent card after the webhook notification arrives.
+For channels without rich-card support, `send-message.mjs` renders Markdown/text and delivers it through the gateway.
 
-### 2.7 Query Refund Status
-When the user asks to check an existing refund:
-1. **Require Refund Context:** Collect or confirm the target `refundOrderId`. Do NOT guess it from memory.
-2. **Call `get_refund_status`:** Query the current refund state with the `refundOrderId` only when the user explicitly asks about refund progress/status.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_refund_status --args '{"refundOrderId":"<REFUND_ORDER_ID>"}'
-   ```
-3. **Return The Status Card:** The tool returns a status card for current states such as `pending_review`, `refunding`, `success`, `failed`, or `review_rejected`.
-4. **Handle Missing Refunds Carefully:** If the backend returns `71160007`, tell the user the refund order was not found and ask them to confirm the refund order ID.
+### 5.2 Notification Reply Guidance
 
-### 2.8 VIC Agentic Authorization (Purchase Instruction)
+After sending a user notification, you may continue with a short natural-language reply if it helps the user.
 
-Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
+Guidelines:
+- Do not resend or paraphrase the entire card.
+- Keep follow-up text brief and action-oriented.
+- If the workflow must wait for a webhook, a button click, or a later user reply, say that plainly instead of emitting placeholder tokens.
 
-1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
-   ```
-2. **State machine outcomes:**
-   - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
-   - `state=MISSING_FULFILLMENT_TYPE` means the agent must determine whether the purchase is shipped physical goods before listing or creating instructions.
-   - `state=vic_registration_required` or `state=vic_registration_pending` means the user must finish `/passkey-auth/{paymentInstrumentId}?type=visa`; wait until the refreshed payment method list shows the same `paymentInstrumentId` with `visaRegistrationSucceeded=true`.
-   - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
-   - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
-3. **Sign (after the user completes Passkey on the front-end):**
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills sign_purchase_instruction --args '{"instructionId":"<INSTRUCTION_ID>","appInstance":{"deviceData":{"type":"Laptop","brand":"Chrome"}},"authResult":{"identifier":"<FIDO_ID>","fidoBlob":"<BLOB>","dfpSessionId":"<DFP>"}}'
-   ```
-   Status must become `ACTIVE` before any payment. Never fabricate `authResult`/`appInstance`.
-4. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
+---
 
-**VIC hard rules:** never create/sign without explicit user authorization; never invent mandates or authResult; an instruction must be `ACTIVE` before VIC payment execution; `update`/`cancel` require fresh `appInstance` + `authResult`; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
-
-### 3. Post-Installation Setup (Strict Single-Step Workflow)
-
-The skill is pre-bundled. Do NOT run `npm install`.
-
-When the user asks to install this skill, follow `README.md` / `README-zh.md` only:
-
-- Use the documented manual install command there.
-- Do not substitute a partial MCP-only setup for the documented install flow.
-- Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
-- `pre_install.mjs` already schedules the gateway restart in the background; do not trigger a second manual restart after it succeeds.
-- Installation success is notified immediately; do not wait for or promise a later restart-success card.
-
-**Truthfulness guardrail**
-   The agent MUST NOT say any of the following unless `pre_install.mjs` has actually succeeded in the current session:
-   - `Webhook route is ready`
-   - `Installation completed`
-   - `Wallet initialization can begin`
-   - `A later restart-success card is definitely configured successfully`
-
-   A delayed card or notify log entry alone is NOT sufficient proof that installation completed correctly.
-
-### 4. Uninstall (Text-Based Workflow)
-
-When the user asks to uninstall this skill, the agent MUST follow the same strict workflow:
-
-1. **Send Uninstall Authorization Card**:
-   - Send exactly one uninstall authorization notification appropriate for the current channel.
-   - All channels should use the unified notification payload via `send-message.mjs`, for example: `{"message_key":"uninstall.in_progress","vars":{"results":["Webhook: pending removal","Configuration: pending removal","Skill directory: pending removal","Gateway restart: pending"]}}`
-   - If direct delivery is unavailable, send the equivalent markdown/text rendered from the same `message_key`; do not construct a legacy raw card payload.
-   - Do NOT execute any destructive operations yet. After sending the notification, you may add a short natural-language reminder that uninstall is waiting for text confirmation.
-
-2. **Wait for Text Approval**:
-   Pause execution. **Wait for the user to explicitly reply with "Confirm uninstall" or similar approval in the chat.**
-
-3. **Execute Uninstall**:
-   ONLY AFTER receiving the text approval, call the `uninstall_system_hooks` tool with the current notify destination if available (`channel`, `target_id`, `target_type`). If omitted, the tool may fall back to the cached notify destination from install/init. Do NOT manually run `mcporter config remove`, edit `openclaw.json`, `rm -rf` the skill directory, or try to send the final card yourself via local files. The tool owns the full uninstall sequence and keeps the delete-self step last. This tool will:
-   - Remove `my_payment_webhook.mjs` from `~/.openclaw/hooks/transforms/`.
-   - Remove the `hooks/clink/payment` route mapping from `openclaw.json` `hooks.mappings`.
-   - Remove Clink skill config (`skills.entries["agent-payment-skills"]`) from `openclaw.json`.
-   - Unregister the MCP server from `mcporter --config "$MCPORTER_CONFIG_PATH"`.
-   - Remove the skill directory.
-   - Schedule an async gateway restart (3-second delay, non-blocking).
-
-4. **Final Confirmation**:
-   The tool will return immediately. You MUST send a "🗑️ Clink Payment Skill Uninstall In Progress" notification to the user stating that uninstall is in progress and the gateway will automatically restart after the uninstall completes.
-
-## Code Change Guardrail
+## 6. Code Change Guardrail
 
 Do not modify source code or skill files in this directory unless the user explicitly asks for a code or documentation change.
 
@@ -566,5 +591,5 @@ When making changes:
 - Preserve card ownership and tool-return rules defined in this skill
 - Do not make unrelated refactors
 
-## API References
+## 7. API References
 - API Documentation: `https://docs.clinkbill.com/`
