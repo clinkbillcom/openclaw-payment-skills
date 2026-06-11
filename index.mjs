@@ -1299,8 +1299,16 @@ function buildRedirectUrl(bindingUrl, redirectPath) {
   }
 }
 
+function buildBareDomainUrl(bindingUrl) {
+  try {
+    return new URL(bindingUrl).origin;
+  } catch {
+    return bindingUrl;
+  }
+}
+
 function buildRiskRulesNotification(bindingUrl) {
-  const riskUrl = buildRedirectUrl(bindingUrl, "risk-rules-setup");
+  const riskUrl = buildBareDomainUrl(bindingUrl);
   return createMessageRequest({
     messageKey: 'risk.rules_link',
     vars: { riskUrl },
@@ -1748,7 +1756,7 @@ async function handle_get_binding_link(args = {}) {
     const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
 
     if (methods.length === 0) {
-      const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
+      const setupUrl = buildBareDomainUrl(bindingUrl);
       const notification = createMessageRequest({
         messageKey: 'payment.method.binding_required',
         vars: {
@@ -1930,7 +1938,7 @@ async function handle_get_risk_rules_link(args = {}) {
 async function handle_get_payment_method_setup_link(args = {}) {
   try {
     const { bindingUrl, env, methods } = await fetchBindingData();
-    const setupUrl = buildRedirectUrl(bindingUrl, "payment-method-setup");
+    const setupUrl = buildBareDomainUrl(bindingUrl);
     const notification = createMessageRequest({
       messageKey: 'payment.method.setup_link',
       vars: {
@@ -1998,7 +2006,7 @@ async function handle_get_payment_method_setup_link(args = {}) {
 async function handle_get_payment_method_modify_link(args = {}) {
   try {
     const { bindingUrl, methods } = await fetchBindingData();
-    const modifyUrl = buildRedirectUrl(bindingUrl, "payment-method-modify");
+    const modifyUrl = buildBareDomainUrl(bindingUrl);
     const defaultCard = methods.find(m => m.isDefault);
     const notification = createMessageRequest({
       messageKey: 'payment.method.manage_link',
