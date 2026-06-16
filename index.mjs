@@ -1,22 +1,15 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import crypto from "crypto";
 import { execFileSync, spawn } from "child_process";
 import fs from "fs/promises";
 import path from "path";
 import os from "os";
-import https from "https";
-import { CONFIG } from "./config.mjs";
 import {
   buildMessagePreviewTitle,
   createMessageRequest,
   renderMessageMarkdown,
 } from "./notification-utils.js";
-import {
-  buildDirectSendDirective,
-  getReusableAsyncOperation,
-} from "./poll-fallback-utils.mjs";
 import {
   isVisaRegistrationSucceeded,
   resolveVicRegistrationState,
@@ -69,7 +62,6 @@ async function getPaymentEnv() {
     if (cache?.email) env.CLINK_USER_EMAIL = cache.email;
     if (cache?.customerId) env.CLINK_CUSTOMER_ID = cache.customerId;
     if (cache?.customerAPIKey) env.CLINK_CUSTOMER_API_KEY = cache.customerAPIKey;
-    if (cache?.webhookSignKey) env.CLINK_WEBHOOK_SIGNKEY = cache.webhookSignKey;
   } catch (err) { await logError('getPaymentEnv/readCache', err); }
   return env;
 }
@@ -96,11 +88,10 @@ const LOCK_DIR = path.join(SKILL_DIR, 'locks');
 const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = path.join(SKILL_DIR, 'scripts', 'send-message.mjs');
 const MERCHANT_CONFIRMATION_RUNNER = path.join(SKILL_DIR, 'scripts', 'run-merchant-confirmation.mjs');
-const POLL_FALLBACK_SCRIPT = path.join(SKILL_DIR, 'scripts', 'poll-fallback.mjs');
-const PURCHASE_INSTRUCTION_MANAGE_URL = 'https://uat-agent.clinkbill.com';
-const POLL_START_DELAY_MS = 30_000;
-const POLL_INTERVAL_MS = 5_000;
-const POLL_TIMEOUT_MS = 120_000;
+const EVENT_PUMP_SCRIPT = path.join(SKILL_DIR, 'scripts', 'event-pump.mjs');
+// Vendored single-file bundle of @clink-ai/clink-cli. Every Clink API call is
+// performed by invoking this CLI; the skill never calls Clink HTTP directly.
+const CLINK_CLI_BUNDLE = path.join(SKILL_DIR, 'vendor', 'clink-cli', 'clink-cli.bundle.mjs');
 
 function resolveOpenClawExecutable() {
   const explicit = typeof process.env.OPENCLAW_BIN === 'string' ? process.env.OPENCLAW_BIN.trim() : '';
@@ -158,20 +149,10 @@ function shellQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-async function renderWebhookModule(skillDir) {
-  const webhookTemplatePath = path.join(skillDir, 'hooks', 'my_payment_webhook.mjs');
-  const webhookSource = await fs.readFile(webhookTemplatePath, 'utf8');
-  return webhookSource.split('__AGENT_PAYMENT_SKILL_DIR__').join(JSON.stringify(skillDir));
-}
-
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
   if (!Array.isArray(normalized.paymentMethods)) normalized.paymentMethods = [];
   if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
-  if (normalized.webhookAvailable === undefined) normalized.webhookAvailable = null;
-  if (!normalized.asyncOperations || typeof normalized.asyncOperations !== 'object') {
-    normalized.asyncOperations = {};
-  }
   if (!normalized.paymentFlowStates || typeof normalized.paymentFlowStates !== 'object') {
     normalized.paymentFlowStates = {};
   }
@@ -367,119 +348,50 @@ async function writePaymentMethodsCache(cache) {
   await fs.writeFile(CACHE_PATH, JSON.stringify(normalizeCache(cache), null, 2), 'utf8');
 }
 
-function isWebhookAvailable(cache) {
-  return normalizeCache(cache).webhookAvailable !== false;
-}
-
-function createAsyncOperationId(type) {
-  return `${String(type)}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-}
-
-function buildAsyncOperation(type, snapshotBefore, notifyDestination, details = {}) {
-  const now = Date.now();
-  return {
-    id: createAsyncOperationId(type),
-    type,
-    status: 'pending',
-    createdAt: now,
-    firstPollAt: now + POLL_START_DELAY_MS,
-    expireAt: now + POLL_TIMEOUT_MS,
-    pollIntervalMs: POLL_INTERVAL_MS,
-    retryCount: 0,
-    snapshotBefore: cloneJsonValue(snapshotBefore),
-    notifyDestination: notifyDestination ? cloneJsonValue(notifyDestination) : null,
-    ...(details && typeof details === 'object' && !Array.isArray(details) ? cloneJsonValue(details) : {}),
-    lastError: '',
-    resultPayload: null,
-  };
-}
-
-function spawnPollFallbackProcessor(operationId) {
-  const child = spawn(process.execPath, [POLL_FALLBACK_SCRIPT, '--operation-id', operationId], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
-}
-
-async function schedulePollFallbackOperation(type, snapshotBefore, notifyDestination = null, details = {}) {
-  const cache = normalizeCache(await readPaymentMethodsCache() || {});
-  if (isWebhookAvailable(cache)) {
-    return null;
-  }
-
-  const activeOperation = getReusableAsyncOperation(cache, type, Date.now(), details);
-  if (activeOperation) {
-    if (notifyDestination) {
-      activeOperation.notifyDestination = cloneJsonValue(notifyDestination);
-      cache.asyncOperations[activeOperation.id] = activeOperation;
-      await writePaymentMethodsCache(cache);
-    }
-    await logRequest('poll_fallback/reuse_operation', {
-      operationId: activeOperation.id,
-      type,
-      notifyDestinationUpdated: Boolean(notifyDestination),
-    }, { reused: true });
-    return activeOperation;
-  }
-
-  const operation = buildAsyncOperation(type, snapshotBefore, notifyDestination || getNotifyDestination(cache), details);
-  cache.asyncOperations[operation.id] = operation;
-  await writePaymentMethodsCache(cache);
-  spawnPollFallbackProcessor(operation.id);
-  await logRequest('poll_fallback/create_operation', {
-    operationId: operation.id,
-    type,
-    firstPollAt: operation.firstPollAt,
-    expireAt: operation.expireAt,
-  }, { scheduled: true });
-  return operation;
-}
-
-async function schedulePollFallbackOperationSafely(type, snapshotBefore, notifyDestination = null, details = {}) {
+// ------------------------------------------------------------------
+// EVENT PUMP (single mailbox consumer; replaces webhook + poll fallback)
+// ------------------------------------------------------------------
+function ensureEventPumpRunning() {
   try {
-    return await schedulePollFallbackOperation(type, snapshotBefore, notifyDestination, details);
-  } catch (error) {
-    await logError(`poll_fallback/${type}`, error);
-    return null;
+    const child = spawn(process.execPath, [EVENT_PUMP_SCRIPT], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+  } catch (err) {
+    // The pump is a singleton guarded by its own lock; a spawn failure here is
+    // non-fatal — the next tool call (or install) retries.
+    logError('ensureEventPumpRunning', err);
   }
 }
 
-function requiresPollFallback(cache) {
-  return normalizeCache(cache).webhookAvailable === false;
+// Async completion (card bound, order/refund result, instruction activation,
+// risk-rule update) is delivered by the event pump, not by per-operation
+// pollers. These shims keep handler call sites stable while scheduling nothing.
+async function ensureRequiredPollFallback() {
+  return { required: false, operation: null };
 }
 
-async function ensureRequiredPollFallback(type, snapshotBefore, cache, notifyDestination = null, details = {}) {
-  const normalizedCache = normalizeCache(cache);
-  if (!requiresPollFallback(normalizedCache)) {
-    return { required: false, operation: null };
-  }
-  const operation = await schedulePollFallbackOperationSafely(
-    type,
-    snapshotBefore,
-    notifyDestination || getNotifyDestination(normalizedCache),
-    details,
-  );
-  return {
-    required: true,
-    operation: operation ? cloneJsonValue(operation) : null,
-  };
+function getRequiredPollFallbackLines() {
+  return [];
 }
 
-function getRequiredPollFallbackLines({ fallback, successEvent }) {
-  if (!fallback?.required) return [];
-  if (!fallback.operation) {
-    return [
-      'MANDATORY: webhookAvailable=false — poll fallback could not be scheduled automatically.',
-      `This flow is NOT complete. Do NOT stop here. Retry and continue checking for ${successEvent} until success, failure, or timeout.`,
-    ];
-  }
-  return [
-    'MANDATORY: webhookAvailable=false — poll fallback is active.',
-    `This flow is NOT complete. Continue monitoring for ${successEvent} until success, failure, or timeout.`,
-    `Poll fallback operation: ${fallback.operation.id}`,
+// Build the agent-facing DIRECT_SEND directive after a notification has already
+// been delivered. webhookWaitMessage (if provided) explains how the completion
+// notification will arrive.
+function buildDirectSendDirective({ summary, suffix, webhookWaitMessage } = {}) {
+  const sections = [
+    `[SYSTEM DIRECTIVE] DIRECT_SEND: ${summary || ''}`.trimEnd(),
+    'The notification has been sent. Do NOT send another card.',
   ];
+  const waitContent = String(webhookWaitMessage || '').trim();
+  if (waitContent) sections.push(waitContent);
+  let result = sections.join('\n');
+  if (suffix) result += '\n\n' + suffix;
+  return result;
 }
+
+
 
 function normalizeRefundStatusCode(status) {
   return typeof status === 'string' && status.trim()
@@ -1178,64 +1090,90 @@ function resolveChargeCardDisplay({ paymentInstrumentId, channelPaymentResponse,
 }
 
 // ------------------------------------------------------------------
-// API HELPERS
+// CLINK CLI HELPER
 // ------------------------------------------------------------------
-const BASE_URL = CONFIG.API_BASE_URL;
+// Every Clink operation goes through the vendored clink-cli bundle. Credentials
+// are passed via the child process env (names match clink-cli exactly). The API
+// base URL is owned by clink-cli itself: it resolves CLINK_BASE_URL (env) >
+// ~/.clink-cli/config.json baseUrl > production default. The skill never pins it,
+// so a CLINK_BASE_URL env var (e.g. the UAT runtime) transparently overrides it.
 
-class ClinkApiError extends Error {
-  constructor(code, msg, raw) {
-    super(msg || `Clink API Error (code: ${code})`);
-    this.code = code;
+class ClinkCliError extends Error {
+  constructor({ message, type, code, exitCode, raw }) {
+    super(message || `clink-cli error (exit ${exitCode})`);
+    this.name = 'ClinkCliError';
+    this.type = type || 'cli_error';
+    this.code = code ?? null;
+    this.exitCode = exitCode ?? null;
     this.raw = raw;
   }
 }
 
-function httpsRequest(urlStr, options = {}, body = null) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const bodyStr = body ? JSON.stringify(body) : null;
-    const reqOptions = {
-      hostname: url.hostname,
-      port: url.port || 443,
-      path: url.pathname + url.search,
-      method: options.method || "GET",
-      headers: {
-        "Content-Type": "application/json",
-        ...(bodyStr ? { "Content-Length": Buffer.byteLength(bodyStr) } : {}),
-        ...(options.headers || {})
-      }
-    };
-    const req = https.request(reqOptions, (res) => {
-      let data = "";
-      res.on("data", chunk => { data += chunk; });
-      res.on("end", () => {
-        try { resolve(JSON.parse(data)); }
-        catch (e) { reject(new Error(`Failed to parse response: ${data}`)); }
-      });
-    });
-    req.on("error", reject);
-    if (bodyStr) req.write(bodyStr);
-    req.end();
-  });
-}
-
-async function fetchClink(endpoint, options = {}) {
-  const url = `${BASE_URL}${endpoint}`;
-  const body = options.body ? JSON.parse(options.body) : null;
-  const data = await httpsRequest(url, { method: options.method || "GET", headers: options.headers }, body);
-  if (data.code !== 200) {
-    throw new ClinkApiError(data.code, data.msg, data);
+// Scan text for the last line that parses as a JSON object (the CLI may emit
+// progress lines before the machine-readable envelope).
+function parseClinkEnvelope(text) {
+  const lines = String(text || '').split('\n').map((line) => line.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i];
+    if (!line.startsWith('{')) continue;
+    try {
+      return JSON.parse(line);
+    } catch {
+      // keep scanning earlier lines
+    }
   }
-  return data.data;
+  return null;
 }
 
-function getPublicIp() {
-  return new Promise((resolve) => {
-    https.get('https://api.ipify.org', (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => resolve(data.trim()));
-    }).on('error', () => resolve('127.0.0.1'));
+async function runClinkCli(args, { timeoutMs = 30000 } = {}) {
+  const env = await getPaymentEnv();
+  const childEnv = { ...process.env };
+  if (env.CLINK_CUSTOMER_ID) childEnv.CLINK_CUSTOMER_ID = env.CLINK_CUSTOMER_ID;
+  if (env.CLINK_CUSTOMER_API_KEY) childEnv.CLINK_CUSTOMER_API_KEY = env.CLINK_CUSTOMER_API_KEY;
+  // Base URL is owned by clink-cli. A real CLINK_BASE_URL env var (already in
+  // process.env) takes precedence; otherwise an openclaw.json skill-env override
+  // is applied; otherwise clink-cli falls back to its own config / default.
+  if (!childEnv.CLINK_BASE_URL && env.CLINK_BASE_URL) childEnv.CLINK_BASE_URL = env.CLINK_BASE_URL;
+
+  const fullArgs = [CLINK_CLI_BUNDLE, ...args];
+  if (!fullArgs.includes('--format')) fullArgs.push('--format', 'json');
+
+  const { stdout, stderr, exitCode } = await new Promise((resolve) => {
+    const child = spawn(process.execPath, fullArgs, { env: childEnv });
+    let out = '';
+    let err = '';
+    let settled = false;
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      resolve({ stdout: out, stderr: err, exitCode: code });
+    };
+    const timer = setTimeout(() => {
+      try { child.kill('SIGKILL'); } catch {}
+      finish(6); // NETWORK/timeout
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => { out += chunk; });
+    child.stderr.on('data', (chunk) => { err += chunk; });
+    child.on('error', (spawnErr) => { err += `\n${spawnErr.message}`; clearTimeout(timer); finish(1); });
+    child.on('close', (code) => { clearTimeout(timer); finish(code ?? 0); });
+  });
+
+  // Success envelope is authoritative even when the CLI exits non-zero
+  // (e.g. exit 7 / 3-D Secure still returns the charge data on stdout).
+  const okEnvelope = parseClinkEnvelope(stdout);
+  if (okEnvelope && okEnvelope.ok === true) {
+    return okEnvelope.data;
+  }
+
+  const errEnvelope = parseClinkEnvelope(stderr) || okEnvelope;
+  const errorInfo = errEnvelope && errEnvelope.ok === false ? (errEnvelope.error || {}) : {};
+  await logRequest('clink-cli', { args, exitCode }, { stderr: stderr.slice(0, 2000) });
+  throw new ClinkCliError({
+    message: errorInfo.message || stderr.trim() || `clink-cli ${args[0] || ''} failed (exit ${exitCode})`,
+    type: errorInfo.type,
+    code: errorInfo.code,
+    exitCode,
+    raw: errEnvelope,
   });
 }
 
@@ -1252,14 +1190,9 @@ async function fetchBindingData() {
     customerId: env.CLINK_CUSTOMER_ID,
     hasCustomerApiKey: !!env.CLINK_CUSTOMER_API_KEY,
   };
-  const data = await fetchClink('/agent/cwallet/card/bindingLink', {
-    method: 'POST',
-    headers: {
-      "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-      "X-Customer-ID": env.CLINK_CUSTOMER_ID,
-      "X-Timestamp": Date.now().toString()
-    }
-  });
+  // card binding-link refreshes the cached payment methods. The event pump owns
+  // async card-bound delivery, so never let the CLI watch here (--no-watch).
+  const data = await runClinkCli(['card', 'binding-link', '--no-watch']);
   await logRequest('fetchBindingData/bindingLink', requestPayload, data);
 
   const bindingUrl = data.bindingUrl || "";
@@ -1595,7 +1528,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
     'Do NOT create a purchase instruction and do NOT charge until this same Visa payment method appears with visaRegistrationSucceeded=true.',
     ...(pollFallback.required
       ? pollFallbackLines
-      : ['Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.']),
+      : ['The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.']),
   ];
 
   if (!vicState.shouldNotify) {
@@ -1607,7 +1540,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
         summary: 'VIC registration is already pending for this Visa card.',
         pollFallback,
         pollFallbackLines,
-        webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
+        webhookWaitMessage: 'The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
         suffix: 'The VIC registration notification was already sent for this paymentInstrumentId. Do NOT send another card and do NOT retry clink_pay until the same Visa payment method appears with visaRegistrationSucceeded=true.',
       }),
     };
@@ -1624,7 +1557,7 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
           summary: 'VIC registration link delivered.',
           pollFallback,
           pollFallbackLines,
-          webhookWaitMessage: 'Wait for the payment-method webhook or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
+          webhookWaitMessage: 'The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
         }),
       };
     } catch (error) {
@@ -1649,13 +1582,8 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
 // ------------------------------------------------------------------
 
 async function handle_initialize_wallet(args) {
-  const openclawConfig = await loadConfig();
-  let signkey = openclawConfig.hooks?.token || '';
-  if (!signkey) {
-    signkey = crypto.randomBytes(32).toString('hex');
-    openclawConfig.hooks = openclawConfig.hooks || {};
-    openclawConfig.hooks.token = signkey;
-    await saveConfig(openclawConfig);
+  if (!args || !args.email) {
+    return "ERROR: initialize_wallet requires 'email'.";
   }
 
   try {
@@ -1664,7 +1592,6 @@ async function handle_initialize_wallet(args) {
     if (notifyDestination) {
       cache.notifyDestination = notifyDestination;
     }
-    cache.webhookSignKey = signkey;
     cache.email = args.email;
     await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
     cache.cachedAt = new Date().toISOString();
@@ -1675,37 +1602,15 @@ async function handle_initialize_wallet(args) {
   }
 
   try {
-    const port = openclawConfig.gateway?.port || 14924;
-    const publicIp = await getPublicIp();
-    const realCallbackUrl = `http://${publicIp}:${port}/hooks/clink/payment`;
-
-    const bootstrapPayload = {
-        webhookSignKey: signkey,
-        callbackUrl: realCallbackUrl,
-        source: "agent",
-        email: args.email,
-        name: args.name || "Agent User"
-      };
-    const bootstrapJson = await httpsRequest(
-      `${BASE_URL}/agent/cwallet/customer/bootstrap`,
-      { method: 'POST' },
-      bootstrapPayload
-    );
-    await logRequest('initialize_wallet/bootstrap', bootstrapPayload, bootstrapJson);
-    if (bootstrapJson.code !== 200) {
-      throw new ClinkApiError(bootstrapJson.code, bootstrapJson.msg, bootstrapJson);
-    }
-    const data = bootstrapJson.data;
+    const data = await runClinkCli(['wallet', 'init', '--email', args.email, '--name', args.name || 'Agent User']);
+    const customerId = data?.customerId;
+    const customerAPIKey = data?.customerAPIKey ?? data?.customerApiKey;
+    await logRequest('initialize_wallet/walletInit', { email: args.email }, { customerId, hasKey: !!customerAPIKey });
 
     try {
       const cache = await readPaymentMethodsCache() || {};
-      cache.customerId = data.customerId;
-      cache.customerAPIKey = data.customerAPIKey;
-      if (typeof data.webhook_available === 'boolean') {
-        cache.webhookAvailable = data.webhook_available;
-      } else if (typeof data.webhookAvailable === 'boolean') {
-        cache.webhookAvailable = data.webhookAvailable;
-      }
+      if (customerId) cache.customerId = customerId;
+      if (customerAPIKey) cache.customerAPIKey = customerAPIKey;
       cache.cachedAt = new Date().toISOString();
       await fs.mkdir(path.dirname(CACHE_PATH), { recursive: true });
       await fs.writeFile(CACHE_PATH, JSON.stringify(cache, null, 2), 'utf8');
@@ -1714,16 +1619,31 @@ async function handle_initialize_wallet(args) {
       return `Failed to save customer data to cache: ${err.message}`;
     }
 
+    // Mirror credentials into the skill env block so getPaymentEnv (and thus
+    // every runClinkCli child) resolves them on later turns.
+    try {
+      const envUpdates = {};
+      if (customerId) envUpdates.CLINK_CUSTOMER_ID = customerId;
+      if (customerAPIKey) envUpdates.CLINK_CUSTOMER_API_KEY = customerAPIKey;
+      if (args.email) envUpdates.CLINK_USER_EMAIL = args.email;
+      if (Object.keys(envUpdates).length) await updatePaymentEnv(envUpdates);
+    } catch (err) {
+      await logError('initialize_wallet/updateEnv', err);
+    }
+
+    // Start the mailbox event pump (idempotent). It replaces the old webhook
+    // receiver + poll fallback as the single async-completion delivery path.
+    ensureEventPumpRunning();
+
     return `Clink 账户 Bootstrap 成功。
 [SYSTEM DIRECTIVE]
-Wallet bootstrap completed for ${args.email}. Customer ID: ${data.customerId}. Generated webhook signkey and saved to config.
+Wallet bootstrap completed for ${args.email}. Customer ID: ${customerId}.
 
 You MUST NOT output ANY text to the user yet.
 You MUST IMMEDIATELY call the "get_binding_link" tool to check for existing payment methods.
 
 After calling "get_binding_link", use the returned Markdown notification content for the current channel.
 If "get_binding_link" returns a DIRECT_SEND system directive, do NOT send any additional markdown or notification in this turn.
-If the cached wallet state says webhookAvailable=false, "get_binding_link" MUST start the poll fallback flow and you MUST continue waiting for that async completion path instead of stopping at WAIT_FOR_WEBHOOK.
 Otherwise, follow its returned notification instruction exactly once.`;
   } catch (err) {
     await logError('initialize_wallet', err);
@@ -1782,7 +1702,7 @@ async function handle_get_binding_link(args = {}) {
             summary: 'Binding notification delivered.',
             pollFallback,
             pollFallbackLines,
-            webhookWaitMessage: 'Wait for the payment_method.added webhook before continuing initialization.',
+            webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when binding completes.',
             suffix: `Extracted Binding Token for future use: ${bindingToken}`,
           });
         } catch (err) {
@@ -1799,7 +1719,7 @@ ${formatNotificationInstruction({
     'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
     ...(pollFallback.required
       ? pollFallbackLines
-      : ['Wait for the payment_method.added webhook before continuing initialization.']),
+      : ['The background event monitor will deliver the payment_method.added notification automatically when binding completes.']),
     '',
     `Extracted Binding Token for future use: ${bindingToken}`,
   ],
@@ -1910,7 +1830,7 @@ async function handle_get_risk_rules_link(args = {}) {
           summary: 'Risk rules link generated.',
           pollFallback,
           pollFallbackLines,
-          webhookWaitMessage: 'Wait for the risk_rule.updated webhook before treating the change as complete.',
+          webhookWaitMessage: 'The background event monitor will deliver the risk_rule.updated notification automatically when the change completes.',
         });
       } catch (err) {
         fallbackReason = 'direct_send_failed';
@@ -1926,7 +1846,7 @@ async function handle_get_risk_rules_link(args = {}) {
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
         ...(pollFallback.required
           ? pollFallbackLines
-          : ['Wait for the risk_rule.updated webhook before treating the change as complete.']),
+          : ['The background event monitor will deliver the risk_rule.updated notification automatically when the change completes.']),
       ],
     });
   } catch (err) {
@@ -1978,7 +1898,7 @@ async function handle_get_payment_method_setup_link(args = {}) {
           summary: 'Payment method setup link generated.',
           pollFallback,
           pollFallbackLines,
-          webhookWaitMessage: 'Wait for the payment_method.added webhook before treating the setup as complete.',
+          webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when setup completes.',
         });
       } catch (err) {
         fallbackReason = 'direct_send_failed';
@@ -1994,7 +1914,7 @@ async function handle_get_payment_method_setup_link(args = {}) {
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
         ...(pollFallback.required
           ? pollFallbackLines
-          : ['Wait for the payment_method.added webhook before treating the setup as complete.']),
+          : ['The background event monitor will deliver the payment_method.added notification automatically when setup completes.']),
       ],
     });
   } catch (err) {
@@ -2048,7 +1968,7 @@ async function handle_get_payment_method_modify_link(args = {}) {
           summary: 'Payment method management link generated.',
           pollFallback,
           pollFallbackLines,
-          webhookWaitMessage: 'Wait for the payment_method.added webhook before treating the change as complete.',
+          webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when the change completes.',
         });
       } catch (err) {
         fallbackReason = 'direct_send_failed';
@@ -2064,7 +1984,7 @@ async function handle_get_payment_method_modify_link(args = {}) {
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
         ...(pollFallback.required
           ? pollFallbackLines
-          : ['Wait for the payment_method.added webhook before treating the change as complete.']),
+          : ['The background event monitor will deliver the payment_method.added notification automatically when the change completes.']),
         '',
         `Current Payment Methods: ${JSON.stringify(methods)}`,
       ],
@@ -2072,101 +1992,6 @@ async function handle_get_payment_method_modify_link(args = {}) {
   } catch (err) {
     await logError('get_payment_method_modify_link', err);
     return `Failed to get payment method modify link: ${err.message}`;
-  }
-}
-
-async function handle_list_payment_methods(args) {
-  if (!args.bindingToken) {
-    return "Requires bindingToken (usually obtained from binding link or session).";
-  }
-  try {
-    const data = await fetchClink('/a/cwallet/card/info', {
-      method: 'GET',
-      headers: { "Authorization": `Bearer ${args.bindingToken}` }
-    });
-    return `Payment Methods for ${data.email}:\n${JSON.stringify(data.paymentMethods, null, 2)}`;
-  } catch (err) {
-    await logError('list_payment_methods', err);
-    return `Failed to list payment methods: ${err.message}`;
-  }
-}
-
-async function handle_get_payment_method_detail(args) {
-  try {
-    const data = await fetchClink(`/a/cwallet/card/detail?paymentInstrumentId=${args.paymentInstrumentId}`, {
-      method: 'GET',
-      headers: { "Authorization": `Bearer ${args.bindingToken}` }
-    });
-    return `${formatNotificationInstruction({
-      summary: 'Payment method detail retrieved.',
-      notifications: createMessageRequest({
-        messageKey: 'payment.method.detail',
-        vars: {
-          cardDisplay: formatPaymentMethodDisplay({
-            paymentMethodType: data.paymentMethodType || data.paymentInstrumentType,
-            cardBrand: data.cardBrand || data.cardScheme,
-            cardLast4: data.cardLast4 || data.cardLastFour,
-            walletAccountTag: data.walletAccountTag || data.wallet?.accountTag,
-          }),
-          billingRegion: data.billingAddressJson?.country || 'N/A',
-        },
-      }),
-      followUp: [`Raw Data: ${JSON.stringify(data)}`],
-    })}`;
-  } catch (err) {
-    await logError('get_payment_method_detail', err);
-    return `Failed to get payment method detail: ${err.message}`;
-  }
-}
-
-async function handle_update_payment_method(args) {
-  try {
-    const data = await fetchClink('/a/cwallet/card/update', {
-      method: 'PUT',
-      headers: { "Authorization": `Bearer ${args.bindingToken}` },
-      body: JSON.stringify({ paymentInstrumentId: args.paymentInstrumentId, billingAddressJson: args.billingAddressJson })
-    });
-    return `Payment method updated successfully: ${data}`;
-  } catch (err) {
-    await logError('update_payment_method', err);
-    return `Failed to update payment method: ${err.message}`;
-  }
-}
-
-async function handle_delete_payment_method(args) {
-  try {
-    const data = await fetchClink('/a/cwallet/card/delete', {
-      method: 'DELETE',
-      headers: { "Authorization": `Bearer ${args.bindingToken}` },
-      body: JSON.stringify({ paymentInstrumentId: args.paymentInstrumentId })
-    });
-    return `Payment method deleted successfully: ${data}`;
-  } catch (err) {
-    await logError('delete_payment_method', err);
-    return `Failed to delete payment method: ${err.message}`;
-  }
-}
-
-async function handle_set_default_payment_method(args) {
-  try {
-    const requestPayload = { paymentInstrumentId: args.paymentInstrumentId };
-    const data = await fetchClink('/a/cwallet/card/setDefault', {
-      method: 'PUT',
-      headers: { "Authorization": `Bearer ${args.bindingToken}` },
-      body: JSON.stringify(requestPayload)
-    });
-    await logRequest('set_default_payment_method', requestPayload, data);
-    return `${formatNotificationInstruction({
-      summary: 'Payment method set as default successfully.',
-      notifications: createMessageRequest({ messageKey: 'payment.method.default_updated' }),
-      followUp: [
-        'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-        `Raw Data: ${data}`,
-      ],
-    })}`;
-  } catch (err) {
-    await logError('set_default_payment_method', err);
-    return `Failed to set default payment method: ${err.message}`;
   }
 }
 
@@ -2306,22 +2131,24 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
   }
 
   const timestamp = Date.now().toString();
-  const chargeBody = { paymentInstrumentId: piId, paymentMethodType: pmType };
-
+  // --no-watch: the event pump is the single mailbox consumer. Without it, a 3DS
+  // redirect would make the CLI long-poll the mailbox (up to 15 min) and block.
+  const payArgs = ['pay', '--no-watch', '--payment-instrument-id', piId, '--payment-method-type', pmType];
   if (args.sessionId) {
-    chargeBody.sessionId = args.sessionId;
+    payArgs.push('--session-id', String(args.sessionId));
   } else {
-    chargeBody.merchantId = args.merchant_id;
-    chargeBody.customAmount = args.amount;
-    chargeBody.paymentCurrency = args.currency || "USD";
+    payArgs.push('--merchant-id', String(args.merchant_id));
+    payArgs.push('--amount', String(args.amount));
+    payArgs.push('--currency', args.currency || 'USD');
+  }
+  if (args.purchaseInstructionId) {
+    payArgs.push('--purchase-instruction-id', String(args.purchaseInstructionId));
   }
 
   try {
-    const data = await fetchClink('/agent/order/charge', {
-      method: 'POST',
-      headers: { "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY, "X-Timestamp": timestamp },
-      body: JSON.stringify(chargeBody)
-    });
+    // clink-cli pay exits 7 on a 3-D Secure redirect but still returns the
+    // charge data on stdout; runClinkCli returns that data regardless of exit code.
+    const data = await runClinkCli(payArgs);
 
     const cache = normalizeCache(await readPaymentMethodsCache() || {});
     const notifyDestination = getNotifyDestination(cache);
@@ -2362,7 +2189,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
         }),
         followUp: [
           'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-          'Do NOT continue until the webhook confirms agent_order.succeeded or agent_order.failed.',
+          'Do NOT continue until the background event monitor reports agent_order.succeeded or agent_order.failed.',
         ],
       });
     }
@@ -2454,7 +2281,7 @@ The payment success notification has already been sent to the user.
 Immediate merchant recharge confirmation handoff failed in the background.
 Do NOT send any additional notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker again in this turn.
-Wait for the later async webhook to retry the merchant confirmation and original-task resume flow.`;
+The background event monitor will retry the merchant confirmation and original-task resume flow when agent_order.succeeded arrives.`;
         }
 
         if (sendResult === 'already_completed') {
@@ -2474,7 +2301,7 @@ Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
 Direct notification delivery failed, so do NOT send any fallback notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
-Wait for the later async webhook to continue the merchant confirmation and original-task resume flow.`;
+The background event monitor will continue the merchant confirmation and original-task resume flow when agent_order.succeeded arrives.`;
       }
     }
 
@@ -2535,10 +2362,10 @@ Do NOT send any intermediate "处理中" notification to the user for this state
 Do not send any extra notification in this turn. A brief natural-language reply is fine if helpful.
 Do NOT ask the user any question.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
-The merchant-side recharge confirmation and original-task resume must be driven by the payment-layer success handoff that owns this order. For pending / 3DS flows, wait for the later async webhook wake for payment/agent_order.succeeded.`;
+The merchant-side recharge confirmation and original-task resume must be driven by the payment-layer success handoff that owns this order. For pending / 3DS flows, the background event monitor delivers agent_order.succeeded when it arrives.`;
   } catch (err) {
     await logError('clink_pay', err);
-    const code = err instanceof ClinkApiError ? err.code : null;
+    const code = err instanceof ClinkCliError ? err.code : null;
     const currency = args.currency || "USD";
     const amt = formatAmountWithCurrency(args.amount, currency);
 
@@ -2598,7 +2425,7 @@ The merchant-side recharge confirmation and original-task resume must be driven 
         }),
         followUp: [
           'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-          'Wait for the previous order to complete via webhook callback.',
+          'Wait for the previous order to complete via the background event monitor.',
         ],
       });
     }
@@ -2766,20 +2593,10 @@ async function handle_clink_refund(args) {
     return "Wallet not initialized. Please run initialize_wallet first.";
   }
 
-  const timestamp = Date.now().toString();
-  const refundBody = {
-    orderId,
-  };
+  const refundBody = { orderId };
 
   try {
-    const data = await fetchClink('/agent/cwallet/refund/apply', {
-      method: 'POST',
-      headers: {
-        "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-        "X-Timestamp": timestamp,
-      },
-      body: JSON.stringify(refundBody),
-    });
+    const data = await runClinkCli(['refund', 'create', '--order-id', String(orderId)]);
     await logRequest('clink_refund', refundBody, data);
     const refundId = data.refundOrderId || "N/A";
     const responseOrderId = data.orderId || orderId;
@@ -2814,7 +2631,7 @@ async function handle_clink_refund(args) {
         sendNotificationDirect(notifyDestination, notification);
         return `[SYSTEM DIRECTIVE] DIRECT_SEND: Refund application submitted successfully.
 The notification has been sent. Do NOT send another card.
-Wait for the later refund webhook to deliver the final success/failure notification. The refund remains pending manual review/processing until the user explicitly asks to query its status.`;
+The background event monitor will deliver the final refund success/failure notification. The refund remains pending manual review/processing until the user explicitly asks to query its status.`;
       } catch (sendErr) {
         fallbackReason = 'direct_send_failed';
         await logError('clink_refund/direct_send', sendErr);
@@ -2829,14 +2646,14 @@ Wait for the later refund webhook to deliver the final success/failure notificat
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
         'Do NOT restate the refund details verbatim in natural language.',
         'Do NOT send this submission notification more than once for the same tool result.',
-        'Wait for the later refund webhook to deliver the final success/failure notification.',
+        'The background event monitor will deliver the final refund success/failure notification.',
         'Do NOT auto-start refund status polling. Query get_refund_status only when the user explicitly asks about refund progress/status.',
       ],
     });
   } catch (err) {
     await logError('clink_refund', err);
-    const code = err instanceof ClinkApiError ? err.code : null;
-    const failureReason = err instanceof ClinkApiError
+    const code = err instanceof ClinkCliError ? err.code : null;
+    const failureReason = err instanceof ClinkCliError
       ? (err.raw?.msg || err.message || "退款申请失败")
       : err.message;
     const failureDescription = code === 90101401
@@ -2909,15 +2726,8 @@ async function handle_get_refund_status(args) {
     return "Wallet not initialized. Please run initialize_wallet first.";
   }
 
-  const timestamp = Date.now().toString();
   try {
-    const data = await fetchClink(`/agent/cwallet/refund/${encodeURIComponent(refundOrderId)}`, {
-      method: 'GET',
-      headers: {
-        "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-        "X-Timestamp": timestamp,
-      },
-    });
+    const data = await runClinkCli(['refund', 'get', '--refund-id', String(refundOrderId)]);
     await logRequest('get_refund_status', { refundOrderId }, data);
 
     const notification = buildRefundStatusNotification(data);
@@ -2947,8 +2757,8 @@ The notification has been sent. Do NOT send another card.`;
     });
   } catch (err) {
     await logError('get_refund_status', err);
-    const code = err instanceof ClinkApiError ? err.code : null;
-    const reason = err instanceof ClinkApiError
+    const code = err instanceof ClinkCliError ? err.code : null;
+    const reason = err instanceof ClinkCliError
       ? (err.raw?.msg || err.message || '退款状态查询失败')
       : err.message;
     const description = code === 71160007
@@ -2977,22 +2787,6 @@ The notification has been sent. Do NOT send another card.`;
 // ------------------------------------------------------------------
 // VIC PURCHASE INSTRUCTION (agentic authorization)
 // ------------------------------------------------------------------
-async function fetchInstruction(endpoint, method, bodyObj) {
-  const env = await getPaymentEnv();
-  if (!env.CLINK_CUSTOMER_API_KEY) {
-    throw new Error("Wallet not initialized. Please run initialize_wallet first.");
-  }
-  // Instruction endpoints authenticate by customer API key only (no X-Customer-ID).
-  return fetchClink(endpoint, {
-    method,
-    headers: {
-      "X-Customer-API-Key": env.CLINK_CUSTOMER_API_KEY,
-      "X-Timestamp": Date.now().toString(),
-    },
-    body: bodyObj !== undefined ? JSON.stringify(bodyObj) : undefined,
-  });
-}
-
 async function resolveSelectedPaymentMethod(paymentInstrumentId = null) {
   const cache = normalizeCache(await readPaymentMethodsCache() || {});
   let methods = normalizePaymentMethods(cache.paymentMethods || []);
@@ -3213,8 +3007,11 @@ ${vicGate.response}`;
     }
 
     const paymentInstrumentId = vicGate.paymentMethod?.paymentInstrumentId || selectedMethod.paymentInstrumentId;
-    const endpoint = `/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=${encodeURIComponent(paymentInstrumentId)}`;
-    const activeInstructions = await fetchInstruction(endpoint, 'GET');
+    const activeInstructions = await runClinkCli([
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', paymentInstrumentId,
+    ]);
     await logRequest('prepare_visa_purchase_instruction/list_active', { status: 'ACTIVE', paymentInstrumentId }, activeInstructions);
 
     const reusableInstruction = findReusablePurchaseInstruction(activeInstructions, {
@@ -3282,10 +3079,21 @@ async function createPurchaseInstructionDraft(args = {}) {
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
-    const data = await fetchInstruction('/agent/cwallet/instructions', 'POST', body);
+    const createArgs = [
+      'instruction', 'create',
+      '--payment-instrument-id', body.paymentInstrumentId,
+      '--title', body.title,
+      '--mandates', JSON.stringify(body.mandates),
+    ];
+    if (body.description !== undefined) createArgs.push('--description', String(body.description));
+    if (body.effectiveUntilTime !== undefined) createArgs.push('--effective-until-time', String(body.effectiveUntilTime));
+    if (body.extra !== undefined) createArgs.push('--extra', JSON.stringify(body.extra));
+    if (body.isRecurring) createArgs.push('--is-recurring');
+    if (body.shippingAddress !== undefined) createArgs.push('--shipping-address', JSON.stringify(body.shippingAddress));
+    const data = await runClinkCli(createArgs);
     await logRequest('create_purchase_instruction', body, data);
     if (!data?.instructionId) {
-      return `Purchase instruction created, but the response did not include instructionId. It is NOT usable until you call sign_purchase_instruction with the user's Passkey result.\nRaw Data: ${JSON.stringify(data)}`;
+      return `Purchase instruction created, but the response did not include instructionId. It is NOT usable until the user completes the Passkey authorization on the page.\nRaw Data: ${JSON.stringify(data)}`;
     }
 
     try {
@@ -3352,32 +3160,12 @@ async function createPurchaseInstructionDraft(args = {}) {
   }
 }
 
-async function handle_sign_purchase_instruction(args = {}) {
-  if (!args.instructionId) return "ERROR: sign_purchase_instruction requires 'instructionId'.";
-  if (!args.appInstance || typeof args.appInstance !== 'object') return "ERROR: sign_purchase_instruction requires 'appInstance'.";
-  if (!args.authResult || typeof args.authResult !== 'object') return "ERROR: sign_purchase_instruction requires 'authResult' from the front-end Passkey flow.";
-
-  const body = { appInstance: args.appInstance, authResult: args.authResult };
-  if (args.extra !== undefined) body.extra = args.extra;
-
-  try {
-    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}/sign`, 'POST', body);
-    // Never log authResult — it carries fidoBlob.
-    await logRequest('sign_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
-    return `Purchase instruction signed (now ACTIVE). The VIC payment entry and request field are pending backend confirmation.\nRaw Data: ${JSON.stringify(data)}`;
-  } catch (err) {
-    await logError('sign_purchase_instruction', err);
-    return `Failed to sign purchase instruction: ${err.message}`;
-  }
-}
-
 async function handle_list_purchase_instructions(args = {}) {
-  const params = new URLSearchParams();
-  if (args.status) params.set('status', args.status);
-  if (args.paymentInstrumentId) params.set('paymentInstrumentId', args.paymentInstrumentId);
-  const qs = params.toString() ? `?${params.toString()}` : '';
+  const listArgs = ['instruction', 'list'];
+  if (args.status) listArgs.push('--status', String(args.status));
+  if (args.paymentInstrumentId) listArgs.push('--payment-instrument-id', String(args.paymentInstrumentId));
   try {
-    const data = await fetchInstruction(`/agent/cwallet/instructions${qs}`, 'GET');
+    const data = await runClinkCli(listArgs);
     const lines = [`Purchase instructions:\n${JSON.stringify(data, null, 2)}`];
     if (args.status === 'ACTIVE' && args.paymentInstrumentId && Array.isArray(data) && data.length === 0) {
       lines.push(`[SYSTEM DIRECTIVE] No matching ACTIVE purchase instruction was returned for paymentInstrumentId=${args.paymentInstrumentId}.
@@ -3392,10 +3180,21 @@ Do NOT ask for a payment link, payment URL,代付链接, Session ID, or tell the
 }
 
 async function handle_get_purchase_instruction_manage_link(args = {}) {
+  // Derive the agent-page origin from the backend-issued bindingUrl so it always
+  // matches whatever environment the CLI actually talked to (env / CLI config /
+  // default), with no skill-side base-URL configuration.
+  let manageUrl;
+  try {
+    const { bindingUrl } = await resolvePurchaseInstructionBindingUrl();
+    manageUrl = buildBareDomainUrl(bindingUrl);
+  } catch (err) {
+    await logError('get_purchase_instruction_manage_link/resolveUrl', err);
+    return `Failed to resolve the authorization management link: ${err.message}`;
+  }
   const notification = createMessageRequest({
     messageKey: 'payment.purchase_instruction_manage_link',
     vars: {
-      manageUrl: PURCHASE_INSTRUCTION_MANAGE_URL,
+      manageUrl,
     },
   });
 
@@ -3441,64 +3240,7 @@ async function handle_get_purchase_instruction_manage_link(args = {}) {
   }
 }
 
-async function handle_get_purchase_instruction(args = {}) {
-  if (!args.instructionId) return "ERROR: get_purchase_instruction requires 'instructionId'.";
-  try {
-    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'GET');
-    return `Purchase instruction detail:\n${JSON.stringify(data, null, 2)}`;
-  } catch (err) {
-    await logError('get_purchase_instruction', err);
-    return `Failed to get purchase instruction: ${err.message}`;
-  }
-}
-
-async function handle_update_purchase_instruction(args = {}) {
-  if (!args.instructionId) return "ERROR: update_purchase_instruction requires 'instructionId'.";
-  if (!args.paymentInstrumentId || !args.title || !Array.isArray(args.mandates) || args.mandates.length === 0) {
-    return "ERROR: update_purchase_instruction is a full update; it requires 'paymentInstrumentId', 'title', and a non-empty 'mandates' array.";
-  }
-  if (!args.appInstance || !args.authResult) return "ERROR: update_purchase_instruction requires fresh 'appInstance' and 'authResult' (re-authentication).";
-
-  const body = {
-    paymentInstrumentId: args.paymentInstrumentId,
-    title: args.title,
-    mandates: args.mandates,
-    appInstance: args.appInstance,
-    authResult: args.authResult,
-  };
-  if (args.description !== undefined) body.description = args.description;
-  if (args.effectiveUntilTime !== undefined) body.effectiveUntilTime = args.effectiveUntilTime;
-  if (args.extra !== undefined) body.extra = args.extra;
-
-  try {
-    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}`, 'PUT', body);
-    await logRequest('update_purchase_instruction', { ...body, authResult: '[REDACTED]' }, data);
-    return `Purchase instruction updated.\nRaw Data: ${JSON.stringify(data)}`;
-  } catch (err) {
-    await logError('update_purchase_instruction', err);
-    return `Failed to update purchase instruction: ${err.message}`;
-  }
-}
-
-async function handle_cancel_purchase_instruction(args = {}) {
-  if (!args.instructionId) return "ERROR: cancel_purchase_instruction requires 'instructionId'.";
-  if (!args.appInstance || !args.authResult) return "ERROR: cancel_purchase_instruction requires 'appInstance' and 'authResult'.";
-
-  const body = { authResult: args.authResult, appInstance: args.appInstance };
-  try {
-    const data = await fetchInstruction(`/agent/cwallet/instructions/${encodeURIComponent(args.instructionId)}/cancel`, 'POST', body);
-    await logRequest('cancel_purchase_instruction', { instructionId: args.instructionId, appInstance: args.appInstance, authResult: '[REDACTED]' }, data);
-    return `Purchase instruction cancelled.\nRaw Data: ${JSON.stringify(data)}`;
-  } catch (err) {
-    await logError('cancel_purchase_instruction', err);
-    return `Failed to cancel purchase instruction: ${err.message}`;
-  }
-}
-
 async function handle_install_system_hooks(args) {
-  const skillDir = SKILL_DIR;
-  const hooksTarget = path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.mjs');
-
   let userEmail = "";
   try {
     const cache = await readPaymentMethodsCache();
@@ -3516,53 +3258,17 @@ async function handle_install_system_hooks(args) {
   }
 
   try {
-    await fs.mkdir(path.dirname(hooksTarget), { recursive: true });
-    await fs.writeFile(hooksTarget, await renderWebhookModule(skillDir), 'utf8');
-    await fs.unlink(path.join(OPENCLAW_DIR, 'hooks', 'transforms', 'my_payment_webhook.js')).catch(() => {});
+    const cache = await readPaymentMethodsCache() || {};
+    cache.notifyDestination = notifyDestination;
+    await writePaymentMethodsCache(cache);
   } catch (err) {
-    await logError('install_system_hooks/copyWebhook', err);
-    return `[SYSTEM DIRECTIVE] Installation FAILED at step 1 (copy webhook file): ${err.message}`;
+    await logError('install_system_hooks/saveNotifyDestination', err);
+    return `[SYSTEM DIRECTIVE] Installation FAILED (save notify destination): ${err.message}`;
   }
 
-  try {
-    const config = await loadConfig();
-    config.hooks = config.hooks || {};
-    config.hooks.mappings = config.hooks.mappings || [];
-
-    let changed = false;
-    if (!config.hooks.enabled) { config.hooks.enabled = true; changed = true; }
-
-    // Pre-generate hooks.token if not already set — initialize_wallet will reuse this
-    if (!config.hooks.token) {
-      config.hooks.token = crypto.randomBytes(32).toString('hex');
-      changed = true;
-    }
-
-    const CLINK_PATH = "/clink/payment";
-    config.hooks.mappings = config.hooks.mappings.filter(
-      m => m.transform?.module !== "my_payment_webhook.js"
-    );
-    const newMapping = { match: { path: CLINK_PATH }, transform: { module: "my_payment_webhook.mjs" } };
-    const alreadyExists = config.hooks.mappings.some(
-      m => m.transform?.module === "my_payment_webhook.mjs"
-    );
-    if (!alreadyExists) { config.hooks.mappings.push(newMapping); changed = true; }
-    if (changed) await saveConfig(config);
-  } catch (err) {
-    await logError('install_system_hooks/injectConfig', err);
-    return `[SYSTEM DIRECTIVE] Installation FAILED at step 2 (inject config): ${err.message}`;
-  }
-
-  if (notifyDestination) {
-    try {
-      const cache = await readPaymentMethodsCache() || {};
-      cache.notifyDestination = notifyDestination;
-      await writePaymentMethodsCache(cache);
-    } catch (err) {
-      await logError('install_system_hooks/saveNotifyDestination', err);
-      return `[SYSTEM DIRECTIVE] Installation FAILED at step 2.5 (save notify destination): ${err.message}`;
-    }
-  }
+  // Async completion notifications are delivered by the mailbox event pump.
+  // No webhook hook transform or /clink/payment route is installed anymore.
+  ensureEventPumpRunning();
 
   const statusNotification = createMessageRequest({
     messageKey: 'install.success',
@@ -3581,9 +3287,7 @@ async function handle_install_system_hooks(args) {
     await logError('install_system_hooks/sendInitialNotification', err);
   }
 
-  const { spawn } = await import('child_process');
   const openclawBin = resolveOpenClawExecutable();
-
   const restartChild = spawn('sh', ['-c', `sleep 3 && ${shellQuote(openclawBin)} gateway restart`], { detached: true, stdio: 'ignore' });
   restartChild.unref();
 
@@ -3593,7 +3297,7 @@ async function handle_install_system_hooks(args) {
 [SYSTEM DIRECTIVE] The installation success notification was already sent directly. Do NOT send it again. The user may reply with their email immediately; if the gateway is still restarting, they can retry a few seconds later.`;
   }
 
-  return `SUCCESS: Webhook config updated. Gateway restart scheduled.
+  return `SUCCESS: Installation completed. Gateway restart scheduled.
 
 ${formatNotificationInstruction({
   summary: 'Installation bootstrap completed.',
@@ -3685,6 +3389,15 @@ async function handle_uninstall_system_hooks(args) {
     results.push(err.code === 'ENOENT' ? "Skill cache: already absent ✓" : `Skill cache: FAILED to remove — ${err.message}`);
   }
 
+  // Removing the cache leaves the event pump without credentials, so it self-exits
+  // on its next cycle. Clear its lock so a fresh install can start cleanly.
+  try {
+    await fs.unlink(path.join(LOCK_DIR, 'event-pump.lock'));
+    results.push("Event pump lock: cleared ✓");
+  } catch (err) {
+    if (err?.code !== 'ENOENT') await logError('uninstall_system_hooks/eventPumpLock', err);
+  }
+
   for (const script of ['clink_notify.mjs', 'clink_uninstall_notify.mjs']) {
     try { await fs.unlink(path.join(OPENCLAW_DIR, 'cache', script)); } catch (err) { await logError('uninstall_system_hooks', err); }
   }
@@ -3770,7 +3483,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: "initialize_wallet",
-      description: "Run once per user. Generates signature key, calls Clink bootstrap API, and sets up webhook.",
+      description: "Run once per user. Calls the Clink wallet bootstrap via clink-cli, persists credentials, and starts the mailbox event pump.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3840,39 +3553,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         }
       }
-    },
-    {
-      name: "list_payment_methods",
-      description: "List all payment methods bound to the user's wallet. Requires a valid binding token.",
-      inputSchema: { type: "object", properties: { bindingToken: { type: "string", description: "JWT token from the binding link flow" } }, required: ["bindingToken"] }
-    },
-    {
-      name: "get_payment_method_detail",
-      description: "Get detailed information about a specific payment method.",
-      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
-    },
-    {
-      name: "update_payment_method",
-      description: "Update the billing address of a specific payment method.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          bindingToken: { type: "string" },
-          paymentInstrumentId: { type: "string" },
-          billingAddressJson: { type: "object", properties: { country: { type: "string" }, city: { type: "string" }, line1: { type: "string" }, line2: { type: "string" }, postalCode: { type: "string" }, region: { type: "string" } } }
-        },
-        required: ["bindingToken", "paymentInstrumentId", "billingAddressJson"]
-      }
-    },
-    {
-      name: "delete_payment_method",
-      description: "Delete a specific payment method from the wallet.",
-      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
-    },
-    {
-      name: "set_default_payment_method",
-      description: "Set a specific payment method as the default for future transactions.",
-      inputSchema: { type: "object", properties: { bindingToken: { type: "string" }, paymentInstrumentId: { type: "string" } }, required: ["bindingToken", "paymentInstrumentId"] }
     },
     {
       name: "pre_check_account",
@@ -3976,20 +3656,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
-      name: "sign_purchase_instruction",
-      description: "VIC: submit the user's Passkey/FIDO result and app/device context to activate a purchase instruction (status CREATED -> ACTIVE). The instructionId comes from prepare_visa_purchase_instruction state=CREATED_DRAFT or a reused ACTIVE instruction. authResult/appInstance come from the front-end Passkey flow — never fabricate them.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          instructionId: { type: "string", description: "Local instruction ID from prepare_visa_purchase_instruction" },
-          appInstance: { type: "object", description: "Visa app/device context, e.g. { deviceData: { type, brand, model, manufacturer }, userAgent, clientDeviceId }" },
-          authResult: { type: "object", description: "FIDO/DFP result, e.g. { identifier, fidoBlob, dfpSessionId }" },
-          extra: { type: "object", description: "Optional extra fields" }
-        },
-        required: ["instructionId", "appInstance", "authResult"]
-      }
-    },
-    {
       name: "list_purchase_instructions",
       description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft.",
       inputSchema: {
@@ -4002,7 +3668,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_purchase_instruction_manage_link",
-      description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link https://uat-agent.clinkbill.com. Feishu renders this as a button; other channels receive a link.",
+      description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link (the agent origin derived from the configured Clink environment, e.g. https://agent.clinkbill.com in production or https://test-agent.clinkbill.com in sandbox). Feishu renders this as a button; other channels receive a link.",
       inputSchema: {
         type: "object",
         properties: {
@@ -4011,49 +3677,6 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
           locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         }
-      }
-    },
-    {
-      name: "get_purchase_instruction",
-      description: "VIC backend API: get a single purchase instruction by instructionId. For user requests to view/manage authorization, prefer get_purchase_instruction_manage_link.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          instructionId: { type: "string", description: "Local instruction ID" }
-        },
-        required: ["instructionId"]
-      }
-    },
-    {
-      name: "update_purchase_instruction",
-      description: "VIC backend API: full update of a purchase instruction. Requires re-authentication (fresh appInstance + authResult) and the complete instruction fields + mandates. For user requests to modify authorization, prefer get_purchase_instruction_manage_link.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          instructionId: { type: "string" },
-          paymentInstrumentId: { type: "string" },
-          title: { type: "string" },
-          description: { type: "string" },
-          effectiveUntilTime: { type: "string", description: "UTC string \"yyyy-MM-dd HH:mm:ss\"" },
-          mandates: { type: "array" },
-          appInstance: { type: "object" },
-          authResult: { type: "object" },
-          extra: { type: "object" }
-        },
-        required: ["instructionId", "paymentInstrumentId", "title", "mandates", "appInstance", "authResult"]
-      }
-    },
-    {
-      name: "cancel_purchase_instruction",
-      description: "VIC backend API: cancel a purchase instruction. Requires appInstance + authResult. For user requests to cancel authorization, prefer get_purchase_instruction_manage_link.",
-      inputSchema: {
-        type: "object",
-        properties: {
-          instructionId: { type: "string" },
-          appInstance: { type: "object" },
-          authResult: { type: "object" }
-        },
-        required: ["instructionId", "appInstance", "authResult"]
       }
     },
     {
@@ -4072,7 +3695,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "uninstall_system_hooks",
-      description: "卸载 Clink Payment Skill：清除 webhook、配置、skill 目录，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
+      description: "卸载 Clink Payment Skill：清除事件轮询器（event pump）、遗留 webhook 配置、skill 配置与缓存，并在后台延迟 3 秒重启网关。必须在用户输入文字授权后才能调用。",
       inputSchema: {
         type: "object",
         properties: {
@@ -4098,22 +3721,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_risk_rules_link":           result = await handle_get_risk_rules_link(args); break;
       case "get_payment_method_setup_link": result = await handle_get_payment_method_setup_link(args); break;
       case "get_payment_method_modify_link":result = await handle_get_payment_method_modify_link(args); break;
-      case "list_payment_methods":          result = await handle_list_payment_methods(args); break;
-      case "get_payment_method_detail":     result = await handle_get_payment_method_detail(args); break;
-      case "update_payment_method":         result = await handle_update_payment_method(args); break;
-      case "delete_payment_method":         result = await handle_delete_payment_method(args); break;
-      case "set_default_payment_method":    result = await handle_set_default_payment_method(args); break;
       case "pre_check_account":             result = await handle_pre_check_account(); break;
       case "clink_pay":                     result = await handle_clink_pay(args); break;
       case "clink_refund":                  result = await handle_clink_refund(args); break;
       case "get_refund_status":             result = await handle_get_refund_status(args); break;
       case "prepare_visa_purchase_instruction": result = await handle_prepare_visa_purchase_instruction(args); break;
-      case "sign_purchase_instruction":     result = await handle_sign_purchase_instruction(args); break;
       case "list_purchase_instructions":    result = await handle_list_purchase_instructions(args); break;
       case "get_purchase_instruction_manage_link": result = await handle_get_purchase_instruction_manage_link(args); break;
-      case "get_purchase_instruction":      result = await handle_get_purchase_instruction(args); break;
-      case "update_purchase_instruction":   result = await handle_update_purchase_instruction(args); break;
-      case "cancel_purchase_instruction":   result = await handle_cancel_purchase_instruction(args); break;
       case "install_system_hooks":          result = await handle_install_system_hooks(args); break;
       case "uninstall_system_hooks":        result = await handle_uninstall_system_hooks(args); break;
       default: throw new Error(`Unknown tool: ${name}`);

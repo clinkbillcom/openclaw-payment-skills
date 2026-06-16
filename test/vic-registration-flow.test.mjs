@@ -14,11 +14,8 @@ import {
 } from '../notification-utils.js';
 
 const indexSource = await fs.readFile(new URL('../index.mjs', import.meta.url), 'utf8');
-const webhookSource = await fs.readFile(new URL('../hooks/my_payment_webhook.mjs', import.meta.url), 'utf8');
-const pollSource = await fs.readFile(new URL('../scripts/poll-fallback.mjs', import.meta.url), 'utf8');
 const notificationSource = await fs.readFile(new URL('../notification-utils.js', import.meta.url), 'utf8');
 const skillSource = await fs.readFile(new URL('../SKILL.md', import.meta.url), 'utf8');
-const configSource = await fs.readFile(new URL('../config.mjs', import.meta.url), 'utf8');
 
 function sliceBetween(source, startNeedle, endNeedle) {
   const start = source.indexOf(startNeedle);
@@ -73,10 +70,10 @@ function buildCreatePurchaseInstructionDraftHarness() {
     function formatPaymentMethodDisplay(method) {
       return [method.cardBrand || method.paymentMethodType || 'CARD', method.cardLast4 || ''].filter(Boolean).join(' ');
     }
-    async function fetchInstruction(...args) { return globalThis.fetchInstruction(...args); }
+    async function runClinkCli(...args) { return globalThis.runClinkCli(...args); }
     async function logRequest(...args) { return globalThis.logRequest(...args); }
     async function logError(...args) { return globalThis.logError(...args); }
-    async function resolvePurchaseInstructionBindingUrl() { return { bindingUrl: 'https://uat-agent.clinkbill.com/bind', cache: {} }; }
+    async function resolvePurchaseInstructionBindingUrl() { return { bindingUrl: 'https://test-agent.clinkbill.com/bind', cache: {} }; }
     function getNotifyDestination() { return null; }
     async function writePaymentMethodsCache() {}
     function sendNotificationDirect() { throw new Error('direct send should not run'); }
@@ -142,23 +139,11 @@ test('normalizes payment methods with visaRegistrationSucceeded only and without
     'function normalizePaymentMethods(methods) {',
     'function normalizeRuleSettings(settings) {',
   );
-  const pollNormalizer = sliceBetween(
-    pollSource,
-    'function normalizePaymentMethods(methods) {',
-    'function paymentMethodIdentity(method) {',
-  );
-  const webhookMapper = sliceBetween(
-    webhookSource,
-    'function toCachedPaymentMethod(data, paymentInstrumentId) {',
-    'function getRefundMeta(data) {',
-  );
 
-  for (const source of [indexNormalizer, pollNormalizer, webhookMapper]) {
-    assert.match(source, /visaRegistrationSucceeded/);
-    assert.doesNotMatch(source, /is_vic/);
-    assert.doesNotMatch(source, /vicReadiness/);
-    assert.doesNotMatch(source, /vicReadinessReason/);
-  }
+  assert.match(indexNormalizer, /visaRegistrationSucceeded/);
+  assert.doesNotMatch(indexNormalizer, /is_vic/);
+  assert.doesNotMatch(indexNormalizer, /vicReadiness/);
+  assert.doesNotMatch(indexNormalizer, /vicReadinessReason/);
 });
 
 test('clink_pay routes Visa cards through VIC gates before charging', () => {
@@ -172,8 +157,8 @@ test('clink_pay routes Visa cards through VIC gates before charging', () => {
   assert.match(indexSource, /payment\.vic_registration_required/);
   assert.match(indexSource, /VIC purchase instruction flow/);
   assert.ok(
-    handler.indexOf('ensureVisaVicReadyForUse') < handler.indexOf("fetchClink('/agent/order/charge'"),
-    'VIC registration check must run before /agent/order/charge',
+    handler.indexOf('ensureVisaVicReadyForUse') < handler.indexOf('runClinkCli(payArgs)'),
+    'VIC registration check must run before runClinkCli(payArgs)',
   );
 });
 
@@ -206,7 +191,6 @@ test('VIC gate uses registration state before sending duplicate registration not
 test('builds passkey-auth registration links from paymentInstrumentId', () => {
   assert.match(indexSource, /function buildVicRegistrationUrl/);
   assert.match(indexSource, /passkey-auth\/\$\{encodeURIComponent\(paymentInstrumentId\)\}\?type=visa/);
-  assert.match(indexSource, /ensureRequiredPollFallback\(\s*'vic_registration'/);
 });
 
 test('VIC registration notification exists and uses passkeyUrl', () => {
@@ -260,10 +244,23 @@ test('purchase instruction draft auth notification includes the requested instru
   };
   let fallbackMessage = null;
 
-  globalThis.fetchInstruction = async (endpoint, method, body) => {
-    assert.equal(endpoint, '/agent/cwallet/instructions');
-    assert.equal(method, 'POST');
-    assert.deepEqual(body, requestBody);
+  globalThis.runClinkCli = async (cliArgs) => {
+    assert.equal(cliArgs[0], 'instruction');
+    assert.equal(cliArgs[1], 'create');
+    assert.ok(cliArgs.includes('--payment-instrument-id'));
+    assert.equal(cliArgs[cliArgs.indexOf('--payment-instrument-id') + 1], 'cpi_9031');
+    assert.ok(cliArgs.includes('--title'));
+    assert.equal(cliArgs[cliArgs.indexOf('--title') + 1], requestBody.title);
+    assert.ok(cliArgs.includes('--mandates'));
+    assert.deepEqual(
+      JSON.parse(cliArgs[cliArgs.indexOf('--mandates') + 1]),
+      requestBody.mandates,
+    );
+    assert.ok(cliArgs.includes('--description'));
+    assert.equal(cliArgs[cliArgs.indexOf('--description') + 1], requestBody.description);
+    assert.ok(cliArgs.includes('--effective-until-time'));
+    assert.equal(cliArgs[cliArgs.indexOf('--effective-until-time') + 1], requestBody.effectiveUntilTime);
+    assert.ok(!cliArgs.includes('--shipping-address'));
     return {
       instructionId: 'inst_hotel',
       paymentInstrumentId: 'cpi_9031',
@@ -290,7 +287,7 @@ test('purchase instruction draft auth notification includes the requested instru
     assert.deepEqual(result.notifications.vars.mandates, requestBody.mandates);
     assert.deepEqual(fallbackMessage, result.notifications);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.logRequest;
     delete globalThis.logError;
     delete globalThis.logNotificationFallback;
@@ -327,10 +324,19 @@ test('purchase instruction draft creation passes US shipping address for deliver
     fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
   };
 
-  globalThis.fetchInstruction = async (endpoint, method, body) => {
-    assert.equal(endpoint, '/agent/cwallet/instructions');
-    assert.equal(method, 'POST');
-    assert.deepEqual(body, requestBody);
+  globalThis.runClinkCli = async (cliArgs) => {
+    assert.equal(cliArgs[0], 'instruction');
+    assert.equal(cliArgs[1], 'create');
+    assert.ok(cliArgs.includes('--shipping-address'));
+    assert.deepEqual(
+      JSON.parse(cliArgs[cliArgs.indexOf('--shipping-address') + 1]),
+      requestBody.shippingAddress,
+    );
+    assert.ok(cliArgs.includes('--mandates'));
+    assert.deepEqual(
+      JSON.parse(cliArgs[cliArgs.indexOf('--mandates') + 1]),
+      requestBody.mandates,
+    );
     return {
       instructionId: 'inst_goods',
       paymentInstrumentId: 'cpi_9031',
@@ -349,7 +355,7 @@ test('purchase instruction draft creation passes US shipping address for deliver
 
     assert.deepEqual(result.notifications.vars.shippingAddress, requestBody.shippingAddress);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.logRequest;
     delete globalThis.logError;
     delete globalThis.logNotificationFallback;
@@ -367,7 +373,7 @@ test('purchase instruction authorization card renders mandate amount and merchan
       title: '全季酒店住宿预订',
       description: '明天入住，离上海迪士尼最近且交通方便',
       effectiveUntilTime: '2026-06-10T23:59:59Z',
-      passkeyUrl: 'https://uat-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_hotel',
+      passkeyUrl: 'https://test-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_hotel',
       mandates: [{
         title: 'Hotel Booking',
         description: 'Booking for Ji Hotel near Shanghai Disney',
@@ -400,7 +406,7 @@ test('purchase instruction authorization card renders shipping address', () => {
       instructionId: 'inst_goods',
       cardDisplay: 'VISA 9031',
       title: 'Physical goods purchase',
-      passkeyUrl: 'https://uat-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_goods',
+      passkeyUrl: 'https://test-agent.clinkbill.com/passkey-auth/cpi_9031?type=visa&instructionId=inst_goods',
       shippingAddress: {
         name: 'Jim',
         line1: '123 Market St',
@@ -453,22 +459,21 @@ test('purchase instruction passkey URL keeps instructionId inside redirectUrl', 
   );
 });
 
-test('purchase instruction APIs use the default UAT API domain', () => {
-  const fetchInstruction = extractFunction(indexSource, 'fetchInstruction');
-
-  assert.match(configSource, /API_BASE_URL:\s*"https:\/\/uat-api\.clinkbill\.com"/);
-  assert.doesNotMatch(configSource, /AGENT_API_BASE_URL/);
-  assert.doesNotMatch(indexSource, /AGENT_BASE_URL/);
-  assert.match(fetchInstruction, /fetchClink\(endpoint/);
+test('Clink calls go through the vendored clink-cli bundle; base URL owned by clink-cli', () => {
+  assert.match(indexSource, /async function runClinkCli/);
+  assert.match(indexSource, /vendor', 'clink-cli', 'clink-cli\.bundle\.mjs'|vendor\/clink-cli\/clink-cli\.bundle\.mjs/);
+  assert.doesNotMatch(indexSource, /fetchClink|fetchInstruction|httpsRequest/);
+  // Base URL is not pinned by the skill: no config.mjs import, no forced CLINK_BASE_URL.
+  assert.doesNotMatch(indexSource, /config\.mjs/);
+  assert.doesNotMatch(indexSource, /CLINK_BASE_URL:\s*CLINK_API_BASE_URL/);
+  // A real CLINK_BASE_URL env var must be allowed to pass through and override.
+  assert.match(indexSource, /CLINK_BASE_URL/);
 });
 
-test('purchase instruction APIs use the agent cwallet instruction path', () => {
-  assert.match(indexSource, /fetchInstruction\('\/agent\/cwallet\/instructions', 'POST'/);
-  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}\/sign`/);
-  assert.match(indexSource, /`\/agent\/cwallet\/instructions\$\{qs\}`/);
-  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}`/);
-  assert.match(indexSource, /`\/agent\/cwallet\/instructions\/\$\{encodeURIComponent\(args\.instructionId\)\}\/cancel`/);
-  assert.doesNotMatch(indexSource, /\/a\/cwallet\/instructions/);
+test('purchase instruction operations invoke the clink-cli instruction commands', () => {
+  assert.match(indexSource, /runClinkCli\(\[\s*'instruction', 'list'/);
+  assert.match(indexSource, /'instruction', 'create'/);
+  assert.doesNotMatch(indexSource, /\/a\/cwallet/);
 });
 
 test('purchase instruction manage link notification renders Feishu button and markdown link', () => {
@@ -476,7 +481,7 @@ test('purchase instruction manage link notification renders Feishu button and ma
     messageKey: 'payment.purchase_instruction_manage_link',
     locale: 'zh-CN',
     vars: {
-      manageUrl: 'https://uat-agent.clinkbill.com',
+      manageUrl: 'https://test-agent.clinkbill.com',
     },
   });
 
@@ -485,14 +490,21 @@ test('purchase instruction manage link notification renders Feishu button and ma
   const markdown = renderMessageMarkdown(request, { preferredLocale: 'zh-CN' });
 
   assert.match(cardJson, /"tag":"button"/);
-  assert.match(cardJson, /https:\/\/uat-agent\.clinkbill\.com/);
+  assert.match(cardJson, /https:\/\/test-agent\.clinkbill\.com/);
   assert.match(cardJson, /管理 instruction 授权/);
-  assert.match(markdown, /\[管理 instruction 授权\]\(https:\/\/uat-agent\.clinkbill\.com\)/);
+  assert.match(markdown, /\[管理 instruction 授权\]\(https:\/\/test-agent\.clinkbill\.com\)/);
 });
 
 test('instruction authorization manage intents route to the agent UI link tool', () => {
   assert.match(indexSource, /name: "get_purchase_instruction_manage_link"/);
-  assert.match(indexSource, /https:\/\/uat-agent\.clinkbill\.com/);
+  // Manage URL is derived from the backend-issued bindingUrl, not a pinned domain.
+  const manageHandler = sliceBetween(
+    indexSource,
+    'async function handle_get_purchase_instruction_manage_link',
+    'async function handle_install_system_hooks',
+  );
+  assert.match(manageHandler, /resolvePurchaseInstructionBindingUrl/);
+  assert.match(manageHandler, /buildBareDomainUrl/);
   assert.match(indexSource, /修改授权[\s\S]*查看授权[\s\S]*取消 instruction 授权/);
   assert.match(indexSource, /case "get_purchase_instruction_manage_link"/);
   assert.match(notificationSource, /'payment\.purchase_instruction_manage_link'/);
@@ -515,8 +527,8 @@ test('list purchase instructions filters by status and paymentInstrumentId', asy
   `)();
 
   const calls = [];
-  globalThis.fetchInstruction = async (endpoint, method) => {
-    calls.push({ endpoint, method });
+  globalThis.runClinkCli = async (args) => {
+    calls.push(args);
     return [{ instructionId: 'ins_100001', paymentInstrumentId: 'pi_123456', status: 'ACTIVE' }];
   };
   globalThis.logError = async () => {};
@@ -528,11 +540,14 @@ test('list purchase instructions filters by status and paymentInstrumentId', asy
     });
 
     assert.equal(calls.length, 1);
-    assert.equal(calls[0].method, 'GET');
-    assert.equal(calls[0].endpoint, '/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_123456');
+    assert.deepEqual(calls[0], [
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', 'pi_123456',
+    ]);
     assert.match(result, /ins_100001/);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.logError;
   }
 });
@@ -544,7 +559,7 @@ test('empty active Visa instruction list directs agent to create a draft when sc
     return handle_list_purchase_instructions;
   `)();
 
-  globalThis.fetchInstruction = async () => [];
+  globalThis.runClinkCli = async () => [];
   globalThis.logError = async () => {};
 
   try {
@@ -558,7 +573,7 @@ test('empty active Visa instruction list directs agent to create a draft when sc
     assert.match(result, /call prepare_visa_purchase_instruction/i);
     assert.match(result, /Do NOT ask for a payment link/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.logError;
   }
 });
@@ -587,6 +602,7 @@ function buildPrepareInstructionHarness() {
 
   return new Function(`
     function isVisaRegistrationSucceeded(method) { return method?.visaRegistrationSucceeded === true; }
+    async function runClinkCli(...args) { return globalThis.runClinkCli(...args); }
     ${sources}
     return handle_prepare_visa_purchase_instruction;
   `)();
@@ -620,8 +636,8 @@ test('prepare visa purchase instruction state machine lists before creating a dr
     },
     response: 'VIC-ready',
   });
-  globalThis.fetchInstruction = async (endpoint, method) => {
-    calls.push({ type: 'fetchInstruction', endpoint, method });
+  globalThis.runClinkCli = async (args) => {
+    calls.push({ type: 'runClinkCli', args });
     return [];
   };
   globalThis.createPurchaseInstructionDraft = async (args) => {
@@ -644,8 +660,12 @@ test('prepare visa purchase instruction state machine lists before creating a dr
       }],
     });
 
-    assert.equal(calls[0].type, 'fetchInstruction');
-    assert.equal(calls[0].endpoint, '/agent/cwallet/instructions?status=ACTIVE&paymentInstrumentId=pi_vic');
+    assert.equal(calls[0].type, 'runClinkCli');
+    assert.deepEqual(calls[0].args, [
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', 'pi_vic',
+    ]);
     assert.equal(calls[1].type, 'create');
     assert.equal(calls[1].args.paymentInstrumentId, 'pi_vic');
     assert.match(result, /state=CREATED_DRAFT/);
@@ -654,7 +674,7 @@ test('prepare visa purchase instruction state machine lists before creating a dr
     delete globalThis.readPaymentMethodsCache;
     delete globalThis.fetchBindingData;
     delete globalThis.ensureVisaVicReadyForUse;
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logRequest;
     delete globalThis.logError;
@@ -666,7 +686,7 @@ test('prepare visa purchase instruction state machine returns missing scope befo
   let listed = false;
   let created = false;
 
-  globalThis.fetchInstruction = async () => {
+  globalThis.runClinkCli = async () => {
     listed = true;
     return [];
   };
@@ -692,7 +712,7 @@ test('prepare visa purchase instruction state machine returns missing scope befo
     assert.match(result, /amountLimit/i);
     assert.match(result, /merchantCategoryCode or preferredMerchantName/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logError;
   }
@@ -703,7 +723,7 @@ test('prepare visa purchase instruction state machine requires explicit fulfillm
   let listed = false;
   let created = false;
 
-  globalThis.fetchInstruction = async () => {
+  globalThis.runClinkCli = async () => {
     listed = true;
     return [];
   };
@@ -729,7 +749,7 @@ test('prepare visa purchase instruction state machine requires explicit fulfillm
     assert.match(result, /state=MISSING_FULFILLMENT_TYPE/);
     assert.match(result, /fulfillmentType/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logError;
   }
@@ -740,7 +760,7 @@ test('prepare visa purchase instruction state machine blocks unknown fulfillment
   let listed = false;
   let created = false;
 
-  globalThis.fetchInstruction = async () => {
+  globalThis.runClinkCli = async () => {
     listed = true;
     return [];
   };
@@ -767,7 +787,7 @@ test('prepare visa purchase instruction state machine blocks unknown fulfillment
     assert.match(result, /state=MISSING_FULFILLMENT_TYPE/);
     assert.match(result, /must be resolved/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logError;
   }
@@ -778,7 +798,7 @@ test('prepare visa purchase instruction state machine requires shipping address 
   let listed = false;
   let created = false;
 
-  globalThis.fetchInstruction = async () => {
+  globalThis.runClinkCli = async () => {
     listed = true;
     return [];
   };
@@ -805,7 +825,7 @@ test('prepare visa purchase instruction state machine requires shipping address 
     assert.match(result, /state=MISSING_SCOPE/);
     assert.match(result, /shippingAddress/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logError;
   }
@@ -816,7 +836,7 @@ test('prepare visa purchase instruction state machine rejects non-US shipping ad
   let listed = false;
   let created = false;
 
-  globalThis.fetchInstruction = async () => {
+  globalThis.runClinkCli = async () => {
     listed = true;
     return [];
   };
@@ -851,7 +871,7 @@ test('prepare visa purchase instruction state machine rejects non-US shipping ad
     assert.match(result, /state=MISSING_SCOPE/);
     assert.match(result, /shippingAddress\.countryCode must be US/i);
   } finally {
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logError;
   }
@@ -884,7 +904,7 @@ test('prepare visa purchase instruction state machine does not mark failed draft
     },
     response: 'VIC-ready',
   });
-  globalThis.fetchInstruction = async () => [];
+  globalThis.runClinkCli = async () => [];
   globalThis.createPurchaseInstructionDraft = async () => 'Failed to create purchase instruction: backend unavailable';
   globalThis.logRequest = async () => {};
   globalThis.logError = async () => {};
@@ -907,7 +927,7 @@ test('prepare visa purchase instruction state machine does not mark failed draft
     delete globalThis.readPaymentMethodsCache;
     delete globalThis.fetchBindingData;
     delete globalThis.ensureVisaVicReadyForUse;
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logRequest;
     delete globalThis.logError;
@@ -942,7 +962,7 @@ test('prepare visa purchase instruction state machine reuses a matching active i
     },
     response: 'VIC-ready',
   });
-  globalThis.fetchInstruction = async () => [{
+  globalThis.runClinkCli = async () => [{
     instructionId: 'ins_hotel',
     paymentInstrumentId: 'pi_vic',
     status: 'ACTIVE',
@@ -981,7 +1001,7 @@ test('prepare visa purchase instruction state machine reuses a matching active i
     delete globalThis.readPaymentMethodsCache;
     delete globalThis.fetchBindingData;
     delete globalThis.ensureVisaVicReadyForUse;
-    delete globalThis.fetchInstruction;
+    delete globalThis.runClinkCli;
     delete globalThis.createPurchaseInstructionDraft;
     delete globalThis.logRequest;
     delete globalThis.logError;
@@ -1130,30 +1150,6 @@ test('does not fail closed for non-card payment methods without card network fie
 
   assert.equal(result.blocked, false);
   assert.equal(result.route, 'legacy');
-});
-
-test('webhook treats a VIC-ready update on the same Visa card as VIC registration completion', () => {
-  assert.match(webhookSource, /isVisaRegistrationComplete/);
-  assert.match(webhookSource, /visaRegistrationSucceeded/);
-  assert.match(webhookSource, /payment\.vic_registration_complete/);
-  assert.match(webhookSource, /Continue the VIC purchase instruction flow/);
-  assert.match(webhookSource, /Do NOT call clink_pay/);
-});
-
-test('poll fallback treats VIC registration changes as payment method changes', () => {
-  const identity = sliceBetween(
-    pollSource,
-    'function paymentMethodIdentity(method) {',
-    'function serializePaymentMethods(methods) {',
-  );
-  const serializer = sliceBetween(
-    pollSource,
-    'function serializePaymentMethods(methods) {',
-    'function isSamePaymentMethods(left, right) {',
-  );
-
-  assert.match(pollSource, /visaRegistrationSucceeded/);
-  assert.match(pollSource, /operation\.type === 'vic_registration'/);
 });
 
 test('skill guidance uses visaRegistrationSucceeded for Visa routing and removes vicReadiness', () => {

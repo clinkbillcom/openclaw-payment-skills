@@ -58,7 +58,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` 会同时完成 MCP 注册、安装 ESM Webhook（`my_payment_webhook.mjs`）、Webhook 路由配置、网关重启调度，并立即发送安装成功通知。它成功后不要再手动执行第二次 `openclaw gateway restart`。
+`pre_install.mjs` 会完成 MCP 注册、网关重启调度，并立即发送安装成功通知。它成功后不要再手动执行第二次 `openclaw gateway restart`。所有 Clink 操作通过内置的 `clink-cli`（`vendor/clink-cli/clink-cli.bundle.mjs`）执行；异步完成通知由邮箱事件轮询器（`scripts/event-pump.mjs`）投递，因此不再安装 Webhook 路由。
 
 ---
 
@@ -136,7 +136,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-typ
 
 - 实际支付是否成功取决于你的 Clink 账户状态和可用支付方式
 - 部分支付可能需要额外验证，例如 3DS
-- 退款申请当前按全额退款提交，最终结果通过异步 webhook 回调通知
+- 退款申请当前按全额退款提交，最终结果通过邮箱事件轮询器异步投递
 - 风控规则可能会拦截或限制充值
 - 如果你明确指定了充值金额，Agent 应优先使用你的金额
 

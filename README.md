@@ -58,7 +58,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` already registers the MCP server, installs the ESM webhook (`my_payment_webhook.mjs`), configures the webhook route, schedules the gateway restart, and sends the install success notification immediately. Do not run a second manual `openclaw gateway restart` after it succeeds.
+`pre_install.mjs` already registers the MCP server, schedules the gateway restart, and sends the install success notification immediately. Do not run a second manual `openclaw gateway restart` after it succeeds. Clink operations are performed through the vendored `clink-cli` bundle (`vendor/clink-cli/clink-cli.bundle.mjs`); async completion notifications are delivered by the mailbox event pump (`scripts/event-pump.mjs`), so no webhook route is installed.
 
 ---
 
@@ -136,7 +136,7 @@ This is especially useful for recharge-based skills such as media generation ser
 
 - Payment execution depends on your Clink account status and available payment methods
 - Some payments may require extra verification such as 3DS
-- Refund requests are currently submitted as full refunds and complete asynchronously through webhook callbacks
+- Refund requests are currently submitted as full refunds and complete asynchronously; the final result is delivered by the mailbox event pump
 - Risk rules can block or limit a recharge based on your safety settings
 - If you provide a specific recharge amount, the agent should use that amount
 
