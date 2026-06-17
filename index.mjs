@@ -78,6 +78,23 @@ async function updatePaymentEnv(updates) {
   await saveConfig(config);
 }
 
+// clink-cli persists the customer API key to ~/.clink-cli/config.json (per profile) and, as a
+// security hardening, no longer echoes it on `wallet init` stdout. Recover it from that config so
+// the skill can still mirror it into the child-process env that authenticates every clink-cli call.
+async function readClinkCliCustomerApiKey(profile) {
+  try {
+    const clinkConfigPath = path.join(os.homedir(), '.clink-cli', 'config.json');
+    const raw = await fs.readFile(clinkConfigPath, 'utf8');
+    const parsed = JSON.parse(raw);
+    const profiles = parsed?.profiles || {};
+    const entry = profiles[profile || 'default'] || profiles.default || {};
+    return entry.customerApiKey ?? entry.customerAPIKey ?? null;
+  } catch (err) {
+    await logError('readClinkCliCustomerApiKey', err);
+    return null;
+  }
+}
+
 // ------------------------------------------------------------------
 // PAYMENT METHODS CACHE HELPERS
 // ------------------------------------------------------------------
@@ -1604,7 +1621,12 @@ async function handle_initialize_wallet(args) {
   try {
     const data = await runClinkCli(['wallet', 'init', '--email', args.email, '--name', args.name || 'Agent User']);
     const customerId = data?.customerId;
-    const customerAPIKey = data?.customerAPIKey ?? data?.customerApiKey;
+    let customerAPIKey = data?.customerAPIKey ?? data?.customerApiKey;
+    // Newer clink-cli omits the API key from `wallet init` stdout (it persists it to
+    // ~/.clink-cli/config.json). Recover it from there so the skill env can authenticate later calls.
+    if (!customerAPIKey) {
+      customerAPIKey = await readClinkCliCustomerApiKey(data?.profile);
+    }
     await logRequest('initialize_wallet/walletInit', { email: args.email }, { customerId, hasKey: !!customerAPIKey });
 
     try {
@@ -2819,9 +2841,20 @@ function normalizeInstructionComparableText(value) {
 
 function parseInstructionTimeMs(value) {
   if (value === undefined || value === null || value === '') return null;
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  // Instruction/mandate effectiveUntilTime is now Unix epoch seconds (string or number). Treat a
+  // bare integer as epoch seconds; values already in millisecond range are passed through as-is.
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    return value < 1e12 ? value * 1000 : value;
+  }
   const raw = String(value).trim();
   if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const seconds = Number(raw);
+    if (!Number.isFinite(seconds)) return null;
+    return seconds < 1e12 ? seconds * 1000 : seconds;
+  }
+  // Legacy "yyyy-MM-dd HH:mm:ss" (UTC) strings from older ACTIVE instructions still parse.
   const isoLike = raw.includes('T') ? raw : raw.replace(' ', 'T');
   const withZone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(isoLike) ? isoLike : `${isoLike}Z`;
   const parsed = Date.parse(withZone);
@@ -3622,9 +3655,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           paymentInstrumentId: { type: "string", description: "Optional selected payment instrument ID. If omitted, the current/default card is resolved." },
           title: { type: "string", description: "Instruction title" },
           description: { type: "string", description: "Optional instruction description" },
-          effectiveUntilTime: { type: "string", description: "Optional instruction expiry, UTC string \"yyyy-MM-dd HH:mm:ss\"." },
+          effectiveUntilTime: { type: "string", description: "Optional instruction expiry as Unix epoch seconds, e.g. \"1782345600\"." },
           isRecurring: { type: "boolean", description: "Optional. Default false unless the user clearly authorizes recurring payments." },
-          mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }" },
+          mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }. Each mandate effectiveUntilTime is Unix epoch seconds." },
           fulfillmentType: {
             type: "string",
             enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"],
@@ -3668,7 +3701,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "get_purchase_instruction_manage_link",
-      description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link (the agent origin derived from the configured Clink environment, e.g. https://agent.clinkbill.com in production or https://test-agent.clinkbill.com in sandbox). Feishu renders this as a button; other channels receive a link.",
+      description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link (the agent origin derived from the configured Clink environment, e.g. https://agent.clinkbill.com in production or https://agent.clinkbill.dev in sandbox). Feishu renders this as a button; other channels receive a link.",
       inputSchema: {
         type: "object",
         properties: {

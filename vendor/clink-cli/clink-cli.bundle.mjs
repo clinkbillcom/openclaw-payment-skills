@@ -3632,11 +3632,13 @@ import path from "node:path";
 // dist/domains.js
 var API_BASE_URLS = {
   production: "https://api.clinkbill.com",
-  sandbox: "https://test-api.clinkbill.com"
+  // sandbox: "https://test-api.clinkbill.com"
+  sandbox: "https://api.clinkbill.dev"
 };
 var AGENT_BASE_URLS = {
   production: "https://agent.clinkbill.com",
-  sandbox: "https://test-agent.clinkbill.com"
+  // sandbox: "https://test-agent.clinkbill.com"
+  sandbox: "https://agent.clinkbill.dev"
 };
 var DEFAULT_BASE_URL = API_BASE_URLS.production;
 
@@ -3687,7 +3689,10 @@ function resolveRuntimeConfig(storedConfig, flags) {
   };
   const runtimeConfig = {
     profile: profileName,
-    baseUrl: getStringFlag(flags, "base-url") ?? process.env.CLINK_BASE_URL ?? storedConfig.baseUrl,
+    // Base URL precedence: explicit --base-url / CLINK_BASE_URL win; otherwise --sandbox selects the
+    // sandbox API host (so one flag switches both the API base and the agent domain); otherwise the
+    // stored/default (production) base URL.
+    baseUrl: getStringFlag(flags, "base-url") ?? process.env.CLINK_BASE_URL ?? (getBooleanFlag(flags, "sandbox") ? API_BASE_URLS.sandbox : storedConfig.baseUrl),
     defaultOpenLinks: storedConfig.defaultOpenLinks
   };
   assignIfDefined(runtimeConfig, "customerId", resolved.customerId);
@@ -4367,6 +4372,8 @@ Global Options:
   --no-watch                    Do not poll for webhook events after printing a link
   --profile <name>              Use a named local profile, defaults to "default"
   --base-url <url>              Override API base URL
+  --sandbox                     Target the sandbox environment (sandbox API base + agent domain);
+                                explicit --base-url / CLINK_BASE_URL still overrides the API host
   --customer-id <id>            Override customer ID
   --customer-api-key <key>      Override customer API key
   --timeout <ms>                Request timeout in milliseconds
@@ -4587,12 +4594,12 @@ Usage:
 Options:
   --profile <name>             Local profile whose customer credentials will be used
   --open                       Open the generated risk-rule page in the browser
-  --sandbox                    Use the sandbox agent domain (uat-agent.clinkbill.com)
+  --sandbox                    Use the sandbox agent domain (agent.clinkbill.dev)
   --no-watch                   Skip polling for webhook events after printing the link
 
 Notes:
   Prints the agent risk-rule setup page: https://agent.clinkbill.com/risk-rules-setup
-  (or https://uat-agent.clinkbill.com/risk-rules-setup with --sandbox). No network request.
+  (or https://agent.clinkbill.dev/risk-rules-setup with --sandbox). No network request.
   After printing the link, polls for webhook events until one arrives (max 15 min); use --no-watch to skip.
 
 Examples:
@@ -4752,40 +4759,41 @@ Examples:
 var INSTRUCTION_HELP = `clink-cli instruction
 
 Usage:
-  clink-cli instruction <create|prepare|sign-url|list|update|cancel> [options]
+  clink-cli instruction <create|sign-url|list|get|update|cancel> [options]
 
 Actions:
-  create    Create an instruction draft through the agent wallet API
-  prepare   Create a draft and print the Passkey URL using the returned instructionId
+  create    Create an instruction (CREATED draft) and print the Passkey URL to authorize it
   sign-url  Print the Passkey page URL; the page automatically signs after the user opens it
   list      List instructions, optionally filtered by --status and --payment-instrument-id
+  get       Get one instruction by --purchase-instruction-id
   update    Print the agent page URL for user-managed changes; no backend update call in this phase
   cancel    Print the agent page URL for user-managed cancellation; no backend cancel call in this phase
 
 Notes:
-  Calls CWallet InstructionController under /agent/cwallet/instructions for create/list/prepare.
-  sign-url, update, and cancel only generate agent page URLs. They do not call backend sign/update/cancel APIs.
-  Agent page URL environment: --sandbox uses https://test-agent.clinkbill.com; omit it for production https://agent.clinkbill.com.
+  create POSTs /agent/cwallet/instructions and creates the instruction in CREATED (draft) state,
+  then prints the Passkey page URL for the returned instructionId.
+  An instruction turns ACTIVE only after the Passkey/FIDO signature completes on the agent page
+  (that page calls the backend sign API with the WebAuthn authResult). The CLI does not call the
+  backend sign/update/cancel APIs itself \u2014 those require a Passkey authResult produced in the
+  browser, so sign-url/update/cancel only print the agent page URL for the user to complete there.
+  Agent page URL environment: --sandbox uses https://agent.clinkbill.dev; omit it for production https://agent.clinkbill.com.
   Only valid for Visa cards whose card data has visaRegistrationSucceeded = true.
   Instruction-level currency/amount are NOT sent \u2014 currency and amountLimit live on each mandate.
   Do not send clientReferenceId / channelTokenId / consumerId \u2014 the server derives them.
-  --effective-until-time is a UTC "yyyy-MM-dd HH:mm:ss" string (both instruction and mandate level).
+  --effective-until-time / mandate effectiveUntilTime are Unix epoch seconds (e.g. "1782345600").
   Authenticates by customer API key only (no X-Customer-ID header).
-  prepare/sign-url/update/cancel poll for webhook events after printing the Passkey/agent URL (max 15 min); use --no-watch to skip.
+  create/sign-url/update/cancel poll for webhook events after printing the Passkey/agent URL (max 15 min); use --no-watch to skip.
 
 Examples:
   clink-cli instruction create \\
     --payment-instrument-id pi_xxx --title "Business trip" \\
-    --effective-until-time "2026-06-25 00:00:00" \\
-    --mandates '[{"title":"Hotel","description":"Hotel payment","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]' \\
-    --format json
-  clink-cli instruction prepare \\
-    --payment-instrument-id pi_xxx --title "Hotel booking" \\
-    --mandates '[{"title":"Hotel","amountLimit":500.00,"currencyCode":"CNY"}]' \\
+    --effective-until-time "1782345600" \\
+    --mandates '[{"title":"Hotel","description":"Hotel payment","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"1782345600"}]' \\
     --sandbox --format json
   clink-cli instruction sign-url \\
     --payment-instrument-id pi_xxx --purchase-instruction-id ins_xxx --format json
   clink-cli instruction list --status ACTIVE --payment-instrument-id pi_xxx --format json
+  clink-cli instruction get --purchase-instruction-id ins_xxx --format json
   clink-cli instruction cancel --sandbox --format json
 `;
 var EVENTS_HELP = `clink-cli events
@@ -5138,7 +5146,10 @@ async function walletInit(context) {
   }
   await writeStoredConfig(nextConfig);
   printSuccess({
-    ...data,
+    customerId: profile.customerId ?? null,
+    email,
+    name,
+    hasCustomerApiKey: Boolean(profile.customerApiKey),
     profile: context.runtimeConfig.profile,
     configPath: "~/.clink-cli/config.json"
   }, context.globalOptions.format);
@@ -5380,12 +5391,12 @@ async function handleInstructionCommand(subcommand, context) {
   switch (subcommand) {
     case "create":
       return instructionCreate(context);
-    case "prepare":
-      return instructionPrepare(context);
     case "sign-url":
       return instructionSignUrl(context);
     case "list":
       return instructionList(context);
+    case "get":
+      return instructionGet(context);
     case "update":
     case "cancel":
       return instructionAgentPageUrl(context);
@@ -5399,7 +5410,7 @@ function instructionBody(context) {
     paymentInstrumentId: requireStringFlag(flags, "missing --payment-instrument-id", "payment-instrument-id"),
     title: requireStringFlag(flags, "missing --title", "title"),
     description: getStringFlag(flags, "description"),
-    effectiveUntilTime: getStringFlag(flags, "effective-until-time"),
+    effectiveUntilTime: epochSecondsFlag(flags, "effective-until-time"),
     extra: optionalJsonFlag(flags, "extra"),
     mandates: requireJsonArrayFlag(flags, "mandates")
   });
@@ -5412,6 +5423,16 @@ function instructionBody(context) {
   }
   return body;
 }
+function epochSecondsFlag(flags, name) {
+  const value = getStringFlag(flags, name);
+  if (value === void 0) {
+    return void 0;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw validationError(`--${name} must be Unix epoch seconds (e.g. 1782345600), got "${value}"`);
+  }
+  return value;
+}
 function requireJsonArrayFlag(flags, name) {
   const parsed = parseJsonFlag(requireStringFlag(flags, `missing --${name} (JSON array)`, name), `--${name}`);
   if (!Array.isArray(parsed)) {
@@ -5420,18 +5441,6 @@ function requireJsonArrayFlag(flags, name) {
   return parsed;
 }
 async function instructionCreate(context) {
-  const result = await requestJson({
-    baseUrl: context.runtimeConfig.baseUrl,
-    method: "POST",
-    path: INSTRUCTION_PATH,
-    headers: buildInstructionHeaders(context.runtimeConfig),
-    body: instructionBody(context),
-    timeoutMs: context.globalOptions.timeoutMs,
-    dryRun: context.globalOptions.dryRun
-  });
-  return finishApiCommand(result, context);
-}
-async function instructionPrepare(context) {
   const agentBaseUrl = resolveAgentBaseUrl(getBooleanFlag(context.args.flags, "sandbox"));
   const body = instructionBody(context);
   const result = await requestJson({
@@ -5463,6 +5472,18 @@ async function instructionPrepare(context) {
   }, context.globalOptions.format);
   await maybeWatchEvents(context, passkeyUrl, "purchase instruction authorization");
   return EXIT_CODES.OK;
+}
+async function instructionGet(context) {
+  const instructionId = requireStringFlag(context.args.flags, "missing --purchase-instruction-id", "purchase-instruction-id");
+  const result = await requestJson({
+    baseUrl: context.runtimeConfig.baseUrl,
+    method: "GET",
+    path: `${INSTRUCTION_PATH}/${encodeURIComponent(instructionId)}`,
+    headers: buildInstructionHeaders(context.runtimeConfig),
+    timeoutMs: context.globalOptions.timeoutMs,
+    dryRun: context.globalOptions.dryRun
+  });
+  return finishApiCommand(result, context);
 }
 async function instructionSignUrl(context) {
   const flags = context.args.flags;

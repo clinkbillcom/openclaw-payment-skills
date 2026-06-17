@@ -37,7 +37,7 @@ tools:
   - name: list_purchase_instructions
     description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
   - name: get_purchase_instruction_manage_link
-    description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://test-agent.clinkbill.com in sandbox) as the authorization management link."
+    description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://agent.clinkbill.dev in sandbox) as the authorization management link."
   - name: install_system_hooks
     description: Update `openclaw.json` and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.
   - name: uninstall_system_hooks
@@ -110,7 +110,7 @@ See Section 3.4 for the full VIC workflow, the instruction matching rule, and pa
 
 If the user asks to 修改授权, 查看授权, 取消 instruction 授权, manage instruction authorization, view instruction authorization, edit instruction authorization, cancel instruction authorization, or uses semantically similar wording for purchase instruction authorization management, call `get_purchase_instruction_manage_link`.
 
-This returns the agent UI origin derived from the configured Clink environment (`https://agent.clinkbill.com` in production, `https://test-agent.clinkbill.com` in sandbox). In Feishu it is delivered as a button through the normal notification renderer; in other channels it is shown as a link. Do not ask the user for `appInstance` or `authResult` for this user-facing management intent — viewing, editing, and cancelling authorization all happen on that agent page.
+This returns the agent UI origin derived from the configured Clink environment (`https://agent.clinkbill.com` in production, `https://agent.clinkbill.dev` in sandbox). In Feishu it is delivered as a button through the normal notification renderer; in other channels it is shown as a link. Do not ask the user for `appInstance` or `authResult` for this user-facing management intent — viewing, editing, and cancelling authorization all happen on that agent page.
 
 ### 1.5 Routing Boundary Rule (Hard Rule)
 
@@ -285,7 +285,7 @@ Use this for every selected Visa card before payment execution. Non-Visa cards u
 
 1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
    ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"2026-06-25 00:00:00","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"2026-06-25 00:00:00"}]}'
+   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"1782345600","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"1782345600"}]}'
    ```
 2. **State machine outcomes:**
    - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
@@ -352,7 +352,7 @@ For that request, after the state machine finds no semantic match, it creates a 
       "currencyCode": "CNY",
       "merchantCategoryCode": "7011",
       "preferredMerchantName": "全季酒店",
-      "effectiveUntilTime": "<date/time covering the requested stay window>"
+      "effectiveUntilTime": "<Unix epoch seconds covering the requested stay window, e.g. 1782345600>"
     }
   ]
 }
