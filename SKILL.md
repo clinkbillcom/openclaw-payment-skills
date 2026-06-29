@@ -60,7 +60,7 @@ Evaluate these rules in order. The first matching rule decides the route.
 
 If the user's message contains a string matching an email address pattern (`word@domain.tld`), **and the wallet is not yet initialized**:
 1. Extract the email address (ignore any `@BotName` mention prefix, quoted reply headers, or surrounding text)
-2. **Immediately call `initialize_wallet`** with that email — no confirmation, no output first
+2. **Immediately call `initialize_wallet`** with that email — no confirmation, no output first. Include the current `channel`, `target_id`, and `target_type` when the runtime exposes them; otherwise let the tool use the cached notify destination if present.
 3. Do NOT call `get_wallet_status` first — just attempt `initialize_wallet` and let it fail gracefully if already initialized
 
 This rule covers the post-install flow where the gateway restarts and the user replies with their email directly.
@@ -154,7 +154,31 @@ Exactly one layer owns each card. Do NOT duplicate card delivery across tool, ev
   - Meaning: the tool returned data only; no notification was sent
   - Agent may use the data to construct the next required response
 
-### 2.3 Async Completion Model
+Tool output may also include a `[PAYMENT_FSM] state=<STATE> action=<ACTION> reason=<REASON>` marker. The FSM action refines the directive above:
+
+| FSM action | Required behavior |
+|---|---|
+| `WAIT_EVENT_PUMP` | Payment was submitted but is not terminal. Do not block, re-poll, retry, or claim completion; tell the user the final result will arrive through the event pump. |
+| `SEND_3DS_AND_WAIT_EVENT` | Execute the returned 3DS notification exactly once, then wait for `agent_order.succeeded/failed` from the event pump. |
+| `NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT` | Treat the payment tool as the owner of the success card and merchant confirmation handoff. Do not re-send or re-confirm. |
+| `NOTIFY_FAILURE_STOP` | Treat the payment tool as the owner of the failure/risk card. Stop the payment path unless the user explicitly chooses a recovery action. |
+| `VERIFY_BEFORE_RETRY` | Payment state is unknown. Do not retry from memory; verify through an idempotent status path, event-pump result, or merchant-provided recovery contract first. |
+| `ASK_WALLET_SETUP` | Wallet/config setup is missing. Ask for the required setup; do not run `clink_pay`. |
+| `SURFACE_ERROR` | Surface the tool error briefly and stop. Do not synthesize success, failure, or retry semantics. |
+
+### 2.3 Control Loop / FSM Contract
+
+Every payment workflow follows this loop:
+
+`Observe → Classify → Act → Verify → Persist`
+
+1. **Observe:** Read only the current tool result, event-pump event, or local cache. Do not infer state from prior chat memory alone.
+2. **Classify:** Use `[PAYMENT_FSM]` for payment tool output and the event-pump `event_fsm` classification for mailbox events.
+3. **Act:** Perform exactly one owner-approved action from the card ownership matrix and FSM action table.
+4. **Verify:** A workflow becomes complete only after a terminal sync result (`status=1` or terminal failure) or the matching event-pump event. A user returning from an external page is not proof.
+5. **Persist:** Event hooks update `clink.config.json` before dependent local state is used for follow-up decisions. Never advance to the next state from memory if cache/event evidence is missing.
+
+### 2.4 Async Completion Model
 
 Operations that complete asynchronously (payment-method binding/change, risk-rule update, order payment, refund lifecycle, VIC registration, purchase-instruction activation) are NOT polled by the agent. A single background process — the mailbox event pump (`scripts/event-pump.mjs`) — long-polls the Clink agent mailbox via `clink-cli events poll`, delivers the completion notification, and updates the local cache.
 
@@ -163,8 +187,28 @@ This means:
 - After a tool returns `DIRECT_SEND` (e.g. a binding/setup/modify link or a refund submission), the agent informs the user that the action is pending and does NOT block, re-poll, or fabricate a completion. The event pump delivers the result when it arrives.
 - The agent MUST NOT claim an async flow is complete until the corresponding event-pump notification has been delivered.
 - Order payment via `clink_pay` is synchronous in the tool response for the immediate `status`/`flag3DS` outcome; the agent follows the returned directive exactly. The final `agent_order.succeeded/failed` (including after 3DS) is delivered by the event pump.
+- Backend acknowledgement of consumed mailbox events is owned by `clink-cli events poll`. The payment skill does not call an ack API directly; it keeps local idempotency with processed event sequence tracking.
 
-### 2.4 Amount Selection Rule
+### 2.5 Event Hook → Local Cache Update Matrix
+
+When the event pump receives one of these event types, it must treat the event handler as the hook for local-state mutation and notification ownership. If a row updates `clink.config.json`, update the local state before notifying or before using that state for the next workflow decision, except for explicit send-state locks that are written immediately after a successful send.
+
+| Event type | Local state update | Notification / next action owner |
+|---|---|---|
+| `payment_method.added` | Upsert `paymentMethods`, mark wallet initialized, update default/payment-method fields when present | Event pump sends `payment.method.bound_success`; on first card it may also send `wallet.initialized_complete` |
+| `payment_method.updated` / `payment_method.update` | Upsert the payment method in `clink.config.json`; detect Visa registration-ready transition | Cache-only unless it completes Visa readiness, then event pump sends `payment.vic_registration_complete` |
+| `payment_method.default_change` | Set `defaultPaymentMethodId` and mark only that method as default | Event pump sends `payment.method.default_changed_webhook` |
+| `risk_rule.updated` | Replace cached `riskRules` | Event pump sends `risk_rule.updated` |
+| `purchase_instruction.activated` | Mark the target Visa/payment-instrument flow as VIC-ready in `paymentFlowStates` | Event pump sends `payment.vic_registration_complete` |
+| `vic_device.binding_succeeded` | Mark the target Visa/payment-instrument flow as VIC-ready in `paymentFlowStates` | Event pump sends `payment.vic_registration_complete` |
+| `agent_order.succeeded` | Use local order-card state to de-duplicate payment success and merchant confirmation | Event pump sends payment success only if needed, then triggers merchant confirmation exactly once |
+| `agent_order.failed` | Clear pending merchant confirmation and record payment-failure send state | Event pump sends the payment-layer failure notification |
+| `agent_refund.succeeded` / `agent_refund.approved` | Read cached card/notify context; no merchant confirmation | Event pump sends final refund success/approved notification |
+| `agent_refund.failed` / `agent_refund.rejected` | Read cached card/notify context; no merchant confirmation | Event pump sends final refund failed/rejected notification |
+
+Unknown events are log-only. Do not invent a new workflow from an unknown event type until the FSM and this matrix are updated.
+
+### 2.6 Amount Selection Rule
 
 There are only two valid amount sources for `clink_pay`:
 
@@ -179,7 +223,7 @@ There are only two valid amount sources for `clink_pay`:
 You MUST NOT invent a third amount from memory, prior turns, habit, or judgment.
 You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary amount unless the user explicitly asked for that amount in the current turn.
 
-### 2.5 Prohibited Behaviors
+### 2.7 Prohibited Behaviors
 
 - Do NOT send the same semantic card twice for the same `order_id`.
 - Do NOT send a payment-layer success/failure card after a tool or the event pump already direct-sent it.
@@ -204,7 +248,7 @@ The skill is pre-bundled. Do NOT run `npm install`.
 
 When the user asks to install this skill, follow `README.md` / `README-zh.md` only:
 
-- Use the documented manual install command there.
+- Use the documented install command there. In an OpenClaw runtime that can execute local scripts, this means running `node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>` with the current notify destination. If the runtime cannot execute shell commands, show the exact manual command instead of claiming installation succeeded.
 - Do not substitute a partial MCP-only setup for the documented install flow.
 - Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
 - `pre_install.mjs` registers the MCP server, saves notify routing, schedules the gateway restart, and sends the install success notification immediately.
@@ -246,7 +290,7 @@ When a user installs or uses this skill for the first time:
    npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_risk_rules_link --args '{}'
    ```
    This step is mainly for standalone "modify/view risk rules" requests or for fallback paths where `get_binding_link` could not deliver the optional risk-rules follow-up directly. The mailbox event pump delivers `risk_rule.updated` when the user changes rules on the page.
-5. **Send Initialization Complete Card:** Once payment method is confirmed (either already existed or the `payment_method.added` event was delivered), send the "🎉 Clink Setup Complete!" card. Do NOT wait for risk rules.
+5. **Complete only after verified binding:** Once payment method is confirmed (either already existed in the current `get_binding_link` result or the `payment_method.added` event was delivered), the setup is complete. If the event pump already sent `wallet.initialized_complete`, do NOT send another setup-complete card; keep any chat follow-up brief. Do NOT wait for risk rules.
 
 ### 3.3 Execute Payment (Direct or Auto Top-Up)
 
@@ -365,11 +409,10 @@ For that request, after the state machine finds no semantic match, it creates a 
 
 When the user asks to view or manage their payment methods:
 1. **Show Current Status:** Call `get_binding_link` to display current payment method and email as an informational card.
-2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. Send a "⚙️ Payment Method Management" card with the link.
-3. **Confirm Update:** After the user returns from the external page, send a "✅ Payment Method Updated" card showing:
-   - Current payment method: updated ✓
-   - Notification email: confirmed ✓
-   - Risk rules: unchanged ✓
+2. **Open Management Page:** Call `get_payment_method_modify_link` to generate the management URL. If the tool direct-sent the management card, do not send a duplicate; otherwise send the returned link through the normal notification contract.
+3. **Wait for evidence, not page-return:** Do NOT treat the user's return from the external page as proof that anything changed. A real update is proven only by a relevant event-pump event (`payment_method.updated`, `payment_method.update`, or `payment_method.default_change`) or by a fresh `get_binding_link` result that shows the changed method/default state.
+4. **Confirm only verified changes:** If an event or refresh proves the payment method changed, briefly confirm the observed change. If no event or refreshed change is available, say the management action is still pending and the event pump will update local state when Clink emits the event.
+5. **Do not claim unrelated state:** Do not say risk rules are unchanged, email is confirmed, or setup is complete unless those facts were observed in the current tool result, event, or local cache.
 
 ### 3.6 Request Refund
 

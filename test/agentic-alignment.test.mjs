@@ -88,6 +88,53 @@ test('skill install section says when event pump starts, without webhook install
   assert.match(installSection, /event pump starts idempotently when usable wallet credentials are available/i);
 });
 
+test('skill documents the FSM control loop and payment FSM actions', () => {
+  assert.match(skillDoc, /Control Loop \/ FSM Contract/i);
+  assert.match(skillDoc, /Observe\s*→\s*Classify\s*→\s*Act\s*→\s*Verify\s*→\s*Persist/i);
+  for (const action of [
+    'WAIT_EVENT_PUMP',
+    'SEND_3DS_AND_WAIT_EVENT',
+    'NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT',
+    'NOTIFY_FAILURE_STOP',
+    'VERIFY_BEFORE_RETRY',
+    'ASK_WALLET_SETUP',
+    'SURFACE_ERROR',
+  ]) {
+    assert.match(skillDoc, new RegExp(action));
+  }
+});
+
+test('skill documents event hooks that update local config before notification', () => {
+  const eventHookSection = sliceSection(skillDoc, '### 2.5 Event Hook → Local Cache Update Matrix', /^###\s+2\.6\s+/m);
+  for (const eventType of [
+    'payment_method.added',
+    'payment_method.updated',
+    'payment_method.update',
+    'payment_method.default_change',
+    'risk_rule.updated',
+    'purchase_instruction.activated',
+    'vic_device.binding_succeeded',
+    'agent_order.succeeded',
+    'agent_order.failed',
+    'agent_refund.succeeded',
+    'agent_refund.approved',
+    'agent_refund.failed',
+    'agent_refund.rejected',
+  ]) {
+    assert.match(eventHookSection, new RegExp(eventType.replaceAll('.', '\\.')));
+  }
+  assert.match(eventHookSection, /clink\.config\.json/i);
+  assert.match(eventHookSection, /before notifying/i);
+});
+
+test('payment method management does not fabricate update confirmation after page return', () => {
+  const managementSection = sliceSection(skillDoc, '### 3.5 Payment Method Management', /^###\s+3\.6\s+/m);
+  assert.match(managementSection, /Do NOT treat the user's return from the external page as proof/i);
+  assert.match(managementSection, /payment_method\.updated/i);
+  assert.match(managementSection, /payment_method\.default_change/i);
+  assert.doesNotMatch(managementSection, /Risk rules: unchanged ✓/i);
+});
+
 test('skill and README docs no longer expose legacy webhook wait directives for this payment skill', () => {
   for (const [name, text] of [['SKILL.md', skillDoc], ['README.md', readme], ['README-zh.md', readmeZh]]) {
     assert.doesNotMatch(text, new RegExp('webhook' + 'Available', 'iu'), `${name} should not mention the legacy webhook availability flag`);
@@ -96,4 +143,12 @@ test('skill and README docs no longer expose legacy webhook wait directives for 
   }
   assert.match(skillDoc, /event pump|事件监控|events poll/i);
   assert.match(skillDoc, /clink-cli/i);
+});
+
+test('README install commands cd into the openclaw payment skill repository', () => {
+  for (const [name, text] of [['README.md', readme], ['README-zh.md', readmeZh]]) {
+    assert.match(text, /git clone https:\/\/github\.com\/clinkbillcom\/openclaw-payment-skills\.git/i, `${name} should clone the OpenClaw repository`);
+    assert.match(text, /^cd openclaw-payment-skills$/m, `${name} should cd into the cloned OpenClaw repository`);
+    assert.doesNotMatch(text, /^cd agent-payment-skills$/m, `${name} should not use the stale generic skill directory`);
+  }
 });

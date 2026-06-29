@@ -45,7 +45,7 @@ After installation, the agent will guide you through the remaining setup.
 
 ```bash
 git clone https://github.com/clinkbillcom/openclaw-payment-skills.git
-cd agent-payment-skills
+cd openclaw-payment-skills
 node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>
 ```
 

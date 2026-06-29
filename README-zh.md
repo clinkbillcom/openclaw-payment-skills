@@ -45,7 +45,7 @@ Agent Payment Skills 可以通过 Clink 为 OpenClaw Agent 增加钱包初始化
 
 ```bash
 git clone https://github.com/clinkbillcom/openclaw-payment-skills.git
-cd agent-payment-skills
+cd openclaw-payment-skills
 node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>
 ```
 
