@@ -1,6 +1,6 @@
 ---
 name: openclaw-payment-skills
-description: "OpenClaw payment skill for Clink wallet setup, payment-method management, merchant-initiated payments, refunds, VIC authorization, and async completion through a clink-cli event-polling event pump. Also triggers for purchase/book/order intents that should route to VIC when the current card is Visa. Async notify routing uses a unified channel + target contract; Feishu uses native cards, Telegram uses rich text/media delivery, and other channels fall back to markdown/text."
+description: "OpenClaw payment skill for Clink wallet setup, payment-method management, merchant-initiated payments, refunds, VIC authorization, external UCP checkout create→complete, and async completion through a clink-cli event-polling event pump. Also triggers for purchase/book/order intents that should route to VIC when the current card is Visa. Async notify routing uses a unified channel + target contract; Feishu uses native cards, Telegram uses rich text/media delivery, and other channels fall back to markdown/text."
 version: "1.0.0"
 metadata:
   openclaw:
@@ -36,6 +36,8 @@ tools:
     description: "VIC state machine: primary entrypoint for purchase/book/order intents. Resolves the current/default card; if it is Visa, handles VIC registration or lists ACTIVE instructions filtered by paymentInstrumentId and reuses/creates a draft. Always provide fulfillmentType. Use PHYSICAL_GOODS_REQUIRES_SHIPPING plus a US shippingAddress only for shipped physical goods; use NO_SHIPPING_REQUIRED for hotels, tickets, services, subscriptions, digital goods, bookings, and reservations. Use this instead of manually chaining pre_check_account, list_purchase_instructions, and create_purchase_instruction. After it creates a draft it returns a Passkey authorization URL; the user signs on that page (the skill never calls a backend sign API)."
   - name: list_purchase_instructions
     description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
+  - name: ucp_checkout
+    description: "External UCP checkout state machine: use after product/price truth and one matching ACTIVE instruction+mandate are known. Resolves the refreshed current/default paymentInstrumentId, runs clink-cli ucp-checkout create, parses checkoutId from the create response, then immediately runs clink-cli ucp-checkout complete with --payment-instrument-id. Completion is not merchant fulfillment."
   - name: get_purchase_instruction_manage_link
     description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://agent.clinkbill.dev in sandbox) as the authorization management link."
   - name: install_system_hooks
@@ -105,6 +107,19 @@ When this rule fires:
 9. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
 
 See Section 3.4 for the full VIC workflow, the instruction matching rule, and payload examples.
+
+### 1.3.1 UCP Checkout Product Order Flow
+
+If a merchant/product skill has already frozen product identity, price truth, currency, merchant context, and a matching ACTIVE instruction+mandate for this exact order, call `ucp_checkout`.
+
+This route is for external/shadow merchant product checkout. It must be continuous:
+
+1. Refresh/resolve the current/default paymentInstrumentId inside `ucp_checkout`.
+2. Run `clink-cli ucp-checkout create` with `instruction_id`, `mandate_id`, merchant URL/context, currency, and line items.
+3. Parse `checkoutId` from the create response (`data.id`, `data.checkout_id`, or `data.checkoutId`).
+4. Immediately run `clink-cli ucp-checkout complete --checkout-id <checkoutId> --payment-instrument-id <current/default paymentInstrumentId>`.
+
+Do not ask the user to provide the `checkoutId`. Do not use `clink_pay` for this product-order path. Do not pass instruction, mandate, or credential token fields to complete; create binds instruction+mandate, and complete sends the payment instrument only. UCP checkout completion is not merchant fulfillment; delivery, entitlement, receipt, balance credit, and task resume still belong to the merchant/product runtime.
 
 ### 1.4 Instruction Authorization Management Link
 
@@ -341,7 +356,7 @@ Use this for every selected Visa card before payment execution. Non-Visa cards u
    - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
    - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
 3. **Authorize (Passkey, page-driven):** the user opens the Passkey URL `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}` that was returned with the CREATED draft; the page completes the Passkey signature and activates the instruction. The skill does NOT call any backend sign API and never fabricates `appInstance`/`authResult`. When the user returns or asks how it is going, the mailbox event pump delivers `purchase_instruction.activated`; the instruction must be `ACTIVE` before any payment.
-4. **Payment execution:** do not pass an instruction field to `clink_pay` yet. The VIC payment entry and request field are pending backend confirmation. Until that contract is confirmed, keep the `ACTIVE` instruction in task state and use the normal payment path only for non-Visa routes.
+4. **Payment execution:** for external/shadow merchant product checkout, call `ucp_checkout` after an ACTIVE instruction+mandate is selected and the product/order inputs are frozen. Do not pass the instruction to `clink_pay` for this product-order path; `ucp_checkout` creates the checkout with the instruction+mandate, captures `checkoutId`, then completes with the refreshed current/default paymentInstrumentId.
 
 **VIC hard rules:** never create a draft without explicit user authorization; never invent mandates; signing happens on the Passkey page (never via a backend API) and the skill never fabricates `appInstance`/`authResult`; modify/cancel authorization happens on the agent management page via `get_purchase_instruction_manage_link`; an instruction must be `ACTIVE` before VIC payment execution; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
 
@@ -404,6 +419,55 @@ For that request, after the state machine finds no semantic match, it creates a 
   ]
 }
 ```
+
+### 3.4.1 UCP Checkout Product Order Flow
+
+Use `ucp_checkout` only after the merchant/product skill has provided a single frozen product/order target and the VIC state machine has produced or found an ACTIVE instruction+mandate that matches it.
+
+Required inputs before calling `ucp_checkout`:
+- `merchant_url`, merchant display/context, and `merchant_category_code`.
+- `currency`.
+- `line_items` with item IDs/titles/prices in minor units and quantities; the line-item total must match the merchant/product skill's price truth.
+- `instruction_id` and `mandate_id` selected from a matching ACTIVE purchase instruction.
+- `buyer` and `shipping_address` only when required by the external merchant or physical shipped goods.
+
+The tool performs the closed-loop handoff:
+
+```text
+REFRESH_PAYMENT_INSTRUMENT
+  -> CREATE_CHECKOUT
+  -> CAPTURE_CHECKOUT_ID
+  -> COMPLETE_CHECKOUT
+  -> RETURN_CHECKOUT_RESULT
+```
+
+Shell-equivalent sequence inside the tool:
+
+```bash
+clink-cli ucp-checkout create \
+  --merchant-url <product_or_checkout_url> \
+  --merchant-category-code <mcc> \
+  --currency <currency> \
+  --instruction-id <instruction_id> \
+  --mandate-id <mandate_id> \
+  --line-items '<line_items_json>' \
+  --buyer '<buyer_json>' \
+  --idempotency-key <stable_create_key> \
+  --format json
+
+clink-cli ucp-checkout complete \
+  --checkout-id <checkoutId_from_create> \
+  --payment-instrument-id <current/default paymentInstrumentId> \
+  --idempotency-key <stable_complete_key> \
+  --format json
+```
+
+Guards:
+- The tool resolves the refreshed current/default paymentInstrumentId before checkout; never guess it from memory.
+- Create must return `data.id`, `data.checkout_id`, or `data.checkoutId`; otherwise stop and surface the missing checkout ID.
+- Complete uses the captured `checkoutId` and current/default paymentInstrumentId only. Do not pass `instruction_id`, `mandate_id`, or credential token to complete.
+- If completion returns `complete_in_progress` or another non-terminal state, use the returned checkout state as a resumable payment/order state; do not claim merchant fulfillment.
+- UCP checkout completion is not merchant fulfillment. Merchant/product code owns delivery, entitlement, receipt validation, balance credit, downstream confirmation, and task resume.
 
 ### 3.5 Payment Method Management
 

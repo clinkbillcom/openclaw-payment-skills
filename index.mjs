@@ -3172,6 +3172,187 @@ Do NOT ask for a payment link, payment URL,代付链接, Session ID, or tell the
   }
 }
 
+// ------------------------------------------------------------------
+// UCP CHECKOUT (external/shadow merchant order)
+// ------------------------------------------------------------------
+async function resolveCurrentUcpCheckoutPaymentInstrument(paymentInstrumentId = null) {
+  const requestedPaymentInstrumentId = typeof paymentInstrumentId === 'string'
+    ? paymentInstrumentId.trim()
+    : '';
+  const { methods } = await fetchBindingData();
+  const normalizedMethods = normalizePaymentMethods(methods || []);
+  if (requestedPaymentInstrumentId) {
+    const selected = findPaymentMethodById(normalizedMethods, requestedPaymentInstrumentId);
+    if (!selected?.paymentInstrumentId) {
+      throw new Error(`paymentInstrumentId ${requestedPaymentInstrumentId} was not found in the refreshed payment method list`);
+    }
+    return selected;
+  }
+
+  const selected = normalizedMethods.find((method) => method.isDefault)
+    || normalizedMethods[0]
+    || null;
+  if (!selected?.paymentInstrumentId) {
+    throw new Error('No payment method is bound. Call get_payment_method_setup_link before creating a UCP checkout.');
+  }
+  return selected;
+}
+
+function normalizeJsonCliFlag(value, fieldName, { required = false, expectArray = false } = {}) {
+  const missing = value === undefined || value === null || value === '';
+  if (missing) {
+    if (required) throw new Error(`ucp_checkout requires '${fieldName}'.`);
+    return null;
+  }
+
+  let parsed = value;
+  if (typeof value === 'string') {
+    try {
+      parsed = JSON.parse(value);
+    } catch (error) {
+      throw new Error(`ucp_checkout '${fieldName}' must be valid JSON when passed as a string: ${error.message}`);
+    }
+  }
+  if (expectArray && !Array.isArray(parsed)) {
+    throw new Error(`ucp_checkout '${fieldName}' must be a JSON array.`);
+  }
+  if (!expectArray && (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))) {
+    throw new Error(`ucp_checkout '${fieldName}' must be a JSON object.`);
+  }
+  return JSON.stringify(parsed);
+}
+
+function extractUcpCheckoutId(data) {
+  const candidates = [
+    data?.id,
+    data?.checkout_id,
+    data?.checkoutId,
+    data?.data?.id,
+    data?.data?.checkout_id,
+    data?.data?.checkoutId,
+  ];
+  const checkoutId = candidates.find((candidate) => typeof candidate === 'string' && candidate.trim());
+  return checkoutId ? checkoutId.trim() : '';
+}
+
+function buildUcpCheckoutCreateArgs(args = {}) {
+  const merchantUrl = String(args.merchant_url || args.merchantUrl || '').trim();
+  const merchantCategoryCode = String(args.merchant_category_code || args.merchantCategoryCode || '').trim();
+  const currency = String(args.currency || '').trim().toUpperCase();
+  const instructionId = String(args.instruction_id || args.instructionId || '').trim();
+  const mandateId = String(args.mandate_id || args.mandateId || '').trim();
+
+  const missing = [];
+  if (!merchantUrl) missing.push('merchant_url');
+  if (!merchantCategoryCode) missing.push('merchant_category_code');
+  if (!currency) missing.push('currency');
+  if (!instructionId) missing.push('instruction_id');
+  if (!mandateId) missing.push('mandate_id');
+  const lineItemsInput = args.line_items ?? args.lineItems;
+  if (lineItemsInput === undefined || lineItemsInput === null || lineItemsInput === '') missing.push('line_items');
+  if (missing.length > 0) {
+    throw new Error(`ucp_checkout missing required fields: ${missing.join(', ')}`);
+  }
+
+  const createArgs = [
+    'ucp-checkout', 'create',
+    '--merchant-url', merchantUrl,
+    '--merchant-category-code', merchantCategoryCode,
+    '--currency', currency,
+    '--instruction-id', instructionId,
+    '--mandate-id', mandateId,
+    '--line-items', normalizeJsonCliFlag(lineItemsInput, 'line_items', { required: true, expectArray: true }),
+  ];
+
+  const merchantName = String(args.merchant_name || args.merchantName || '').trim();
+  if (merchantName) createArgs.push('--merchant-name', merchantName);
+  const orderChannelId = String(args.order_channel_id || args.orderChannelId || '').trim();
+  if (orderChannelId) createArgs.push('--order-channel-id', orderChannelId);
+  const buyerJson = normalizeJsonCliFlag(args.buyer, 'buyer');
+  if (buyerJson) createArgs.push('--buyer', buyerJson);
+  const shippingAddressInput = args.shipping_address ?? args.shippingAddress;
+  const shippingAddressJson = normalizeJsonCliFlag(shippingAddressInput, 'shipping_address');
+  if (shippingAddressJson) createArgs.push('--shipping-address', shippingAddressJson);
+  const metadataJson = normalizeJsonCliFlag(args.metadata, 'metadata');
+  if (metadataJson) createArgs.push('--metadata', metadataJson);
+  const createIdempotencyKey = String(args.create_idempotency_key || args.createIdempotencyKey || args.idempotency_key || args.idempotencyKey || '').trim();
+  if (createIdempotencyKey) createArgs.push('--idempotency-key', createIdempotencyKey);
+
+  return createArgs;
+}
+
+function isTerminalUcpCheckoutStatus(data) {
+  const status = String(data?.status || data?.checkoutStatus || data?.state || '').trim().toLowerCase();
+  return ['completed', 'succeeded', 'success', 'failed', 'canceled', 'cancelled', 'requires_escalation'].includes(status);
+}
+
+async function handle_ucp_checkout(args = {}) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return "ERROR: ucp_checkout requires an args object with merchant_url, merchant_category_code, currency, instruction_id, mandate_id, and line_items.";
+  }
+
+  try {
+    const selectedPaymentMethod = await resolveCurrentUcpCheckoutPaymentInstrument(
+      args.paymentInstrumentId || args.payment_instrument_id || null,
+    );
+    const paymentInstrumentId = selectedPaymentMethod.paymentInstrumentId;
+    const createArgs = buildUcpCheckoutCreateArgs(args);
+    const createData = await runClinkCli(createArgs);
+    await logRequest('ucp_checkout/create', { args: createArgs }, createData);
+
+    const checkoutId = extractUcpCheckoutId(createData);
+    if (!checkoutId) {
+      return `[UCP_CHECKOUT_FSM] state=CREATE_FAILED action=SURFACE_ERROR reason=missing_checkout_id
+The UCP checkout create response did not include data.id, data.checkout_id, or data.checkoutId. Do NOT ask the user to provide a checkoutId manually.
+Payment Instrument ID: ${paymentInstrumentId}
+Create Result: ${JSON.stringify(createData)}`;
+    }
+
+    const completeArgs = [
+      'ucp-checkout', 'complete',
+      '--checkout-id', checkoutId,
+      '--payment-instrument-id', paymentInstrumentId,
+    ];
+    const completeIdempotencyKey = String(args.complete_idempotency_key || args.completeIdempotencyKey || '').trim();
+    if (completeIdempotencyKey) completeArgs.push('--idempotency-key', completeIdempotencyKey);
+    const completeData = await runClinkCli(completeArgs);
+    await logRequest('ucp_checkout/complete', { args: completeArgs }, completeData);
+
+    let verifyData = null;
+    if (!isTerminalUcpCheckoutStatus(completeData)) {
+      try {
+        verifyData = await runClinkCli(['ucp-checkout', 'get', '--checkout-id', checkoutId]);
+        await logRequest('ucp_checkout/get_after_complete', { checkoutId }, verifyData);
+      } catch (verifyError) {
+        await logError('ucp_checkout/get_after_complete', verifyError);
+      }
+    }
+
+    const finalStatus = String(
+      verifyData?.status || completeData?.status || completeData?.checkoutStatus || completeData?.state || 'submitted',
+    ).trim().toLowerCase();
+    const fsmState = finalStatus === 'completed' || finalStatus === 'success' || finalStatus === 'succeeded'
+      ? 'COMPLETED'
+      : finalStatus === 'complete_in_progress'
+        ? 'COMPLETE_IN_PROGRESS'
+        : finalStatus === 'requires_escalation'
+          ? 'REQUIRES_ESCALATION'
+          : 'COMPLETE_SUBMITTED';
+
+    return `[UCP_CHECKOUT_FSM] state=${fsmState} action=RETURN_CHECKOUT_RESULT reason=create_then_complete
+Created the external UCP checkout, captured checkoutId from the create response, and completed it with the current/default paymentInstrumentId.
+Checkout ID: ${checkoutId}
+Payment Instrument ID: ${paymentInstrumentId}
+Create Result: ${JSON.stringify(createData)}
+Complete Result: ${JSON.stringify(completeData)}${verifyData ? `\nVerify Result: ${JSON.stringify(verifyData)}` : ''}
+UCP checkout completion is not merchant fulfillment. The merchant/product runtime still owns delivery, entitlement, receipt, and task resume.`;
+  } catch (err) {
+    await logError('ucp_checkout', err);
+    return `[UCP_CHECKOUT_FSM] state=FAILED action=SURFACE_ERROR reason=${err instanceof ClinkCliError ? 'clink_cli_error' : 'local_validation_error'}
+Failed to create and complete the UCP checkout: ${err.message}`;
+  }
+}
+
 async function handle_get_purchase_instruction_manage_link(args = {}) {
   // Derive the agent-page origin from the backend-issued bindingUrl so it always
   // matches whatever environment the CLI actually talked to (env / CLI config /
@@ -3660,6 +3841,29 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       }
     },
     {
+      name: "ucp_checkout",
+      description: "External UCP checkout state machine: after product/price truth and one matching ACTIVE instruction+mandate are known, resolve the current/default paymentInstrumentId, run clink-cli ucp-checkout create, parse checkoutId, then immediately run clink-cli ucp-checkout complete with --payment-instrument-id. This is not merchant fulfillment.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          merchant_url: { type: "string", description: "External merchant product or checkout URL." },
+          merchant_name: { type: "string", description: "Optional merchant display name." },
+          merchant_category_code: { type: "string", description: "Merchant category code, e.g. 5311." },
+          currency: { type: "string", description: "Checkout currency, e.g. USD." },
+          instruction_id: { type: "string", description: "ACTIVE purchase instruction ID selected for this product order." },
+          mandate_id: { type: "string", description: "Mandate ID selected from the matching ACTIVE instruction." },
+          line_items: { type: "array", description: "UCP line_items array. Prices are minor units and must match the product/order truth." },
+          buyer: { type: "object", description: "Optional buyer object required by the merchant checkout." },
+          shipping_address: { type: "object", description: "Optional shipping address for physical goods that ship." },
+          metadata: { type: "object", description: "Optional metadata object for correlation." },
+          paymentInstrumentId: { type: "string", description: "Optional selected payment instrument. If omitted, the refreshed current/default method is used." },
+          create_idempotency_key: { type: "string", description: "Optional idempotency key for create, stable for the same cart/order attempt." },
+          complete_idempotency_key: { type: "string", description: "Optional idempotency key for complete, scoped to checkoutId + paymentInstrumentId." }
+        },
+        required: ["merchant_url", "merchant_category_code", "currency", "instruction_id", "mandate_id", "line_items"]
+      }
+    },
+    {
       name: "get_purchase_instruction_manage_link",
       description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI link (the agent origin derived from the configured Clink environment, e.g. https://agent.clinkbill.com in production or https://agent.clinkbill.dev in sandbox). Feishu renders this as a button; other channels receive a link.",
       inputSchema: {
@@ -3720,6 +3924,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_refund_status":             result = await handle_get_refund_status(args); break;
       case "prepare_visa_purchase_instruction": result = await handle_prepare_visa_purchase_instruction(args); break;
       case "list_purchase_instructions":    result = await handle_list_purchase_instructions(args); break;
+      case "ucp_checkout":                  result = await handle_ucp_checkout(args); break;
       case "get_purchase_instruction_manage_link": result = await handle_get_purchase_instruction_manage_link(args); break;
       case "install_system_hooks":          result = await handle_install_system_hooks(args); break;
       case "uninstall_system_hooks":        result = await handle_uninstall_system_hooks(args); break;
