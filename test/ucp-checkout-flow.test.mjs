@@ -32,6 +32,12 @@ function buildUcpCheckoutHarness() {
   const sources = [
     'normalizePaymentMethods',
     'findPaymentMethodById',
+    'getPurchaseInstructionId',
+    'getPurchaseInstructionMandateId',
+    'isActivePurchaseInstructionStatus',
+    'isActivePurchaseInstructionMandate',
+    'getUcpCheckoutRequestedMandates',
+    'findReusableUcpCheckoutAuthorization',
     'resolveCurrentUcpCheckoutPaymentInstrument',
     'normalizeJsonCliFlag',
     'extractUcpCheckoutId',
@@ -44,6 +50,21 @@ function buildUcpCheckoutHarness() {
 
   return new Function(`
     function isVisaRegistrationSucceeded(method) { return method?.visaRegistrationSucceeded === true; }
+    function mandateMatchesPurchaseScope(candidateMandate = {}, requestedMandate = {}) {
+      const requestedCurrency = String(requestedMandate.currencyCode || '').trim().toUpperCase();
+      const candidateCurrency = String(candidateMandate.currencyCode || '').trim().toUpperCase();
+      if (requestedCurrency && candidateCurrency !== requestedCurrency) return false;
+      const requestedAmount = Number(requestedMandate.amountLimit);
+      const candidateAmount = Number(candidateMandate.amountLimit);
+      if (Number.isFinite(requestedAmount) && (!Number.isFinite(candidateAmount) || candidateAmount < requestedAmount)) return false;
+      const requestedMcc = String(requestedMandate.merchantCategoryCode || '').trim();
+      const candidateMcc = String(candidateMandate.merchantCategoryCode || '').trim();
+      if (requestedMcc && candidateMcc && candidateMcc !== requestedMcc) return false;
+      const requestedMerchant = String(requestedMandate.preferredMerchantName || '').trim().toLowerCase();
+      const candidateMerchant = String(candidateMandate.preferredMerchantName || candidateMandate.title || candidateMandate.description || '').trim().toLowerCase();
+      return !requestedMerchant || candidateMerchant.includes(requestedMerchant) || requestedMerchant.includes(candidateMerchant);
+    }
+    async function handle_prepare_visa_purchase_instruction(...args) { return globalThis.handle_prepare_visa_purchase_instruction(...args); }
     ${sources}
     async function fetchBindingData(...args) { return globalThis.fetchBindingData(...args); }
     async function runClinkCli(...args) { return globalThis.runClinkCli(...args); }
@@ -56,6 +77,14 @@ function buildUcpCheckoutHarness() {
 test('ucp_checkout creates then completes with the current default payment instrument', async () => {
   const { handle_ucp_checkout } = buildUcpCheckoutHarness();
   const calls = [];
+  const requestedMandate = {
+    title: 'T-shirt purchase',
+    description: 'Shop Example T-shirt',
+    amountLimit: 10,
+    currencyCode: 'USD',
+    merchantCategoryCode: '5311',
+    preferredMerchantName: 'Shop Example',
+  };
 
   globalThis.fetchBindingData = async () => ({
     methods: [{
@@ -67,9 +96,23 @@ test('ucp_checkout creates then completes with the current default payment instr
   });
   globalThis.runClinkCli = async (args) => {
     calls.push(args);
+    if (args[0] === 'instruction' && args[1] === 'list') {
+      return [{
+        instructionId: 'ins_matched',
+        paymentInstrumentId: 'pi_default',
+        status: 'ACTIVE',
+        mandates: [{
+          ...requestedMandate,
+          mandateId: 'mndt_matched',
+          status: 'ACTIVE',
+        }],
+      }];
+    }
     if (args[0] === 'ucp-checkout' && args[1] === 'create') {
       assert.ok(args.includes('--instruction-id'));
+      assert.equal(args[args.indexOf('--instruction-id') + 1], 'ins_matched');
       assert.ok(args.includes('--mandate-id'));
+      assert.equal(args[args.indexOf('--mandate-id') + 1], 'mndt_matched');
       return { checkout_id: 'chk_created', status: 'ready_for_complete' };
     }
     if (args[0] === 'ucp-checkout' && args[1] === 'complete') {
@@ -88,23 +131,89 @@ test('ucp_checkout creates then completes with the current default payment instr
       merchant_name: 'Shop Example',
       merchant_category_code: '5311',
       currency: 'USD',
-      instruction_id: 'ins_123',
-      mandate_id: 'mndt_456',
+      title: 'Shop Example T-shirt',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
+      mandates: [requestedMandate],
       line_items: [{ id: 'li_sku_1', item: { id: 'sku_1', title: 'T-shirt', price: 1000 }, quantity: 1 }],
       buyer: { email: 'buyer@example.com' },
     });
 
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls[0].slice(0, 2), ['ucp-checkout', 'create']);
-    assert.deepEqual(calls[1].slice(0, 2), ['ucp-checkout', 'complete']);
-    assert.equal(calls[1][calls[1].indexOf('--checkout-id') + 1], 'chk_created');
-    assert.equal(calls[1][calls[1].indexOf('--payment-instrument-id') + 1], 'pi_default');
+    assert.equal(calls.length, 3);
+    assert.deepEqual(calls[0], [
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', 'pi_default',
+    ]);
+    assert.deepEqual(calls[1].slice(0, 2), ['ucp-checkout', 'create']);
+    assert.deepEqual(calls[2].slice(0, 2), ['ucp-checkout', 'complete']);
+    assert.equal(calls[2][calls[2].indexOf('--checkout-id') + 1], 'chk_created');
+    assert.equal(calls[2][calls[2].indexOf('--payment-instrument-id') + 1], 'pi_default');
     assert.match(result, /\[UCP_CHECKOUT_FSM\] state=COMPLETED/);
     assert.match(result, /Checkout ID: chk_created/);
     assert.match(result, /Payment Instrument ID: pi_default/);
   } finally {
     delete globalThis.fetchBindingData;
     delete globalThis.runClinkCli;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('ucp_checkout invokes instruction creation workflow when no active instruction mandate matches', async () => {
+  const { handle_ucp_checkout } = buildUcpCheckoutHarness();
+  const calls = [];
+  const requestedMandate = {
+    description: 'Shop Example T-shirt',
+    amountLimit: 10,
+    currencyCode: 'USD',
+    merchantCategoryCode: '5311',
+    preferredMerchantName: 'Shop Example',
+  };
+
+  globalThis.fetchBindingData = async () => ({
+    methods: [{ paymentInstrumentId: 'pi_default', paymentMethodType: 'CARD', cardBrand: 'visa', isDefault: true }],
+  });
+  globalThis.runClinkCli = async (args) => {
+    calls.push(args);
+    if (args[0] === 'instruction' && args[1] === 'list') return [];
+    throw new Error(`ucp-checkout must not run without an active instruction+mandate: ${JSON.stringify(args)}`);
+  };
+  globalThis.handle_prepare_visa_purchase_instruction = async (args) => {
+    calls.push(['prepare_visa_purchase_instruction', args]);
+    assert.equal(args.paymentInstrumentId, 'pi_default');
+    assert.equal(args.title, 'Shop Example T-shirt');
+    assert.equal(args.fulfillmentType, 'NO_SHIPPING_REQUIRED');
+    assert.deepEqual(args.mandates, [requestedMandate]);
+    return '[VIC_STATE_MACHINE] state=CREATED_DRAFT\nInstruction ID: ins_new';
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handle_ucp_checkout({
+      merchant_url: 'https://shop.example/products/t-shirt?variant=123',
+      merchant_name: 'Shop Example',
+      merchant_category_code: '5311',
+      currency: 'USD',
+      title: 'Shop Example T-shirt',
+      fulfillmentType: 'NO_SHIPPING_REQUIRED',
+      mandates: [requestedMandate],
+      line_items: [{ id: 'li_sku_1', item: { id: 'sku_1', title: 'T-shirt', price: 1000 }, quantity: 1 }],
+    });
+
+    assert.deepEqual(calls[0], [
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', 'pi_default',
+    ]);
+    assert.equal(calls[1][0], 'prepare_visa_purchase_instruction');
+    assert.match(result, /state=INSTRUCTION_WORKFLOW_REQUIRED/);
+    assert.match(result, /no matching ACTIVE instruction\+mandate/i);
+    assert.doesNotMatch(result, /state=COMPLETED/);
+  } finally {
+    delete globalThis.fetchBindingData;
+    delete globalThis.runClinkCli;
+    delete globalThis.handle_prepare_visa_purchase_instruction;
     delete globalThis.logRequest;
     delete globalThis.logError;
   }
@@ -122,12 +231,17 @@ test('ucp checkout id extraction accepts all current create response shapes', ()
 test('ucp_checkout tool and SKILL docs require continuous create to complete handoff', () => {
   assert.match(indexSource, /name: "ucp_checkout"/);
   assert.match(indexSource, /case "ucp_checkout"/);
+  assert.match(indexSource, /instruction',\s*'list'/);
   assert.match(indexSource, /ucp-checkout',\s*'create'/);
   assert.match(indexSource, /ucp-checkout',\s*'complete'/);
   assert.match(indexSource, /--payment-instrument-id/);
 
   assert.match(skillSource, /UCP Checkout Product Order Flow/i);
   assert.match(skillSource, /ucp_checkout/);
+  assert.match(skillSource, /instruction list/i);
+  assert.match(skillSource, /instruction_id/i);
+  assert.match(skillSource, /mandate_id/i);
+  assert.match(skillSource, /创建 instruction workflow|instruction creation workflow/i);
   assert.match(skillSource, /create.*complete/is);
   assert.match(skillSource, /checkoutId/);
   assert.match(skillSource, /current\/default paymentInstrumentId/i);

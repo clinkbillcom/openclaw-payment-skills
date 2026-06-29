@@ -3175,6 +3175,103 @@ Do NOT ask for a payment link, payment URL,代付链接, Session ID, or tell the
 // ------------------------------------------------------------------
 // UCP CHECKOUT (external/shadow merchant order)
 // ------------------------------------------------------------------
+function getPurchaseInstructionId(instruction = {}) {
+  const id = instruction.instructionId
+    || instruction.purchaseInstructionId
+    || instruction.instruction_id
+    || instruction.id;
+  return typeof id === 'string' && id.trim() ? id.trim() : '';
+}
+
+function getPurchaseInstructionMandateId(mandate = {}) {
+  const id = mandate.mandateId
+    || mandate.mandate_id
+    || mandate.purchaseInstructionMandateId
+    || mandate.purchase_instruction_mandate_id
+    || mandate.id;
+  return typeof id === 'string' && id.trim() ? id.trim() : '';
+}
+
+function isActivePurchaseInstructionStatus(status) {
+  return String(status || '').trim().toUpperCase() === 'ACTIVE';
+}
+
+function isActivePurchaseInstructionMandate(mandate = {}) {
+  if (!getPurchaseInstructionMandateId(mandate)) return false;
+  const statusCandidates = [
+    mandate.status,
+    mandate.mandateStatus,
+    mandate.state,
+    mandate.lifecycleStatus,
+  ].filter((value) => value !== undefined && value !== null && String(value).trim());
+  if (statusCandidates.length > 0 && !statusCandidates.every(isActivePurchaseInstructionStatus)) {
+    return false;
+  }
+
+  if (mandate.isReserved === true || mandate.reserved === true || mandate.isLocked === true || mandate.locked === true) {
+    return false;
+  }
+  const unavailableText = [
+    mandate.reservationStatus,
+    mandate.lockStatus,
+    mandate.usageStatus,
+    mandate.availability,
+  ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean).join(' ');
+  if (/\b(reserved|reserve|locked|lock|in[_ -]?use|unavailable)\b/.test(unavailableText)) {
+    return false;
+  }
+  return true;
+}
+
+function getUcpCheckoutRequestedMandates(args = {}) {
+  let mandates = args.mandates;
+  if (typeof mandates === 'string') {
+    try {
+      mandates = JSON.parse(mandates);
+    } catch (error) {
+      throw new Error(`ucp_checkout 'mandates' must be valid JSON when passed as a string: ${error.message}`);
+    }
+  }
+  if (!Array.isArray(mandates) || mandates.length === 0) {
+    throw new Error("ucp_checkout requires a non-empty 'mandates' array so it can match an ACTIVE instruction+mandate or start the instruction creation workflow.");
+  }
+  return mandates;
+}
+
+function findReusableUcpCheckoutAuthorization(instructions, {
+  paymentInstrumentId,
+  mandates,
+  instructionIdHint = '',
+  mandateIdHint = '',
+} = {}) {
+  if (!Array.isArray(instructions) || !paymentInstrumentId || !Array.isArray(mandates) || mandates.length === 0) {
+    return null;
+  }
+  const normalizedInstructionIdHint = String(instructionIdHint || '').trim();
+  const normalizedMandateIdHint = String(mandateIdHint || '').trim();
+
+  for (const instruction of instructions) {
+    if (!instruction || instruction.paymentInstrumentId !== paymentInstrumentId) continue;
+    if (!isActivePurchaseInstructionStatus(instruction.status)) continue;
+    const instructionId = getPurchaseInstructionId(instruction);
+    if (!instructionId) continue;
+    if (normalizedInstructionIdHint && instructionId !== normalizedInstructionIdHint) continue;
+
+    const instructionMandates = Array.isArray(instruction.mandates) ? instruction.mandates : [];
+    for (const mandate of instructionMandates) {
+      const mandateId = getPurchaseInstructionMandateId(mandate);
+      if (!mandateId) continue;
+      if (normalizedMandateIdHint && mandateId !== normalizedMandateIdHint) continue;
+      if (!isActivePurchaseInstructionMandate(mandate)) continue;
+      if (mandates.every((requestedMandate) => mandateMatchesPurchaseScope(mandate, requestedMandate))) {
+        return { instruction, mandate, instructionId, mandateId };
+      }
+    }
+  }
+
+  return null;
+}
+
 async function resolveCurrentUcpCheckoutPaymentInstrument(paymentInstrumentId = null) {
   const requestedPaymentInstrumentId = typeof paymentInstrumentId === 'string'
     ? paymentInstrumentId.trim()
@@ -3235,12 +3332,12 @@ function extractUcpCheckoutId(data) {
   return checkoutId ? checkoutId.trim() : '';
 }
 
-function buildUcpCheckoutCreateArgs(args = {}) {
+function buildUcpCheckoutCreateArgs(args = {}, resolvedAuthorization = {}) {
   const merchantUrl = String(args.merchant_url || args.merchantUrl || '').trim();
   const merchantCategoryCode = String(args.merchant_category_code || args.merchantCategoryCode || '').trim();
   const currency = String(args.currency || '').trim().toUpperCase();
-  const instructionId = String(args.instruction_id || args.instructionId || '').trim();
-  const mandateId = String(args.mandate_id || args.mandateId || '').trim();
+  const instructionId = String(resolvedAuthorization.instructionId || args.instruction_id || args.instructionId || '').trim();
+  const mandateId = String(resolvedAuthorization.mandateId || args.mandate_id || args.mandateId || '').trim();
 
   const missing = [];
   if (!merchantUrl) missing.push('merchant_url');
@@ -3288,7 +3385,7 @@ function isTerminalUcpCheckoutStatus(data) {
 
 async function handle_ucp_checkout(args = {}) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
-    return "ERROR: ucp_checkout requires an args object with merchant_url, merchant_category_code, currency, instruction_id, mandate_id, and line_items.";
+    return "ERROR: ucp_checkout requires an args object with merchant_url, merchant_category_code, currency, mandates, fulfillmentType, title, and line_items.";
   }
 
   try {
@@ -3296,9 +3393,44 @@ async function handle_ucp_checkout(args = {}) {
       args.paymentInstrumentId || args.payment_instrument_id || null,
     );
     const paymentInstrumentId = selectedPaymentMethod.paymentInstrumentId;
-    const createArgs = buildUcpCheckoutCreateArgs(args);
+    const requestedMandates = getUcpCheckoutRequestedMandates(args);
+    const instructionList = await runClinkCli([
+      'instruction', 'list',
+      '--status', 'ACTIVE',
+      '--payment-instrument-id', paymentInstrumentId,
+    ]);
+    await logRequest('ucp_checkout/list_active_instructions', { paymentInstrumentId }, instructionList);
+
+    const authorization = findReusableUcpCheckoutAuthorization(instructionList, {
+      paymentInstrumentId,
+      mandates: requestedMandates,
+      instructionIdHint: args.instruction_id || args.instructionId || '',
+      mandateIdHint: args.mandate_id || args.mandateId || '',
+    });
+
+    if (!authorization) {
+      const title = String(args.title || args.instruction_title || args.instructionTitle || args.merchant_name || args.merchantName || '').trim();
+      const fulfillmentType = args.fulfillmentType || args.fulfillment_type;
+      const prepareResult = await handle_prepare_visa_purchase_instruction({
+        ...args,
+        paymentInstrumentId,
+        title,
+        fulfillmentType,
+        mandates: requestedMandates,
+      });
+      return `[UCP_CHECKOUT_FSM] state=INSTRUCTION_WORKFLOW_REQUIRED action=WAIT_INSTRUCTION_ACTIVATION reason=no_matching_active_instruction_mandate
+No matching ACTIVE instruction+mandate was found for this product order after listing instructions with status=ACTIVE and paymentInstrumentId=${paymentInstrumentId}.
+The instruction creation workflow has been invoked. Do NOT run ucp-checkout create or complete until a matching instruction+mandate is ACTIVE.
+${prepareResult}`;
+    }
+
+    const createArgs = buildUcpCheckoutCreateArgs(args, authorization);
     const createData = await runClinkCli(createArgs);
-    await logRequest('ucp_checkout/create', { args: createArgs }, createData);
+    await logRequest('ucp_checkout/create', {
+      args: createArgs,
+      instructionId: authorization.instructionId,
+      mandateId: authorization.mandateId,
+    }, createData);
 
     const checkoutId = extractUcpCheckoutId(createData);
     if (!checkoutId) {
@@ -3343,6 +3475,8 @@ Create Result: ${JSON.stringify(createData)}`;
 Created the external UCP checkout, captured checkoutId from the create response, and completed it with the current/default paymentInstrumentId.
 Checkout ID: ${checkoutId}
 Payment Instrument ID: ${paymentInstrumentId}
+Instruction ID: ${authorization.instructionId}
+Mandate ID: ${authorization.mandateId}
 Create Result: ${JSON.stringify(createData)}
 Complete Result: ${JSON.stringify(completeData)}${verifyData ? `\nVerify Result: ${JSON.stringify(verifyData)}` : ''}
 UCP checkout completion is not merchant fulfillment. The merchant/product runtime still owns delivery, entitlement, receipt, and task resume.`;
@@ -3842,7 +3976,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "ucp_checkout",
-      description: "External UCP checkout state machine: after product/price truth and one matching ACTIVE instruction+mandate are known, resolve the current/default paymentInstrumentId, run clink-cli ucp-checkout create, parse checkoutId, then immediately run clink-cli ucp-checkout complete with --payment-instrument-id. This is not merchant fulfillment.",
+      description: "External UCP checkout state machine: resolve the current/default paymentInstrumentId, list ACTIVE instructions by paymentInstrumentId, match a valid instruction_id + mandate_id for the product/order scope, create an instruction draft when no match exists, otherwise run clink-cli ucp-checkout create then complete. This is not merchant fulfillment.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3850,8 +3984,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           merchant_name: { type: "string", description: "Optional merchant display name." },
           merchant_category_code: { type: "string", description: "Merchant category code, e.g. 5311." },
           currency: { type: "string", description: "Checkout currency, e.g. USD." },
-          instruction_id: { type: "string", description: "ACTIVE purchase instruction ID selected for this product order." },
-          mandate_id: { type: "string", description: "Mandate ID selected from the matching ACTIVE instruction." },
+          title: { type: "string", description: "Instruction title used if no matching instruction+mandate exists and the tool must start the instruction creation workflow." },
+          fulfillmentType: {
+            type: "string",
+            enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"],
+            description: "Instruction workflow fulfillment classification. Required so missing checkout authorization can create the right instruction draft."
+          },
+          mandates: { type: "array", description: "Requested mandate scope used to match an ACTIVE instruction+mandate and to create a draft when no match exists." },
+          instruction_id: { type: "string", description: "Optional instruction ID hint. The tool still lists ACTIVE instructions and verifies the hint before checkout." },
+          mandate_id: { type: "string", description: "Optional mandate ID hint. The tool still lists ACTIVE instructions and verifies the hint before checkout." },
           line_items: { type: "array", description: "UCP line_items array. Prices are minor units and must match the product/order truth." },
           buyer: { type: "object", description: "Optional buyer object required by the merchant checkout." },
           shipping_address: { type: "object", description: "Optional shipping address for physical goods that ship." },
@@ -3860,7 +4001,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           create_idempotency_key: { type: "string", description: "Optional idempotency key for create, stable for the same cart/order attempt." },
           complete_idempotency_key: { type: "string", description: "Optional idempotency key for complete, scoped to checkoutId + paymentInstrumentId." }
         },
-        required: ["merchant_url", "merchant_category_code", "currency", "instruction_id", "mandate_id", "line_items"]
+        required: ["merchant_url", "merchant_category_code", "currency", "title", "fulfillmentType", "mandates", "line_items"]
       }
     },
     {
