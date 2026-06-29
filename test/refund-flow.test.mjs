@@ -14,5 +14,5 @@ test('clink_refund no longer auto-starts refund status poll fallback', () => {
   const refundHandler = extractRefundHandler(source);
   assert.ok(refundHandler.includes('async function handle_clink_refund(args) {'));
   assert.doesNotMatch(refundHandler, /ensureRequiredPollFallback\([\s\S]*['"]refund_status['"]/);
-  assert.doesNotMatch(refundHandler, /DIRECT_SEND_POLL_REQUIRED/);
+  assert.doesNotMatch(refundHandler, new RegExp('DIRECT_SEND_' + 'POLL_REQUIRED'));
 });

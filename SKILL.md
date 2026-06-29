@@ -1,6 +1,6 @@
 ---
 name: openclaw-payment-skills
-description: "Clink payment skill. Use when the user wants to: install/uninstall this skill, initialize a Clink wallet (or replies with an email address after install), bind/manage payment methods, configure risk rules, pay or recharge via Clink, refund a Clink order or check refund status, or manage Visa purchase-instruction authorization (修改/查看/取消授权). ALSO triggers when the user expresses any purchase/book/order/reserve intent (buy, order, book, reserve, 下单, 购买, 预订, 买票) that should route to VIC when the current card is Visa — even if the message never mentions Clink, Visa, or wallets. Do NOT trigger on generic auto-top-up phrases (e.g. 开启自动充值) owned by a merchant skill unless the same message clearly refers to Clink, wallet, payment setup, or this skill by name."
+description: "OpenClaw payment skill for Clink wallet setup, payment-method management, merchant-initiated payments, refunds, VIC authorization, and async completion through a clink-cli event-polling event pump. Also triggers for purchase/book/order intents that should route to VIC when the current card is Visa. Async notify routing uses a unified channel + target contract; Feishu uses native cards, Telegram uses rich text/media delivery, and other channels fall back to markdown/text."
 version: "1.0.0"
 metadata:
   openclaw:
@@ -39,7 +39,7 @@ tools:
   - name: get_purchase_instruction_manage_link
     description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://agent.clinkbill.dev in sandbox) as the authorization management link."
   - name: install_system_hooks
-    description: Update `openclaw.json` and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.
+    description: Save notify routing, refresh the event pump when usable wallet credentials are available, and restart the gateway in the background after a 3-second delay. MCP registration is performed by `pre_install.mjs`.
   - name: uninstall_system_hooks
     description: Uninstall Clink Payment Skill by stopping the event pump and removing config, cache, and any legacy webhook artifacts, then restart the gateway in the background after a 3-second delay. Must only be called after explicit text authorization from the user.
 ---
@@ -207,7 +207,10 @@ When the user asks to install this skill, follow `README.md` / `README-zh.md` on
 - Use the documented manual install command there.
 - Do not substitute a partial MCP-only setup for the documented install flow.
 - Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
-- `pre_install.mjs` already schedules the gateway restart in the background; do not trigger a second manual restart after it succeeds.
+- `pre_install.mjs` registers the MCP server, saves notify routing, schedules the gateway restart, and sends the install success notification immediately.
+- `pre_install.mjs` does not install a payment webhook transform or `/hooks/clink/payment` route.
+- The event pump starts idempotently when usable wallet credentials are available (after wallet initialization or an existing credential cache); do not promise async completion before that point.
+- Do not trigger a second manual restart after `pre_install.mjs` succeeds.
 - Installation success is notified immediately; do not wait for or promise a later restart-success card.
 
 **Truthfulness guardrail**

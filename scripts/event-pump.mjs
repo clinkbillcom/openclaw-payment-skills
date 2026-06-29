@@ -41,6 +41,10 @@ import {
   isVisaRegistrationSucceeded,
   markVicRegistrationReady,
 } from '../vic-registration-state-utils.mjs';
+import {
+  classifyEventWorkflow,
+  eventTypeOf as classifyEventTypeOf,
+} from '../lib/event-workflow-fsm.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_DIR = path.resolve(SCRIPT_DIR, '..');
@@ -521,7 +525,17 @@ async function sendVicRegistrationComplete(cachedMethod, data) {
 // ─── Event dispatch ───
 
 function eventTypeOf(event) {
-  return event?.eventType || event?.data?.type || event?.type || '';
+  return classifyEventTypeOf(event);
+}
+
+function formatEventFsmLog(workflow) {
+  return {
+    domain: workflow.domain,
+    state: workflow.state,
+    action: workflow.action,
+    terminal: workflow.terminal,
+    reason: workflow.reason,
+  };
 }
 
 function resolveVicTargetId(event) {
@@ -537,6 +551,12 @@ function resolveVicTargetId(event) {
 
 async function dispatchEvent(event) {
   const type = eventTypeOf(event);
+  const workflow = classifyEventWorkflow(event);
+  await logRequest('event_fsm', {
+    type,
+    resourceId: event?.resourceId || null,
+    workflow: formatEventFsmLog(workflow),
+  });
   const data = (event && event.data && typeof event.data === 'object') ? event.data : {};
 
   switch (type) {

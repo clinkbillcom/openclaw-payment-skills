@@ -41,7 +41,7 @@
 - 支付方式绑定和管理
 - 风控规则相关流程
 - 发起 Clink 支付
-- 处理支付层 webhook
+- 处理支付层 event pump 事件
 - 在拥有成功事件时触发商户到账确认
 
 `agent-payment-skills` 不负责：
@@ -244,7 +244,7 @@ Agent 应执行：
 3. 使用用户本轮金额或商户默认支付金额
 4. 调用 `agent-payment-skills.pre_check_account`
 5. 调用 `agent-payment-skills.clink_pay`
-6. 若返回 `WAIT_FOR_WEBHOOK`，当前轮不再补动作，等待异步 handoff
+6. 若返回 `WAIT_FOR_EVENT_PUMP`，当前轮不再补动作，等待 event pump 异步 handoff
 7. 商户确认到账后，自动恢复被中断的原任务
 
 关键点：
@@ -321,11 +321,11 @@ Agent 必须：
 
 - 执行一次，而且只能执行一次
 
-### `WAIT_FOR_WEBHOOK`
+### `WAIT_FOR_EVENT_PUMP`
 
 含义：
 
-- 当前支付链路要等待异步 webhook 接管
+- 当前支付链路要等待异步 event pump 接管
 
 Agent 必须：
 
@@ -374,7 +374,7 @@ Before calling clink_pay:
 After clink_pay returns:
 - If the result indicates DIRECT_SEND, do not send a duplicate card.
 - If the result indicates EXEC_REQUIRED, execute it exactly once.
-- If the result indicates WAIT_FOR_WEBHOOK, wait.
+- If the result indicates WAIT_FOR_EVENT_PUMP, wait.
 - Do not declare merchant recharge success until this merchant's check_recharge_status confirms credited=true or status=paid.
 - Do not send a second terminal success or failure for the same order_id.
 - After merchant recharge is confirmed, automatically resume the interrupted original task.
@@ -471,7 +471,7 @@ modelmax-media.check_recharge_status
 - `check_recharge_status` 是否能返回 `credited` / `status`
 - Agent 是否在支付前调用 `pre_check_account`
 - Agent 是否把 `merchant_confirm_server` / `merchant_confirm_tool` / `merchant_confirm_args` 传给 `clink_pay`
-- Agent 是否正确处理 `DIRECT_SEND` / `EXEC_REQUIRED` / `WAIT_FOR_WEBHOOK`
+- Agent 是否正确处理 `DIRECT_SEND` / `EXEC_REQUIRED` / `WAIT_FOR_EVENT_PUMP`
 - Agent 是否避免重复发送终态成功/失败
 - 商户确认到账后是否自动恢复原任务
 

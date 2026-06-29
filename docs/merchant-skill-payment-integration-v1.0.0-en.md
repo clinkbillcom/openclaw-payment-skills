@@ -44,7 +44,7 @@ The merchant skill should not implement a separate payment state machine from sc
 - payment-method binding and management
 - risk-rule related flows
 - initiating Clink payments
-- handling payment-layer webhooks
+- handling payment-layer event-pump events
 - triggering merchant-side confirmation when the payment layer owns the success event
 
 `agent-payment-skills` is not responsible for:
@@ -247,7 +247,7 @@ The agent should:
 3. use the current-turn user amount or the merchant default amount
 4. call `agent-payment-skills.pre_check_account`
 5. call `agent-payment-skills.clink_pay`
-6. if the result is `WAIT_FOR_WEBHOOK`, stop adding actions in the current turn and wait for async handoff
+6. if the result is `WAIT_FOR_EVENT_PUMP`, stop adding actions in the current turn and wait for async handoff
 7. automatically resume the interrupted original task after the merchant confirms credit
 
 Key points:
@@ -324,7 +324,7 @@ The agent must:
 
 - execute it exactly once
 
-### `WAIT_FOR_WEBHOOK`
+### `WAIT_FOR_EVENT_PUMP`
 
 Meaning:
 
@@ -377,7 +377,7 @@ Before calling clink_pay:
 After clink_pay returns:
 - If the result indicates DIRECT_SEND, do not send a duplicate card.
 - If the result indicates EXEC_REQUIRED, execute it exactly once.
-- If the result indicates WAIT_FOR_WEBHOOK, wait.
+- If the result indicates WAIT_FOR_EVENT_PUMP, wait.
 - Do not declare merchant recharge success until this merchant's check_recharge_status confirms credited=true or status=paid.
 - Do not send a second terminal success or failure for the same order_id.
 - After merchant recharge is confirmed, automatically resume the interrupted original task.
@@ -474,7 +474,7 @@ the agent must treat it as "not credited yet", not as success or terminal failur
 - can `check_recharge_status` return `credited` / `status`
 - does the agent call `pre_check_account` before payment
 - does the agent pass `merchant_confirm_server` / `merchant_confirm_tool` / `merchant_confirm_args` to `clink_pay`
-- does the agent correctly handle `DIRECT_SEND` / `EXEC_REQUIRED` / `WAIT_FOR_WEBHOOK`
+- does the agent correctly handle `DIRECT_SEND` / `EXEC_REQUIRED` / `WAIT_FOR_EVENT_PUMP`
 - does the agent avoid duplicate terminal success/failure
 - does the agent automatically resume the original task after merchant credit is confirmed
 

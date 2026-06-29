@@ -58,7 +58,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` 会完成 MCP 注册、网关重启调度，并立即发送安装成功通知。它成功后不要再手动执行第二次 `openclaw gateway restart`。所有 Clink 操作通过内置的 `clink-cli`（`vendor/clink-cli/clink-cli.bundle.mjs`）执行；异步完成通知由邮箱事件轮询器（`scripts/event-pump.mjs`）投递，因此不再安装 Webhook 路由。
+`pre_install.mjs` 会注册 MCP server、保存通知目标、安排 gateway 重启，并立即发送安装成功通知。它不会安装支付 webhook transform，也不会配置 `/hooks/clink/payment` 路由。它成功后不要再手动执行第二次 `openclaw gateway restart`。所有 Clink 操作通过内置的 `clink-cli`（`vendor/clink-cli/clink-cli.bundle.mjs`）执行；异步完成通知由 mailbox event pump 负责，钱包凭据可用后 event pump 会通过 `clink-cli events poll` 轮询事件。
 
 ---
 
@@ -136,7 +136,8 @@ node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-typ
 
 - 实际支付是否成功取决于你的 Clink 账户状态和可用支付方式
 - 部分支付可能需要额外验证，例如 3DS
-- 退款申请当前按全额退款提交，最终结果通过邮箱事件轮询器异步投递
+- 退款申请当前只支持全额退款；最终状态通过 event pump 或显式退款状态查询异步确认
+- 本 Skill 不暴露也不安装支付 webhook 路由；绑卡、风控规则更新、3DS 后支付结果、退款和 VIC 就绪状态都通过 `clink-cli events poll` 观测
 - 风控规则可能会拦截或限制充值
 - 如果你明确指定了充值金额，Agent 应优先使用你的金额
 

@@ -2,6 +2,8 @@
 
 English | [简体中文](merchant-skill-payment-integration-v1.0.1.md)
 
+> Current payment-layer async behavior: `openclaw-payment-skills` no longer installs a payment webhook route. Pending payment, post-3DS payment, payment-method, refund, risk-rule, and VIC completion events are consumed by the payment skill's event pump through `clink-cli events poll`. Merchant backends may still need their own documented webhooks such as `customer.verify`; that merchant-server webhook responsibility is separate from the payment skill's async event pump.
+
 ## Document Version
 
 - Document version: `v1.0.1`
@@ -13,7 +15,7 @@ This document is for **merchant skill agent authors, prompt authors, and tool de
 
 The goal is not to explain the end-user features of `agent-payment-skills`. The goal is to define:
 
-> How a merchant skill should integrate `agent-payment-skills` under the current design, and how to correctly handle payment execution, transaction success confirmation, async webhooks, idempotency, and original-task resume.
+> How a merchant skill should integrate `agent-payment-skills` under the current design, and how to correctly handle payment execution, transaction success confirmation, async event-pump events, idempotency, and original-task resume.
 
 It is recommended to share this document with both audiences:
 
@@ -38,7 +40,7 @@ If you remember only one thing, remember this:
 - payment method binding and management
 - risk rule flows
 - initiating Clink payment
-- handling payment-layer webhooks
+- handling payment-layer event-pump events
 - triggering merchant-side transaction success confirmation when the payment layer owns the success event
 
 `agent-payment-skills` is not responsible for:
@@ -69,7 +71,7 @@ The agent is not responsible for:
 - reusing an old `merchant_id` from memory
 - sending a semantically equivalent duplicate card after the payment skill already sent one
 - declaring merchant-side success before the merchant confirms transaction success
-- triggering merchant confirmation again after webhook handoff has already taken over
+- triggering merchant confirmation again after event-pump handoff has already taken over
 
 ### One-Sentence Rule for Agents
 
@@ -374,7 +376,7 @@ Field meanings:
 - `session_id`
   - optional, returned in session mode
 - `trigger_source`
-  - indicates whether the handoff comes from the synchronous success path or the webhook success path
+  - indicates whether the handoff comes from the synchronous success path or the event-pump success path
 - `channel`
   - the notification channel for the current conversation
 - `notify_target`
@@ -475,7 +477,7 @@ Standard flow:
 3. the merchant skill / agent obtains `session_id`
 4. call `agent-payment-skills.pre_check_account`
 5. call `agent-payment-skills.clink_pay` with `sessionId`
-6. if the current chain is waiting for webhook, do not add extra actions in the current turn
+6. if the current chain is waiting for event-pump completion, do not add extra actions in the current turn
 7. after the merchant confirms transaction success, automatically resume the interrupted original task
 
 Key points:
@@ -534,7 +536,7 @@ sequenceDiagram
         P->>T: confirm_tool(payment_handoff)
         T-->>P: credited / pending / failed
     else 3DS or pending
-        P-->>A: WAIT_FOR_WEBHOOK
+        P-->>A: WAIT_FOR_EVENT_PUMP
         C-->>W: agent_order.succeeded / failed
         W->>P: webhook wake
         alt Webhook success
@@ -614,7 +616,7 @@ The agent must:
 
 - execute it once, and only once
 
-### `WAIT_FOR_WEBHOOK`
+### `WAIT_FOR_EVENT_PUMP`
 
 Meaning:
 
@@ -624,7 +626,7 @@ The agent must:
 
 - not add success or failure in the current turn
 - not trigger merchant confirmation again by itself
-- wait for webhook or later payment-layer handoff
+- wait for event-pump completion or later payment-layer handoff
 
 ### `NO_REPLY`
 
@@ -679,7 +681,7 @@ This section prevents three common categories of mistakes:
 - the merchant backend did not implement `create-agent-payment-session`
 - a second payment card was sent after receiving `DIRECT_SEND`
 - merchant confirmation was manually triggered again after sync success
-- the flow did not wait for webhook in pending / 3DS cases and resumed the original task too early
+- the flow did not wait for event-pump completion in pending / 3DS cases and resumed the original task too early
 - "transaction successful" was announced before the merchant had confirmed transaction success
 - the merchant side did not integrate or ignored the `customer.verify` webhook
 

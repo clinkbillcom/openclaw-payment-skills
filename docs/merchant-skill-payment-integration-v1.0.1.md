@@ -2,6 +2,8 @@
 
 简体中文
 
+> 当前支付层异步行为：`openclaw-payment-skills` 不再安装支付 webhook 路由。pending 支付、3DS 后支付结果、支付方式、退款、风控规则和 VIC 完成事件，都由 payment skill 的 event pump 通过 `clink-cli events poll` 消费。商户后端仍可能需要实现官方文档要求的 webhook，例如 `customer.verify`；这是商户服务端职责，和 payment skill 的 event pump 是两层不同机制。
+
 ## 文档版本
 
 - 文档版本：`v1.0.1`
@@ -38,7 +40,7 @@
 - 支付方式绑定和管理
 - 风控规则流程
 - 发起 Clink 支付
-- 处理支付层 webhook
+- 处理支付层 event pump 事件
 - 在拥有成功事件时触发商户交易成功确认
 
 `agent-payment-skills` 不负责：
@@ -69,7 +71,7 @@ Agent 不负责：
 - 用记忆复用旧的 `merchant_id`
 - 在 payment skill 已经发卡后再补一张等价卡片
 - 在商户确认交易成功前擅自宣布商户侧成功
-- 在 webhook 接管后重复触发商户确认
+- 在 event pump 接管后重复触发商户确认
 
 ### 给 Agent 的一句话规则
 
@@ -374,7 +376,7 @@ payment skill 在真正调用商户确认工具时，会自动把这些参数与
 - `session_id`
   - 可选，会话模式下回传
 - `trigger_source`
-  - 表明 handoff 来自同步成功路径还是 webhook 成功路径
+  - 表明 handoff 来自同步成功路径还是 event pump 成功路径
 - `channel`
   - 当前会话的通知通道
 - `notify_target`
@@ -475,7 +477,7 @@ Agent 执行时要注意：
 3. 商户 Skill / Agent 拿到 `session_id`
 4. 调用 `agent-payment-skills.pre_check_account`
 5. 使用 `sessionId` 调用 `agent-payment-skills.clink_pay`
-6. 若当前链路等待 webhook，则当前轮不再补动作
+6. 若当前链路等待 event pump 完成，则当前轮不再补动作
 7. 商户确认交易成功后，自动恢复被中断的原任务
 
 关键点：
@@ -534,7 +536,7 @@ sequenceDiagram
         P->>T: confirm_tool(payment_handoff)
         T-->>P: credited / pending / failed
     else 3DS 或 pending
-        P-->>A: WAIT_FOR_WEBHOOK
+        P-->>A: WAIT_FOR_EVENT_PUMP
         C-->>W: agent_order.succeeded / failed
         W->>P: webhook wake
         alt webhook 成功
@@ -614,11 +616,11 @@ Agent 必须：
 
 - 执行一次，而且只能执行一次
 
-### `WAIT_FOR_WEBHOOK`
+### `WAIT_FOR_EVENT_PUMP`
 
 含义：
 
-- 当前支付链路要等待异步 webhook 接管
+- 当前支付链路要等待异步 event pump 接管
 
 Agent 必须：
 

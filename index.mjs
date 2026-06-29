@@ -15,6 +15,12 @@ import {
   resolveVicRegistrationState,
   VIC_REGISTRATION_STATE_TTL_MS,
 } from "./vic-registration-state-utils.mjs";
+import {
+  PaymentWorkflowAction,
+  PaymentWorkflowState,
+  classifyPaymentError,
+  classifyPaymentResponse,
+} from './lib/payment-workflow-fsm.mjs';
 
 // ------------------------------------------------------------------
 // CONFIG HELPERS
@@ -384,15 +390,8 @@ function ensureEventPumpRunning() {
 
 // Async completion (card bound, order/refund result, instruction activation,
 // risk-rule update) is delivered by the event pump, not by per-operation
-// pollers. These shims keep handler call sites stable while scheduling nothing.
-async function ensureRequiredPollFallback() {
-  return { required: false, operation: null };
-}
-
-function getRequiredPollFallbackLines() {
-  return [];
-}
-
+// pollers.
+//
 // Build the agent-facing DIRECT_SEND directive after a notification has already
 // been delivered. webhookWaitMessage (if provided) explains how the completion
 // notification will arrive.
@@ -406,6 +405,14 @@ function buildDirectSendDirective({ summary, suffix, webhookWaitMessage } = {}) 
   let result = sections.join('\n');
   if (suffix) result += '\n\n' + suffix;
   return result;
+}
+
+function formatPaymentFsmDirective(workflow) {
+  if (!workflow || typeof workflow !== 'object') return '';
+  const state = workflow.state || 'UNKNOWN';
+  const action = workflow.action || 'UNKNOWN';
+  const reason = workflow.reason || 'unspecified';
+  return `[PAYMENT_FSM] state=${state} action=${action} reason=${reason}`;
 }
 
 
@@ -1257,11 +1264,16 @@ function buildBareDomainUrl(bindingUrl) {
   }
 }
 
-function buildRiskRulesNotification(bindingUrl) {
-  const riskUrl = buildBareDomainUrl(bindingUrl);
+// Risk-rules page URL comes from clink-cli `risk link` (the canonical /risk-rules-setup
+// deep link). The CLI derives the agent domain from the resolved API base (CLINK_BASE_URL,
+// forwarded by runClinkCli), so production / sandbox / UAT all resolve correctly without a
+// flag. No network request; --no-watch because the mailbox event pump owns async
+// risk_rule.updated delivery.
+async function buildRiskRulesNotification() {
+  const data = await runClinkCli(['risk', 'link', '--no-watch']);
   return createMessageRequest({
     messageKey: 'risk.rules_link',
-    vars: { riskUrl },
+    vars: { riskUrl: data.url || '' },
   });
 }
 
@@ -1525,27 +1537,10 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
     cardDisplay,
     passkeyUrl,
   });
-  const snapshotBefore = latestMethods.length > 0
-    ? latestMethods
-    : normalizePaymentMethods(cache.paymentMethods || [method]);
-  const pollFallback = await ensureRequiredPollFallback(
-    'vic_registration',
-    snapshotBefore,
-    cache,
-    effectiveNotifyDestination,
-    { paymentInstrumentId },
-  );
-  const pollFallbackLines = getRequiredPollFallbackLines({
-    fallback: pollFallback,
-    successEvent: 'payment_method.added/update with visaRegistrationSucceeded=true for the same paymentInstrumentId',
-  });
-
   const followUp = [
     'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
     'Do NOT create a purchase instruction and do NOT charge until this same Visa payment method appears with visaRegistrationSucceeded=true.',
-    ...(pollFallback.required
-      ? pollFallbackLines
-      : ['The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.']),
+    'The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
   ];
 
   if (!vicState.shouldNotify) {
@@ -1555,8 +1550,6 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
       paymentMethod: method,
       response: buildDirectSendDirective({
         summary: 'VIC registration is already pending for this Visa card.',
-        pollFallback,
-        pollFallbackLines,
         webhookWaitMessage: 'The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
         suffix: 'The VIC registration notification was already sent for this paymentInstrumentId. Do NOT send another card and do NOT retry clink_pay until the same Visa payment method appears with visaRegistrationSucceeded=true.',
       }),
@@ -1572,8 +1565,6 @@ async function ensureVisaVicReadyForUse({ paymentInstrumentId, selectedMethod = 
         paymentMethod: method,
         response: buildDirectSendDirective({
           summary: 'VIC registration link delivered.',
-          pollFallback,
-          pollFallbackLines,
           webhookWaitMessage: 'The background event monitor will deliver the VIC-ready notification automatically; or refresh payment methods until visaRegistrationSucceeded=true, then continue the VIC purchase instruction flow.',
         }),
       };
@@ -1706,24 +1697,12 @@ async function handle_get_binding_link(args = {}) {
           setupUrl,
         },
       });
-      const pollFallback = await ensureRequiredPollFallback(
-        'bind_card',
-        normalizePaymentMethods(methods),
-        cache,
-        notifyDestination,
-      );
-      const pollFallbackLines = getRequiredPollFallbackLines({
-        fallback: pollFallback,
-        successEvent: 'payment_method.added',
-      });
       let fallbackReason = 'missing_notify_destination';
       if (notifyDestination) {
         try {
           sendNotificationDirect(notifyDestination, notification);
           return buildDirectSendDirective({
             summary: 'Binding notification delivered.',
-            pollFallback,
-            pollFallbackLines,
             webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when binding completes.',
             suffix: `Extracted Binding Token for future use: ${bindingToken}`,
           });
@@ -1739,9 +1718,7 @@ ${formatNotificationInstruction({
   notifications: notification,
   followUp: [
     'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-    ...(pollFallback.required
-      ? pollFallbackLines
-      : ['The background event monitor will deliver the payment_method.added notification automatically when binding completes.']),
+    'The background event monitor will deliver the payment_method.added notification automatically when binding completes.',
     '',
     `Extracted Binding Token for future use: ${bindingToken}`,
   ],
@@ -1756,7 +1733,7 @@ ${formatNotificationInstruction({
           email: env.CLINK_USER_EMAIL || 'N/A',
         },
       });
-      const riskNotification = buildRiskRulesNotification(bindingUrl);
+      const riskNotification = await buildRiskRulesNotification();
       let fallbackReason = 'missing_notify_destination';
       let statusNotificationSent = false;
       if (notifyDestination) {
@@ -1818,8 +1795,11 @@ ${formatNotificationInstruction({
 
 async function handle_get_risk_rules_link(args = {}) {
   try {
-    const { bindingUrl } = await fetchBindingData();
-    const notification = buildRiskRulesNotification(bindingUrl);
+    const env = await getPaymentEnv();
+    if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
+      throw new Error("Wallet not initialized. Please run initialize_wallet first.");
+    }
+    const notification = await buildRiskRulesNotification();
     const cache = await readPaymentMethodsCache() || {};
     let requestNotifyDestination = null;
     try {
@@ -1832,17 +1812,6 @@ async function handle_get_risk_rules_link(args = {}) {
       await writePaymentMethodsCache(cache);
     }
     const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
-    const snapshotBefore = normalizeRuleSettings(cache.riskRules);
-    const pollFallback = await ensureRequiredPollFallback(
-      'update_rule',
-      snapshotBefore,
-      cache,
-      notifyDestination,
-    );
-    const pollFallbackLines = getRequiredPollFallbackLines({
-      fallback: pollFallback,
-      successEvent: 'risk_rule.updated',
-    });
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
@@ -1850,8 +1819,6 @@ async function handle_get_risk_rules_link(args = {}) {
         sendNotificationDirect(notifyDestination, notification);
         return buildDirectSendDirective({
           summary: 'Risk rules link generated.',
-          pollFallback,
-          pollFallbackLines,
           webhookWaitMessage: 'The background event monitor will deliver the risk_rule.updated notification automatically when the change completes.',
         });
       } catch (err) {
@@ -1866,9 +1833,7 @@ async function handle_get_risk_rules_link(args = {}) {
       notifications: notification,
       followUp: [
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-        ...(pollFallback.required
-          ? pollFallbackLines
-          : ['The background event monitor will deliver the risk_rule.updated notification automatically when the change completes.']),
+        'The background event monitor will deliver the risk_rule.updated notification automatically when the change completes.',
       ],
     });
   } catch (err) {
@@ -1900,17 +1865,6 @@ async function handle_get_payment_method_setup_link(args = {}) {
       await writePaymentMethodsCache(cache);
     }
     const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
-    const snapshotBefore = normalizePaymentMethods(methods);
-    const pollFallback = await ensureRequiredPollFallback(
-      'bind_card',
-      snapshotBefore,
-      cache,
-      notifyDestination,
-    );
-    const pollFallbackLines = getRequiredPollFallbackLines({
-      fallback: pollFallback,
-      successEvent: 'payment_method.added',
-    });
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
@@ -1918,8 +1872,6 @@ async function handle_get_payment_method_setup_link(args = {}) {
         sendNotificationDirect(notifyDestination, notification);
         return buildDirectSendDirective({
           summary: 'Payment method setup link generated.',
-          pollFallback,
-          pollFallbackLines,
           webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when setup completes.',
         });
       } catch (err) {
@@ -1934,9 +1886,7 @@ async function handle_get_payment_method_setup_link(args = {}) {
       notifications: notification,
       followUp: [
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-        ...(pollFallback.required
-          ? pollFallbackLines
-          : ['The background event monitor will deliver the payment_method.added notification automatically when setup completes.']),
+        'The background event monitor will deliver the payment_method.added notification automatically when setup completes.',
       ],
     });
   } catch (err) {
@@ -1970,17 +1920,6 @@ async function handle_get_payment_method_modify_link(args = {}) {
       await writePaymentMethodsCache(cache);
     }
     const notifyDestination = requestNotifyDestination || getNotifyDestination(cache);
-    const snapshotBefore = normalizePaymentMethods(methods);
-    const pollFallback = await ensureRequiredPollFallback(
-      'change_card',
-      snapshotBefore,
-      cache,
-      notifyDestination,
-    );
-    const pollFallbackLines = getRequiredPollFallbackLines({
-      fallback: pollFallback,
-      successEvent: 'payment_method.added',
-    });
     let fallbackReason = 'missing_notify_destination';
 
     if (notifyDestination) {
@@ -1988,8 +1927,6 @@ async function handle_get_payment_method_modify_link(args = {}) {
         sendNotificationDirect(notifyDestination, notification);
         return buildDirectSendDirective({
           summary: 'Payment method management link generated.',
-          pollFallback,
-          pollFallbackLines,
           webhookWaitMessage: 'The background event monitor will deliver the payment_method.added notification automatically when the change completes.',
         });
       } catch (err) {
@@ -2004,9 +1941,7 @@ async function handle_get_payment_method_modify_link(args = {}) {
       notifications: notification,
       followUp: [
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
-        ...(pollFallback.required
-          ? pollFallbackLines
-          : ['The background event monitor will deliver the payment_method.added notification automatically when the change completes.']),
+        'The background event monitor will deliver the payment_method.added notification automatically when the change completes.',
         '',
         `Current Payment Methods: ${JSON.stringify(methods)}`,
       ],
@@ -2171,6 +2106,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     // clink-cli pay exits 7 on a 3-D Secure redirect but still returns the
     // charge data on stdout; runClinkCli returns that data regardless of exit code.
     const data = await runClinkCli(payArgs);
+    const workflow = classifyPaymentResponse(data);
 
     const cache = normalizeCache(await readPaymentMethodsCache() || {});
     const notifyDestination = getNotifyDestination(cache);
@@ -2193,7 +2129,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
       cache,
     });
 
-    if (data.channelPaymentResponse && data.channelPaymentResponse.flag3DS === 1) {
+    if (workflow.state === PaymentWorkflowState.THREE_DS_REQUIRED) {
       await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
       const redirectUrl = cpr.action?.redirectUrl || "";
       const merchantName = psi.merchantName || args.merchant_id || "商户";
@@ -2210,13 +2146,14 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
           },
         }),
         followUp: [
+          formatPaymentFsmDirective(workflow),
           'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
           'Do NOT continue until the background event monitor reports agent_order.succeeded or agent_order.failed.',
         ],
       });
     }
 
-    if (status === 1) {
+    if (workflow.action === PaymentWorkflowAction.NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT) {
       await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
       const successNotification = buildPaymentSuccessNotification({
         amountDisplay,
@@ -2299,6 +2236,7 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
 
         if (sendResult === 'trigger_failed') {
           return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+${formatPaymentFsmDirective(workflow)}
 The payment success notification has already been sent to the user.
 Immediate merchant recharge confirmation handoff failed in the background.
 Do NOT send any additional notification in this turn.
@@ -2308,6 +2246,7 @@ The background event monitor will retry the merchant confirmation and original-t
 
         if (sendResult === 'already_completed') {
           return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+${formatPaymentFsmDirective(workflow)}
 The payment success notification was already sent earlier.
 The merchant recharge confirmation handoff was already triggered earlier.
 Do NOT send any additional notification in this turn.
@@ -2315,19 +2254,21 @@ Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
         }
 
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+${formatPaymentFsmDirective(workflow)}
 The payment success notification has already been sent to the user.
 Do NOT send any additional notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker again in this turn.`;
       } catch (sendErr) {
         await logError('clink_pay/sync_success_card', sendErr);
         return `[SYSTEM DIRECTIVE] Payment already succeeded synchronously.
+${formatPaymentFsmDirective(workflow)}
 Direct notification delivery failed, so do NOT send any fallback notification in this turn.
 Do NOT invoke the merchant-side recharge-status checker in this turn.
 The background event monitor will continue the merchant confirmation and original-task resume flow when agent_order.succeeded arrives.`;
       }
     }
 
-    if (status === 3 || status === 4 || status === 6) {
+    if (workflow.action === PaymentWorkflowAction.NOTIFY_FAILURE_STOP) {
       const isRiskReject = cpr.code === 'risk_reject' || String(cpr.declinedCode || '').includes('risk.');
       const failureReason = cpr.message || cpr.declinedCode || '支付处理异常';
       const failNotification = isRiskReject
@@ -2361,17 +2302,20 @@ The background event monitor will continue the merchant confirmation and origina
         });
         if (sendResult === 'already_sent') {
           return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
+${formatPaymentFsmDirective(workflow)}
 The failure notification was already sent earlier.
 Do NOT send any additional notification in this turn.
 Do NOT retry automatically.`;
         }
         return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
+${formatPaymentFsmDirective(workflow)}
 The failure notification has already been sent to the user.
 Do NOT send any additional notification in this turn.
 Do NOT retry automatically.`;
       } catch (sendErr) {
         await logError('clink_pay/sync_failure_card', sendErr);
         return `[SYSTEM DIRECTIVE] Payment already ended with a terminal failure in the synchronous charge response.
+${formatPaymentFsmDirective(workflow)}
 Direct notification delivery failed, so do NOT send any fallback notification in this turn.
 Do NOT retry automatically.`;
       }
@@ -2380,6 +2324,7 @@ Do NOT retry automatically.`;
     await savePendingMerchantConfirmation(merchantIntegration, sessionId, notifyDestination);
 
     return `[SYSTEM DIRECTIVE] Payment submitted successfully. Order is now processing.
+${formatPaymentFsmDirective(workflow)}
 Do NOT send any intermediate "处理中" notification to the user for this state.
 Do not send any extra notification in this turn. A brief natural-language reply is fine if helpful.
 Do NOT ask the user any question.
@@ -2387,9 +2332,17 @@ Do NOT invoke the merchant-side recharge-status checker in this turn.
 The merchant-side recharge confirmation and original-task resume must be driven by the payment-layer success handoff that owns this order. For pending / 3DS flows, the background event monitor delivers agent_order.succeeded when it arrives.`;
   } catch (err) {
     await logError('clink_pay', err);
+    const errorWorkflow = classifyPaymentError(err);
     const code = err instanceof ClinkCliError ? err.code : null;
     const currency = args.currency || "USD";
     const amt = formatAmountWithCurrency(args.amount, currency);
+
+    if (errorWorkflow.action === PaymentWorkflowAction.VERIFY_BEFORE_RETRY) {
+      return `[SYSTEM DIRECTIVE] Payment state is unknown because clink-cli returned a network/timeout error.
+${formatPaymentFsmDirective(errorWorkflow)}
+Do NOT retry automatically.
+Verify the order/session state through a safe merchant-side or Clink-side status check before any retry.`;
+    }
 
     if (code === 90101203 || err.message.includes("CUSTOMER_EMAIL_NOT_FOUND")) {
       return formatNotificationInstruction({
@@ -2572,6 +2525,12 @@ The merchant-side recharge confirmation and original-task resume must be driven 
       });
     }
 
+    if (errorWorkflow.action === PaymentWorkflowAction.ASK_WALLET_SETUP) {
+      return `[SYSTEM DIRECTIVE] Payment cannot continue because clink-cli reported wallet setup or authentication is required.
+${formatPaymentFsmDirective(errorWorkflow)}
+Do NOT retry automatically. Ask the user to initialize or restore the Clink wallet credentials, then rerun the payment only after the exact same charge is still authorized.`;
+    }
+
     return formatNotificationInstruction({
       summary: 'Payment failed: unexpected error.',
       notifications: createMessageRequest({
@@ -2583,6 +2542,7 @@ The merchant-side recharge confirmation and original-task resume must be driven 
         },
       }),
       followUp: [
+        formatPaymentFsmDirective(errorWorkflow),
         'After sending the notification, you may add a brief natural-language reply if helpful, but do not repeat the notification contents.',
       ],
     });
@@ -3714,7 +3674,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "install_system_hooks",
-      description: "Update openclaw.json and restart the gateway in the background after a 3-second delay. Triggered directly by the install workflow with no extra text authorization required.",
+      description: "Save notify routing, refresh the event pump when usable wallet credentials are available, and restart the gateway in the background after a 3-second delay. MCP registration is performed by pre_install.mjs.",
       inputSchema: {
         type: "object",
         properties: {

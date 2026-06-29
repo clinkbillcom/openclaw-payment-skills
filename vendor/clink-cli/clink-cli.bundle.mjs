@@ -3636,9 +3636,7 @@ var API_BASE_URLS = {
   sandbox: "https://api.clinkbill.dev"
 };
 var AGENT_BASE_URLS = {
-  production: "https://agent.clinkbill.com",
-  // sandbox: "https://test-agent.clinkbill.com"
-  sandbox: "https://agent.clinkbill.dev"
+  production: "https://agent.clinkbill.com"
 };
 var DEFAULT_BASE_URL = API_BASE_URLS.production;
 
@@ -3952,8 +3950,19 @@ function buildInstructionHeaders(config) {
 function buildBareDomainUrl(bindingUrl) {
   return new URL(bindingUrl).origin;
 }
-function resolveAgentBaseUrl(sandbox) {
-  return sandbox ? AGENT_BASE_URLS.sandbox : AGENT_BASE_URLS.production;
+function resolveAgentBaseUrl(apiBaseUrl) {
+  try {
+    const url = new URL(apiBaseUrl);
+    const segments = url.hostname.split(".");
+    const first = segments[0] ?? "";
+    if (/(^|-)api$/i.test(first)) {
+      segments[0] = first.replace(/(^|-)api$/i, "$1agent");
+      url.hostname = segments.join(".");
+      return url.origin;
+    }
+  } catch {
+  }
+  return AGENT_BASE_URLS.production;
 }
 function buildAgentPasskeyUrl(agentBaseUrl, paymentInstrumentId, instructionId) {
   const url = new URL(`/passkey-auth/${encodeURIComponent(paymentInstrumentId)}`, agentBaseUrl);
@@ -4358,10 +4367,10 @@ Usage:
 Commands:
   wallet            Initialize wallet and inspect local wallet status
   card              Generate card links and manage payment methods
-  risk-rule         Inspect or open risk rule settings
+  risk              Inspect or open risk rule settings
   pay               Charge a payment instrument
   refund            Create refund and query refund status
-  instruction       Manage VIC purchase instructions (agentic authorization)
+  instruction       Manage purchase instruction mandates (agentic authorization)
   events            Poll the webhook-event queue for state-change events
   config            Read and update local config
 
@@ -4561,20 +4570,20 @@ Examples:
   clink-cli card get --payment-instrument-id pi_xxx
   clink-cli card get --profile buyer-2 --payment-instrument-id pi_xxx --format pretty
 `;
-var RISK_RULE_HELP = `clink-cli risk-rule
+var RISK_RULE_HELP = `clink-cli risk
 
 Usage:
-  clink-cli risk-rule get [options]
-  clink-cli risk-rule link [--open] [options]
+  clink-cli risk get [options]
+  clink-cli risk link [--open] [options]
 
 Subcommands:
   get          Fetch current risk rule settings
   link         Print the agent risk-rule setup page URL
 `;
-var RISK_RULE_GET_HELP = `clink-cli risk-rule get
+var RISK_RULE_GET_HELP = `clink-cli risk get
 
 Usage:
-  clink-cli risk-rule get [options]
+  clink-cli risk get [options]
 
 Options:
   --profile <name>             Local profile whose customer credentials will be used
@@ -4583,13 +4592,13 @@ Notes:
   Calls GET /agent/risk/rule/settings.
 
 Examples:
-  clink-cli risk-rule get
-  clink-cli risk-rule get --profile buyer-2 --format pretty
+  clink-cli risk get
+  clink-cli risk get --profile buyer-2 --format pretty
 `;
-var RISK_RULE_LINK_HELP = `clink-cli risk-rule link
+var RISK_RULE_LINK_HELP = `clink-cli risk link
 
 Usage:
-  clink-cli risk-rule link [--open] [options]
+  clink-cli risk link [--open] [options]
 
 Options:
   --profile <name>             Local profile whose customer credentials will be used
@@ -4598,13 +4607,15 @@ Options:
   --no-watch                   Skip polling for webhook events after printing the link
 
 Notes:
-  Prints the agent risk-rule setup page: https://agent.clinkbill.com/risk-rules-setup
-  (or https://agent.clinkbill.dev/risk-rules-setup with --sandbox). No network request.
+  Prints the agent risk-rule setup page at /risk-rules-setup. The agent domain mirrors the
+  resolved API environment: production https://agent.clinkbill.com, --sandbox
+  https://agent.clinkbill.dev, a UAT base (CLINK_BASE_URL/--base-url) https://uat-agent.clinkbill.com.
+  No network request.
   After printing the link, polls for webhook events until one arrives (max 15 min); use --no-watch to skip.
 
 Examples:
-  clink-cli risk-rule link
-  clink-cli risk-rule link --sandbox --open --profile buyer-2
+  clink-cli risk link
+  clink-cli risk link --sandbox --open --profile buyer-2
 `;
 var PAY_HELP = `clink-cli pay
 
@@ -4776,7 +4787,8 @@ Notes:
   (that page calls the backend sign API with the WebAuthn authResult). The CLI does not call the
   backend sign/update/cancel APIs itself \u2014 those require a Passkey authResult produced in the
   browser, so sign-url/update/cancel only print the agent page URL for the user to complete there.
-  Agent page URL environment: --sandbox uses https://agent.clinkbill.dev; omit it for production https://agent.clinkbill.com.
+  Agent page URL environment mirrors the resolved API base: production https://agent.clinkbill.com,
+  --sandbox https://agent.clinkbill.dev, UAT https://uat-agent.clinkbill.com.
   Only valid for Visa cards whose card data has visaRegistrationSucceeded = true.
   Instruction-level currency/amount are NOT sent \u2014 currency and amountLimit live on each mandate.
   Do not send clientReferenceId / channelTokenId / consumerId \u2014 the server derives them.
@@ -4871,7 +4883,7 @@ function getHelpText(command, subcommand) {
         default:
           return CARD_HELP;
       }
-    case "risk-rule":
+    case "risk":
       switch (subcommand) {
         case "get":
           return RISK_RULE_GET_HELP;
@@ -4986,7 +4998,7 @@ async function runCli(argv) {
       return handleWalletCommand(subcommand, context);
     case "card":
       return handleCardCommand(subcommand, context);
-    case "risk-rule":
+    case "risk":
       return handleRiskRuleCommand(subcommand, context);
     case "pay":
       return handlePayCommand(context);
@@ -5258,7 +5270,7 @@ async function cardGet(context) {
 }
 async function handleRiskRuleCommand(subcommand, context) {
   if (!subcommand) {
-    printHelp("risk-rule");
+    printHelp("risk");
     return EXIT_CODES.OK;
   }
   switch (subcommand) {
@@ -5267,11 +5279,11 @@ async function handleRiskRuleCommand(subcommand, context) {
     case "link":
       return riskRuleLink(context);
     default:
-      throw validationError("unsupported risk-rule command");
+      throw validationError("unsupported risk command");
   }
 }
 async function riskRuleLink(context) {
-  const agentBaseUrl = resolveAgentBaseUrl(getBooleanFlag(context.args.flags, "sandbox"));
+  const agentBaseUrl = resolveAgentBaseUrl(context.runtimeConfig.baseUrl);
   const url = new URL("/risk-rules-setup", agentBaseUrl).toString();
   maybeOpenBrowser(context.globalOptions.open, url);
   printSuccess({ url }, context.globalOptions.format);
@@ -5441,7 +5453,7 @@ function requireJsonArrayFlag(flags, name) {
   return parsed;
 }
 async function instructionCreate(context) {
-  const agentBaseUrl = resolveAgentBaseUrl(getBooleanFlag(context.args.flags, "sandbox"));
+  const agentBaseUrl = resolveAgentBaseUrl(context.runtimeConfig.baseUrl);
   const body = instructionBody(context);
   const result = await requestJson({
     baseUrl: context.runtimeConfig.baseUrl,
@@ -5489,7 +5501,7 @@ async function instructionSignUrl(context) {
   const flags = context.args.flags;
   const paymentInstrumentId = requireStringFlag(flags, "missing --payment-instrument-id", "payment-instrument-id");
   const instructionId = requireStringFlag(flags, "missing --purchase-instruction-id", "purchase-instruction-id");
-  const url = buildAgentPasskeyUrl(resolveAgentBaseUrl(getBooleanFlag(flags, "sandbox")), paymentInstrumentId, instructionId);
+  const url = buildAgentPasskeyUrl(resolveAgentBaseUrl(context.runtimeConfig.baseUrl), paymentInstrumentId, instructionId);
   maybeOpenBrowser(context.globalOptions.open, url);
   printSuccess({ url }, context.globalOptions.format);
   await maybeWatchEvents(context, url, "purchase instruction authorization");
@@ -5513,7 +5525,7 @@ async function instructionList(context) {
   return finishApiCommand(result, context);
 }
 async function instructionAgentPageUrl(context) {
-  const url = resolveAgentBaseUrl(getBooleanFlag(context.args.flags, "sandbox"));
+  const url = resolveAgentBaseUrl(context.runtimeConfig.baseUrl);
   maybeOpenBrowser(context.globalOptions.open, url);
   printSuccess({ url }, context.globalOptions.format);
   await maybeWatchEvents(context, url, "purchase instruction change");
@@ -5752,7 +5764,7 @@ function detectHelpHint(argv) {
   if (!command) {
     return "Run `clink-cli --help`.";
   }
-  if (["wallet", "card", "risk-rule", "pay", "refund", "instruction", "events", "config"].includes(command)) {
+  if (["wallet", "card", "risk", "pay", "refund", "instruction", "events", "config"].includes(command)) {
     return `Run \`clink-cli ${command} --help\`.`;
   }
   return "Run `clink-cli --help`.";

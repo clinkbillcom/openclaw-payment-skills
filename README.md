@@ -58,7 +58,7 @@ node scripts/pre_install.mjs --channel feishu --target-id <CHAT_ID> --target-typ
 node scripts/pre_install.mjs --channel feishu --target-id <OPEN_ID> --target-type open_id
 ```
 
-`pre_install.mjs` already registers the MCP server, schedules the gateway restart, and sends the install success notification immediately. Do not run a second manual `openclaw gateway restart` after it succeeds. Clink operations are performed through the vendored `clink-cli` bundle (`vendor/clink-cli/clink-cli.bundle.mjs`); async completion notifications are delivered by the mailbox event pump (`scripts/event-pump.mjs`), so no webhook route is installed.
+`pre_install.mjs` registers the MCP server, saves the notify destination, schedules the gateway restart, and sends the install success notification immediately. It does not install a payment webhook transform or `/hooks/clink/payment` route. Do not run a second manual `openclaw gateway restart` after it succeeds. Clink operations are performed through the vendored `clink-cli` bundle (`vendor/clink-cli/clink-cli.bundle.mjs`); async completion notifications are delivered by the mailbox event pump, which calls `clink-cli events poll` after wallet credentials are available.
 
 ---
 
@@ -136,7 +136,8 @@ This is especially useful for recharge-based skills such as media generation ser
 
 - Payment execution depends on your Clink account status and available payment methods
 - Some payments may require extra verification such as 3DS
-- Refund requests are currently submitted as full refunds and complete asynchronously; the final result is delivered by the mailbox event pump
+- Refund requests are currently submitted as full refunds and final states complete asynchronously through the event pump or explicit refund-status polling
+- The skill does not expose or install a payment webhook route; card binding, risk-rule updates, post-3DS payment results, refunds, and VIC readiness are observed through `clink-cli events poll`
 - Risk rules can block or limit a recharge based on your safety settings
 - If you provide a specific recharge amount, the agent should use that amount
 

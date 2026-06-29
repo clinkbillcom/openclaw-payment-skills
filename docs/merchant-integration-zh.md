@@ -1,5 +1,7 @@
 # Agent Payment Skills 商户对接文档
 
+当前版本中，Payment Skill 本身不再安装支付 webhook route。支付方式、风控、退款、3DS 后支付结果和 VIC 就绪等异步结果由后台 event pump 通过 `clink-cli events poll` 观测并触发通知/商户确认。商户后端自己的 `customer.verify` webhook 仍按官方文档独立实现。
+
 本文档面向需要接入 Clink 自动充值/代扣能力的**商户 Skill 开发者**，不面向终端用户。
 
 ---
@@ -85,7 +87,7 @@
 
 - `order_id`：Clink 订单号
 - `session_id`：可选，会话模式下回传
-- `trigger_source`：表明这次 handoff 来自同步成功路径还是 webhook 成功路径
+- `trigger_source`：表明这次 handoff 来自同步成功路径还是 event pump 成功路径
 - `channel` / `notify_target`：当前会话的通知路由信息，供商户侧继续恢复任务时复用
 
 ## 7. 返回结果归属规则
@@ -94,7 +96,7 @@
 
 - 如果结果表示 `DIRECT_SEND`，说明支付层已经发过卡片，**不要重复发**
 - 如果结果表示需要执行某个指令，只执行一次
-- 如果结果表示等待 webhook，就等待，不要自己提前补做商户确认
+- 如果结果表示等待 event pump 完成，就等待，不要自己提前补做商户确认
 
 ## 8. Webhook 与确认归属
 
