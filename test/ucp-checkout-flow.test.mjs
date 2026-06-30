@@ -30,6 +30,11 @@ function extractFunction(source, name) {
 
 function buildUcpCheckoutHarness() {
   const sources = [
+    'isPlainObject',
+    'normalizePurchaseInstructionFulfillmentType',
+    'validatePurchaseInstructionFulfillmentType',
+    'purchaseInstructionNeedsShippingAddress',
+    'validatePurchaseInstructionShippingAddress',
     'normalizePaymentMethods',
     'findPaymentMethodById',
     'getPurchaseInstructionId',
@@ -43,12 +48,15 @@ function buildUcpCheckoutHarness() {
     'extractUcpCheckoutId',
     'buildUcpCheckoutCreateArgs',
     'isTerminalUcpCheckoutStatus',
+    'normalizeUcpCheckoutFulfillmentArgs',
+    'validateUcpCheckoutFulfillmentGate',
     'handle_ucp_checkout',
   ]
     .map((name) => extractFunction(indexSource, name))
     .join('\n\n');
 
   return new Function(`
+    class ClinkCliError extends Error {}
     function isVisaRegistrationSucceeded(method) { return method?.visaRegistrationSucceeded === true; }
     function mandateMatchesPurchaseScope(candidateMandate = {}, requestedMandate = {}) {
       const requestedCurrency = String(requestedMandate.currencyCode || '').trim().toUpperCase();
@@ -73,6 +81,102 @@ function buildUcpCheckoutHarness() {
     return { handle_ucp_checkout, extractUcpCheckoutId };
   `)();
 }
+
+test('ucp_checkout stops before payment refresh when fulfillment type is unknown', async () => {
+  const { handle_ucp_checkout } = buildUcpCheckoutHarness();
+  const calls = [];
+
+  globalThis.fetchBindingData = async () => {
+    calls.push(['fetchBindingData']);
+    throw new Error('payment refresh must not run before fulfillment is classified');
+  };
+  globalThis.runClinkCli = async (args) => {
+    calls.push(args);
+    throw new Error(`CLI must not run before fulfillment is classified: ${JSON.stringify(args)}`);
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handle_ucp_checkout({
+      merchant_url: 'https://shop.example/products/t-shirt?variant=123',
+      merchant_name: 'Shop Example',
+      merchant_category_code: '5311',
+      currency: 'USD',
+      title: 'Shop Example T-shirt',
+      fulfillmentType: 'UNKNOWN',
+      mandates: [{
+        description: 'Shop Example T-shirt',
+        amountLimit: 10,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+      line_items: [{ id: 'li_sku_1', item: { id: 'sku_1', title: 'T-shirt', price: 1000 }, quantity: 1 }],
+    });
+
+    assert.deepEqual(calls, []);
+    assert.match(result, /\[UCP_CHECKOUT_FSM\] state=MISSING_FULFILLMENT_OR_SHIPPING/);
+    assert.match(result, /fulfillmentType must be resolved/i);
+    assert.match(result, /Do NOT run instruction list/i);
+  } finally {
+    delete globalThis.fetchBindingData;
+    delete globalThis.runClinkCli;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('ucp_checkout requires a US shipping address for physical goods before listing instructions', async () => {
+  const { handle_ucp_checkout } = buildUcpCheckoutHarness();
+  const calls = [];
+
+  globalThis.fetchBindingData = async () => {
+    calls.push(['fetchBindingData']);
+    throw new Error('payment refresh must not run before physical-goods shipping address is valid');
+  };
+  globalThis.runClinkCli = async (args) => {
+    calls.push(args);
+    throw new Error(`CLI must not run before physical-goods shipping address is valid: ${JSON.stringify(args)}`);
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handle_ucp_checkout({
+      merchant_url: 'https://shop.example/products/t-shirt?variant=123',
+      merchant_name: 'Shop Example',
+      merchant_category_code: '5311',
+      currency: 'USD',
+      title: 'Shop Example T-shirt',
+      fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
+      mandates: [{
+        description: 'Shop Example T-shirt',
+        amountLimit: 10,
+        currencyCode: 'USD',
+        merchantCategoryCode: '5311',
+      }],
+      line_items: [{ id: 'li_sku_1', item: { id: 'sku_1', title: 'T-shirt', price: 1000 }, quantity: 1 }],
+      shipping_address: {
+        name: 'Buyer',
+        line1: '1 King St',
+        city: 'Toronto',
+        state: 'ON',
+        zip: 'M5H 1A1',
+        countryCode: 'CA',
+      },
+    });
+
+    assert.deepEqual(calls, []);
+    assert.match(result, /\[UCP_CHECKOUT_FSM\] state=MISSING_FULFILLMENT_OR_SHIPPING/);
+    assert.match(result, /shippingAddress\.countryCode must be US/);
+    assert.match(result, /Do NOT run instruction list/i);
+  } finally {
+    delete globalThis.fetchBindingData;
+    delete globalThis.runClinkCli;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
 
 test('ucp_checkout creates then completes with the current default payment instrument', async () => {
   const { handle_ucp_checkout } = buildUcpCheckoutHarness();
@@ -210,6 +314,69 @@ test('ucp_checkout invokes instruction creation workflow when no active instruct
     assert.match(result, /state=INSTRUCTION_WORKFLOW_REQUIRED/);
     assert.match(result, /no matching ACTIVE instruction\+mandate/i);
     assert.doesNotMatch(result, /state=COMPLETED/);
+  } finally {
+    delete globalThis.fetchBindingData;
+    delete globalThis.runClinkCli;
+    delete globalThis.handle_prepare_visa_purchase_instruction;
+    delete globalThis.logRequest;
+    delete globalThis.logError;
+  }
+});
+
+test('ucp_checkout passes US shipping address into the instruction workflow on physical no-match branch', async () => {
+  const { handle_ucp_checkout } = buildUcpCheckoutHarness();
+  const calls = [];
+  const shippingAddress = {
+    name: 'Buyer',
+    line1: '123 Market St',
+    line2: 'Apt 201',
+    city: 'San Francisco',
+    state: 'CA',
+    zip: '94105',
+    countryCode: 'US',
+    deliveryContactDetails: {},
+  };
+  const requestedMandate = {
+    description: 'Shop Example T-shirt',
+    amountLimit: 10,
+    currencyCode: 'USD',
+    merchantCategoryCode: '5311',
+    preferredMerchantName: 'Shop Example',
+  };
+
+  globalThis.fetchBindingData = async () => ({
+    methods: [{ paymentInstrumentId: 'pi_default', paymentMethodType: 'CARD', cardBrand: 'visa', isDefault: true }],
+  });
+  globalThis.runClinkCli = async (args) => {
+    calls.push(args);
+    if (args[0] === 'instruction' && args[1] === 'list') return [];
+    throw new Error(`ucp-checkout must not run without an active instruction+mandate: ${JSON.stringify(args)}`);
+  };
+  globalThis.handle_prepare_visa_purchase_instruction = async (args) => {
+    calls.push(['prepare_visa_purchase_instruction', args]);
+    assert.equal(args.paymentInstrumentId, 'pi_default');
+    assert.equal(args.fulfillmentType, 'PHYSICAL_GOODS_REQUIRES_SHIPPING');
+    assert.deepEqual(args.shippingAddress, shippingAddress);
+    return '[VIC_STATE_MACHINE] state=CREATED_DRAFT\nInstruction ID: ins_new';
+  };
+  globalThis.logRequest = async () => {};
+  globalThis.logError = async () => {};
+
+  try {
+    const result = await handle_ucp_checkout({
+      merchant_url: 'https://shop.example/products/t-shirt?variant=123',
+      merchant_name: 'Shop Example',
+      merchant_category_code: '5311',
+      currency: 'USD',
+      title: 'Shop Example T-shirt',
+      fulfillmentType: 'PHYSICAL_GOODS_REQUIRES_SHIPPING',
+      mandates: [requestedMandate],
+      line_items: [{ id: 'li_sku_1', item: { id: 'sku_1', title: 'T-shirt', price: 1000 }, quantity: 1 }],
+      shipping_address: shippingAddress,
+    });
+
+    assert.equal(calls[1][0], 'prepare_visa_purchase_instruction');
+    assert.match(result, /state=INSTRUCTION_WORKFLOW_REQUIRED/);
   } finally {
     delete globalThis.fetchBindingData;
     delete globalThis.runClinkCli;

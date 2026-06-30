@@ -3383,17 +3383,48 @@ function isTerminalUcpCheckoutStatus(data) {
   return ['completed', 'succeeded', 'success', 'failed', 'canceled', 'cancelled', 'requires_escalation'].includes(status);
 }
 
+function normalizeUcpCheckoutFulfillmentArgs(args = {}) {
+  const normalized = { ...args };
+  if (normalized.fulfillmentType === undefined && args.fulfillment_type !== undefined) {
+    normalized.fulfillmentType = args.fulfillment_type;
+  }
+  const shippingAddress = args.shippingAddress ?? args.shipping_address;
+  if (shippingAddress !== undefined) {
+    normalized.shippingAddress = shippingAddress;
+    normalized.shipping_address = shippingAddress;
+  }
+  return normalized;
+}
+
+function validateUcpCheckoutFulfillmentGate(args = {}) {
+  return [
+    ...validatePurchaseInstructionFulfillmentType(args),
+    ...validatePurchaseInstructionShippingAddress(args),
+  ];
+}
+
 async function handle_ucp_checkout(args = {}) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     return "ERROR: ucp_checkout requires an args object with merchant_url, merchant_category_code, currency, mandates, fulfillmentType, title, and line_items.";
   }
 
+  const checkoutArgs = normalizeUcpCheckoutFulfillmentArgs(args);
+  const fulfillmentErrors = validateUcpCheckoutFulfillmentGate(checkoutArgs);
+  if (fulfillmentErrors.length > 0) {
+    return `[UCP_CHECKOUT_FSM] state=MISSING_FULFILLMENT_OR_SHIPPING action=ASK_USER reason=fulfillment_or_shipping_incomplete
+Before UCP checkout, classify whether this product/order is shipped physical goods or no-shipping-required merchant value.
+Use fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING only for shipped physical goods, fulfillmentType=NO_SHIPPING_REQUIRED for services, subscriptions, hotels, tickets, bookings, reservations, and digital goods, and UNKNOWN only long enough to ask the user to clarify.
+For PHYSICAL_GOODS_REQUIRES_SHIPPING, collect a standard US shipping address before checkout; shippingAddress.countryCode must be US.
+Missing fields: ${fulfillmentErrors.join(', ')}
+Do NOT run instruction list, payment refresh, ucp-checkout create, or ucp-checkout complete until fulfillment and required shipping are resolved.`;
+  }
+
   try {
     const selectedPaymentMethod = await resolveCurrentUcpCheckoutPaymentInstrument(
-      args.paymentInstrumentId || args.payment_instrument_id || null,
+      checkoutArgs.paymentInstrumentId || checkoutArgs.payment_instrument_id || null,
     );
     const paymentInstrumentId = selectedPaymentMethod.paymentInstrumentId;
-    const requestedMandates = getUcpCheckoutRequestedMandates(args);
+    const requestedMandates = getUcpCheckoutRequestedMandates(checkoutArgs);
     const instructionList = await runClinkCli([
       'instruction', 'list',
       '--status', 'ACTIVE',
@@ -3404,18 +3435,16 @@ async function handle_ucp_checkout(args = {}) {
     const authorization = findReusableUcpCheckoutAuthorization(instructionList, {
       paymentInstrumentId,
       mandates: requestedMandates,
-      instructionIdHint: args.instruction_id || args.instructionId || '',
-      mandateIdHint: args.mandate_id || args.mandateId || '',
+      instructionIdHint: checkoutArgs.instruction_id || checkoutArgs.instructionId || '',
+      mandateIdHint: checkoutArgs.mandate_id || checkoutArgs.mandateId || '',
     });
 
     if (!authorization) {
-      const title = String(args.title || args.instruction_title || args.instructionTitle || args.merchant_name || args.merchantName || '').trim();
-      const fulfillmentType = args.fulfillmentType || args.fulfillment_type;
+      const title = String(checkoutArgs.title || checkoutArgs.instruction_title || checkoutArgs.instructionTitle || checkoutArgs.merchant_name || checkoutArgs.merchantName || '').trim();
       const prepareResult = await handle_prepare_visa_purchase_instruction({
-        ...args,
+        ...checkoutArgs,
         paymentInstrumentId,
         title,
-        fulfillmentType,
         mandates: requestedMandates,
       });
       return `[UCP_CHECKOUT_FSM] state=INSTRUCTION_WORKFLOW_REQUIRED action=WAIT_INSTRUCTION_ACTIVATION reason=no_matching_active_instruction_mandate
@@ -3424,7 +3453,7 @@ The instruction creation workflow has been invoked. Do NOT run ucp-checkout crea
 ${prepareResult}`;
     }
 
-    const createArgs = buildUcpCheckoutCreateArgs(args, authorization);
+    const createArgs = buildUcpCheckoutCreateArgs(checkoutArgs, authorization);
     const createData = await runClinkCli(createArgs);
     await logRequest('ucp_checkout/create', {
       args: createArgs,
@@ -3976,7 +4005,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "ucp_checkout",
-      description: "External UCP checkout state machine: resolve the current/default paymentInstrumentId, list ACTIVE instructions by paymentInstrumentId, match a valid instruction_id + mandate_id for the product/order scope, create an instruction draft when no match exists, otherwise run clink-cli ucp-checkout create then complete. This is not merchant fulfillment.",
+      description: "External UCP checkout state machine: first validate fulfillmentType and required US shipping for physical goods, then resolve the current/default paymentInstrumentId, list ACTIVE instructions by paymentInstrumentId, match a valid instruction_id + mandate_id for the product/order scope, create an instruction draft when no match exists, otherwise run clink-cli ucp-checkout create then complete. This is not merchant fulfillment.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3988,14 +4017,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           fulfillmentType: {
             type: "string",
             enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"],
-            description: "Instruction workflow fulfillment classification. Required so missing checkout authorization can create the right instruction draft."
+            description: "Required checkout gate. Use PHYSICAL_GOODS_REQUIRES_SHIPPING only for shipped physical goods, NO_SHIPPING_REQUIRED for services/subscriptions/hotels/tickets/bookings/reservations/digital goods, and UNKNOWN only to ask before checkout."
           },
           mandates: { type: "array", description: "Requested mandate scope used to match an ACTIVE instruction+mandate and to create a draft when no match exists." },
           instruction_id: { type: "string", description: "Optional instruction ID hint. The tool still lists ACTIVE instructions and verifies the hint before checkout." },
           mandate_id: { type: "string", description: "Optional mandate ID hint. The tool still lists ACTIVE instructions and verifies the hint before checkout." },
           line_items: { type: "array", description: "UCP line_items array. Prices are minor units and must match the product/order truth." },
           buyer: { type: "object", description: "Optional buyer object required by the merchant checkout." },
-          shipping_address: { type: "object", description: "Optional shipping address for physical goods that ship." },
+          shipping_address: { type: "object", description: "Required when fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING. Must be a standard US shipping address; countryCode must be US." },
           metadata: { type: "object", description: "Optional metadata object for correlation." },
           paymentInstrumentId: { type: "string", description: "Optional selected payment instrument. If omitted, the refreshed current/default method is used." },
           create_idempotency_key: { type: "string", description: "Optional idempotency key for create, stable for the same cart/order attempt." },

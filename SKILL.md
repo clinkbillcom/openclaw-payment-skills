@@ -37,7 +37,7 @@ tools:
   - name: list_purchase_instructions
     description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
   - name: ucp_checkout
-    description: "External UCP checkout state machine: after product/price truth and mandate scope are known, resolves the refreshed current/default paymentInstrumentId, lists ACTIVE instructions by paymentInstrumentId, matches a valid instruction_id + mandate_id, starts the instruction creation workflow when no match exists, otherwise runs clink-cli ucp-checkout create then complete. Completion is not merchant fulfillment."
+    description: "External UCP checkout state machine: after product/price truth, mandate scope, fulfillmentType, and required shipping are known, resolves the refreshed current/default paymentInstrumentId, lists ACTIVE instructions by paymentInstrumentId, matches a valid instruction_id + mandate_id, starts the instruction creation workflow when no match exists, otherwise runs clink-cli ucp-checkout create then complete. Physical shipped goods require a US shipping_address before checkout. Completion is not merchant fulfillment."
   - name: get_purchase_instruction_manage_link
     description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://agent.clinkbill.dev in sandbox) as the authorization management link."
   - name: install_system_hooks
@@ -110,17 +110,21 @@ See Section 3.4 for the full VIC workflow, the instruction matching rule, and pa
 
 ### 1.3.1 UCP Checkout Product Order Flow
 
-If a merchant/product skill has already frozen product identity, price truth, currency, merchant context, and mandate scope for this exact order, call `ucp_checkout`.
+If a merchant/product skill has already frozen product identity, price truth, currency, merchant context, fulfillment classification, and mandate scope for this exact order, call `ucp_checkout`.
 
 This route is for external/shadow merchant product checkout. It must be continuous:
 
-1. Refresh/resolve the current/default paymentInstrumentId inside `ucp_checkout`.
-2. Run `clink-cli instruction list --status ACTIVE --payment-instrument-id <current/default paymentInstrumentId>`.
-3. Match a valid ACTIVE instruction and ACTIVE/non-reserved mandate for the product/order scope, then take its `instruction_id` and `mandate_id`.
-4. If no matching instruction+mandate exists, enter the instruction creation workflow (`prepare_visa_purchase_instruction`) and stop UCP checkout until that draft is Passkey-authorized and ACTIVE.
-5. If a matching instruction+mandate exists, run `clink-cli ucp-checkout create` with `instruction_id`, `mandate_id`, merchant URL/context, currency, and line items.
-6. Parse `checkoutId` from the create response (`data.id`, `data.checkout_id`, or `data.checkoutId`).
-7. Immediately run `clink-cli ucp-checkout complete --checkout-id <checkoutId> --payment-instrument-id <current/default paymentInstrumentId>`.
+1. Classify fulfillment before checkout:
+   - `PHYSICAL_GOODS_REQUIRES_SHIPPING`: shipped physical goods; collect `shipping_address` with `countryCode=US`.
+   - `NO_SHIPPING_REQUIRED`: services, subscriptions, hotels, tickets, bookings, reservations, and digital goods.
+   - `UNKNOWN`: stop and ask; do not run payment refresh, instruction list, or checkout.
+2. Refresh/resolve the current/default paymentInstrumentId inside `ucp_checkout`.
+3. Run `clink-cli instruction list --status ACTIVE --payment-instrument-id <current/default paymentInstrumentId>`.
+4. Match a valid ACTIVE instruction and ACTIVE/non-reserved mandate for the product/order scope, then take its `instruction_id` and `mandate_id`.
+5. If no matching instruction+mandate exists, enter the instruction creation workflow (`prepare_visa_purchase_instruction`) and stop UCP checkout until that draft is Passkey-authorized and ACTIVE.
+6. If a matching instruction+mandate exists, run `clink-cli ucp-checkout create` with `instruction_id`, `mandate_id`, merchant URL/context, currency, line items, and `shipping_address` only when required.
+7. Parse `checkoutId` from the create response (`data.id`, `data.checkout_id`, or `data.checkoutId`).
+8. Immediately run `clink-cli ucp-checkout complete --checkout-id <checkoutId> --payment-instrument-id <current/default paymentInstrumentId>`.
 
 Do not ask the user to provide the `checkoutId`. Do not use `clink_pay` for this product-order path. Do not pass instruction, mandate, or credential token fields to complete; create binds instruction+mandate, and complete sends the payment instrument only. UCP checkout completion is not merchant fulfillment; delivery, entitlement, receipt, balance credit, and task resume still belong to the merchant/product runtime.
 
@@ -425,7 +429,7 @@ For that request, after the state machine finds no semantic match, it creates a 
 
 ### 3.4.1 UCP Checkout Product Order Flow
 
-Use `ucp_checkout` only after the merchant/product skill has provided a single frozen product/order target and mandate scope. The tool itself must list instructions first, match the effective `instruction_id` and `mandate_id`, and only then perform checkout.
+Use `ucp_checkout` only after the merchant/product skill has provided a single frozen product/order target, fulfillment classification, and mandate scope. The tool itself must validate shipping requirements, list instructions first, match the effective `instruction_id` and `mandate_id`, and only then perform checkout.
 
 Required inputs before calling `ucp_checkout`:
 - `merchant_url`, merchant display/context, and `merchant_category_code`.
@@ -433,12 +437,14 @@ Required inputs before calling `ucp_checkout`:
 - `line_items` with item IDs/titles/prices in minor units and quantities; the line-item total must match the merchant/product skill's price truth.
 - `title`, `fulfillmentType`, and `mandates` for instruction matching and for the instruction creation workflow when no match exists.
 - Optional `instruction_id` and `mandate_id` may be passed only as hints; the tool still lists ACTIVE instructions and verifies that both IDs are valid for the current paymentInstrumentId and mandate scope.
-- `buyer` and `shipping_address` only when required by the external merchant or physical shipped goods.
+- `buyer` when required by the external merchant.
+- `shipping_address` is required for `PHYSICAL_GOODS_REQUIRES_SHIPPING`; `countryCode` must be `US`. Do not invent a shipping address for `NO_SHIPPING_REQUIRED`.
 
 The tool performs the closed-loop handoff:
 
 ```text
 REFRESH_PAYMENT_INSTRUMENT
+  # guarded by fulfillmentType + shipping_address validation before this first transition
   -> LIST_ACTIVE_INSTRUCTIONS
   -> MATCH_INSTRUCTION_AND_MANDATE
   -> IF_NO_MATCH_START_INSTRUCTION_WORKFLOW_AND_STOP
