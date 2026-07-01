@@ -88,6 +88,16 @@ test('skill install section says when event pump starts, without webhook install
   assert.match(installSection, /event pump starts idempotently when usable wallet credentials are available/i);
 });
 
+test('skill requires agent-owned execution instead of user-run commands', () => {
+  const installSection = sliceSection(skillDoc, '### 3.1 Install (Strict Single-Step Workflow)', /^###\s+3\.2\s+/m);
+  assert.match(skillDoc, /agent owns command execution/i);
+  assert.match(installSection, /execute `node scripts\/pre_install\.mjs/i);
+  assert.doesNotMatch(installSection, /show the exact manual command/i);
+  assert.doesNotMatch(skillDoc, /Shell examples below assume/i);
+  assert.doesNotMatch(skillDoc, /If calling via shell/i);
+  assert.doesNotMatch(skillDoc, /npx mcporter --config/i);
+});
+
 test('skill documents the FSM control loop and payment FSM actions', () => {
   assert.match(skillDoc, /Control Loop \/ FSM Contract/i);
   assert.match(skillDoc, /Observe\s*→\s*Classify\s*→\s*Act\s*→\s*Verify\s*→\s*Persist/i);

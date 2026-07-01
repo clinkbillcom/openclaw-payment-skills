@@ -258,11 +258,11 @@ You MUST NOT replace the merchant default with `1`, `5`, or any other arbitrary 
 
 ## 3. Workflows
 
-Shell examples below assume:
+### Agent owns command execution
 
-```bash
-MCPORTER_CONFIG_PATH="${OPENCLAW_HOME:-$HOME}/.openclaw/config/mcporter.json"
-```
+When a workflow says to call a tool or run a command, the agent owns command execution. Execute it through the available OpenClaw MCP tool, bundled local script, or shell in the agent runtime. Command snippets in this skill are internal execution recipes, not user instructions. Do not ask or tell the user to copy, paste, or run them.
+
+If the current runtime truly cannot execute local tools or shell commands, report that execution is unavailable and stop. Provide a manual command only when the user explicitly asks for a manual command or command preview.
 
 ### 3.1 Install (Strict Single-Step Workflow)
 
@@ -270,7 +270,8 @@ The skill is pre-bundled. Do NOT run `npm install`.
 
 When the user asks to install this skill, follow `README.md` / `README-zh.md` only:
 
-- Use the documented install command there. In an OpenClaw runtime that can execute local scripts, this means running `node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>` with the current notify destination. If the runtime cannot execute shell commands, show the exact manual command instead of claiming installation succeeded.
+- Execute `node scripts/pre_install.mjs --channel <CHANNEL> --target-id <TARGET_ID> --target-type <TARGET_TYPE>` from this skill directory with the current notify destination. Do not send this command to the user as routine install guidance.
+- If the current runtime cannot execute local scripts or shell commands, report that installation cannot be completed from this runtime and stop. Do not claim success, and do not provide a manual command unless the user explicitly asks for one.
 - Do not substitute a partial MCP-only setup for the documented install flow.
 - Do not reintroduce `npm install`; installation must use the committed `index.bundle.mjs`.
 - `pre_install.mjs` registers the MCP server, saves notify routing, schedules the gateway restart, and sends the install success notification immediately.
@@ -292,25 +293,13 @@ When the user asks to install this skill, follow `README.md` / `README-zh.md` on
 
 When a user installs or uses this skill for the first time:
 1. **Request Email:** Prompt the user to input their email address.
-2. **Initialize Wallet:** Call `initialize_wallet` with the user's email. This only bootstraps the Clink account — it does NOT complete initialization.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills initialize_wallet --args '{"email":"<USER_EMAIL>"}'
-   ```
+2. **Initialize Wallet:** Call `initialize_wallet` with the user's email, for example `{"email":"<USER_EMAIL>"}`. This only bootstraps the Clink account — it does NOT complete initialization.
    You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so later async events can route back to the current conversation.
 3. **Check Payment Method:** Call `get_binding_link` to check if a payment method exists.
-   If calling via shell:
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_binding_link --args '{}'
-   ```
    - If none → the user gets a card with a link to bind one. The mailbox event pump delivers `payment_method.added` when binding completes; tell the user it is pending and do not block or re-poll.
    - If exists and notify routing is available → `get_binding_link` will directly send both the "Payment Method Already Bound" card and the optional risk-rules follow-up card in the same flow. Do NOT call `get_risk_rules_link` again in that turn.
    - If exists but direct notify routing is unavailable → send the returned notifications in order, then skip to step 5.
 4. **View Risk Rules (Optional):** Call `get_risk_rules_link` to let the user view and optionally configure risk rules. This step is NOT required — initialization is complete once a payment method is bound. Risk rules can be configured at any time.
-   If calling via shell:
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_risk_rules_link --args '{}'
-   ```
    This step is mainly for standalone "modify/view risk rules" requests or for fallback paths where `get_binding_link` could not deliver the optional risk-rules follow-up directly. The mailbox event pump delivers `risk_rule.updated` when the user changes rules on the page.
 5. **Complete only after verified binding:** Once payment method is confirmed (either already existed in the current `get_binding_link` result or the `payment_method.added` event was delivered), the setup is complete. If the event pump already sent `wallet.initialized_complete`, do NOT send another setup-complete card; keep any chat follow-up brief. Do NOT wait for risk rules.
 
@@ -318,10 +307,6 @@ When a user installs or uses this skill for the first time:
 
 When the user requests a recharge or another skill triggers an auto top-up:
 1. **Pre-Check:** Call `pre_check_account` to verify the account is ready. Do NOT send any "🔍 Clink Account Check Passed" card when this check passes.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills pre_check_account --args '{}'
-   ```
    - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
 2. **Route by selected payment method:**
    - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
@@ -331,13 +316,7 @@ When the user requests a recharge or another skill triggers an auto top-up:
    - The updated payment method list may arrive through agent refresh (`get_binding_link` or a later payment call) or through the mailbox event pump (`payment_method.added` / `payment_method.updated`, or `purchase_instruction.activated` / `vic_device.binding_succeeded` for VIC). Tell the user it is pending and do not block or re-poll.
    - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow (Section 3.4). Do NOT call `clink_pay` for that Visa card.
 3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
-   If calling via shell (do NOT omit --args, replace placeholders):
-   ```
-   # Direct mode:
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"merchant_id":"<MERCHANT_ID>","amount":<AMOUNT>,"currency":"USD","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
-   # Session mode:
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_pay --args '{"sessionId":"<SESSION_ID>","merchant_integration":{"server":"<MERCHANT_SERVER>","confirm_tool":"<CONFIRM_TOOL>","confirm_args":{}}}'
-   ```
+   Direct mode args include `merchant_id`, `amount`, `currency`, and `merchant_integration`. Session mode args include `sessionId` and `merchant_integration`.
 4. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
 5. **Async completion ownership (event pump):** The mailbox event pump owns async payment outcomes; the sync `status=1` success path should already hand off merchant confirmation inside the payment tool:
    - `agent_order.succeeded` → the event pump may send `✅ Payment Successful` if needed, then hand off merchant confirmation only when the sync path did not already complete that handoff
@@ -352,10 +331,7 @@ When the user requests a recharge or another skill triggers an auto top-up:
 
 Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
 
-1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills prepare_visa_purchase_instruction --args '{"title":"<TITLE>","fulfillmentType":"NO_SHIPPING_REQUIRED","effectiveUntilTime":"1782345600","mandates":[{"title":"Hotel","description":"Hotel","amountLimit":1000.00,"currencyCode":"USD","merchantCategoryCode":"7011","effectiveUntilTime":"1782345600"}]}'
-   ```
+1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Include fields such as `title`, `fulfillmentType`, `effectiveUntilTime`, and `mandates`. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
 2. **State machine outcomes:**
    - `state=NON_VISA` means the selected/default method is not Visa; continue through the normal non-Visa payment route when payment inputs are ready.
    - `state=MISSING_FULFILLMENT_TYPE` means the agent must determine whether the purchase is shipped physical goods before listing or creating instructions.
@@ -507,10 +483,6 @@ When the user asks to view or manage their payment methods:
 When the user asks to refund an existing Clink order:
 1. **Require Order Context:** Collect or confirm the target `orderId`. Do NOT guess it from memory.
 2. **Call `clink_refund`:** Submit the refund request with the `orderId`.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills clink_refund --args '{"orderId":"<ORDER_ID>"}'
-   ```
    You may also include optional notify routing fields `channel`, `target_id`, and `target_type` so the later event-pump notifications can route back to the current conversation.
 3. **Interpret Scope Correctly:** `clink_refund` currently applies for a full refund only. Do NOT claim partial-refund support unless the tool schema or backend API is updated.
 4. **Wait For Final Result:** A successful submission only means the refund request was accepted for processing. The final refund outcome is delivered asynchronously by the mailbox event pump.
@@ -526,10 +498,6 @@ When the user asks to refund an existing Clink order:
 When the user asks to check an existing refund:
 1. **Require Refund Context:** Collect or confirm the target `refundOrderId`. Do NOT guess it from memory.
 2. **Call `get_refund_status`:** Query the current refund state with the `refundOrderId` only when the user explicitly asks about refund progress/status.
-   If calling via shell (do NOT omit --args):
-   ```
-   npx mcporter --config "$MCPORTER_CONFIG_PATH" call agent-payment-skills get_refund_status --args '{"refundOrderId":"<REFUND_ORDER_ID>"}'
-   ```
 3. **Return The Status Card:** The tool returns a status card for current states such as `pending_review`, `refunding`, `success`, `failed`, or `review_rejected`.
 4. **Handle Missing Refunds Carefully:** If the backend returns `71160007`, tell the user the refund order was not found and ask them to confirm the refund order ID.
 
