@@ -55,6 +55,8 @@ const LOCK_PATH = path.join(LOCK_DIR, 'event-pump.lock');
 const LOCK_STALE_MS = 120000;
 const MESSAGE_SENDER = path.join(SCRIPT_DIR, 'send-message.mjs');
 const MERCHANT_CONFIRMATION_RUNNER = path.join(SCRIPT_DIR, 'run-merchant-confirmation.mjs');
+const PAYMENT_INTENT_RESUME_RUNNER = path.join(SCRIPT_DIR, 'run-payment-intent-resume.mjs');
+const PAYMENT_INTENT_RESUME_TOOL = 'resume_pending_payment_intent';
 const CLI_BUNDLE = path.join(SKILL_DIR, 'vendor', 'clink-cli', 'clink-cli.bundle.mjs');
 // `events poll` drains the webhook-events queue within this client-side window
 // (the CLI polls the backend internally; there is no server-side long-poll).
@@ -126,6 +128,9 @@ function normalizeCache(cache) {
   }
   if (!normalized.paymentFlowStates || typeof normalized.paymentFlowStates !== 'object') {
     normalized.paymentFlowStates = {};
+  }
+  if (!normalized.pendingPaymentIntents || typeof normalized.pendingPaymentIntents !== 'object' || Array.isArray(normalized.pendingPaymentIntents)) {
+    normalized.pendingPaymentIntents = {};
   }
   if (!Array.isArray(normalized.processedEventSeqs)) normalized.processedEventSeqs = [];
   if (normalized.lastProcessedEventSeq === undefined) normalized.lastProcessedEventSeq = null;
@@ -405,6 +410,67 @@ function spawnMerchantConfirmation(merchantContext, merchantArgs, { orderId, ses
     logError('agent_order.succeeded.trigger_merchant_confirmation.spawn', err);
   });
   child.unref();
+}
+
+function spawnPaymentIntentResume(paymentIntentId) {
+  const child = spawn(process.execPath, [
+    PAYMENT_INTENT_RESUME_RUNNER,
+    '--config-path', resolveMcporterConfigPath(),
+    '--tool', PAYMENT_INTENT_RESUME_TOOL,
+    '--payment-intent-id', paymentIntentId,
+  ], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  child.on('error', (err) => {
+    logError('payment_intent.resume.spawn', err);
+  });
+  child.unref();
+}
+
+function resolveInstructionIdForEvent(event, data) {
+  return (
+    data.instructionId ||
+    data.instruction_id ||
+    data.purchaseInstructionId ||
+    data.purchase_instruction_id ||
+    data.id ||
+    event?.resourceId ||
+    null
+  );
+}
+
+function markPendingPaymentIntentsInstructionActivated(cache, event, data) {
+  const normalized = normalizeCache(cache);
+  const instructionId = resolveInstructionIdForEvent(event, data);
+  const paymentInstrumentId = data.paymentInstrumentId || data.payment_instrument_id || null;
+  const activated = [];
+  const now = new Date().toISOString();
+  for (const intent of Object.values(normalized.pendingPaymentIntents)) {
+    if (!intent || typeof intent !== 'object') continue;
+    if (!['WAITING_INSTRUCTION_AUTH', 'INSTRUCTION_WORKFLOW_REQUIRED'].includes(intent.state)) continue;
+    const draftInstructionId = typeof intent.draftInstructionId === 'string' && intent.draftInstructionId.trim()
+      ? intent.draftInstructionId.trim()
+      : '';
+    const instructionMatches = instructionId && draftInstructionId && draftInstructionId === instructionId;
+    // Precise FSM correlation: once a pending payment intent recorded the draft
+    // instruction it created, a later activation for another instruction on the
+    // same card must not resume this intent. The paymentInstrumentId fallback is
+    // only for legacy/incomplete pending intents that predate draftInstructionId.
+    const paymentInstrumentMatches = !draftInstructionId && paymentInstrumentId && intent.paymentInstrumentId === paymentInstrumentId;
+    if (!instructionMatches && !paymentInstrumentMatches) continue;
+    const next = {
+      ...intent,
+      state: 'INSTRUCTION_ACTIVATED',
+      activationEventType: eventTypeOf(event),
+      activationEventId: event?.eventId || null,
+      activationEventSeq: event?.seq ?? null,
+      updatedAt: now,
+    };
+    normalized.pendingPaymentIntents[intent.paymentIntentId] = next;
+    activated.push(next);
+  }
+  return activated;
 }
 
 // ─── Amount formatting (mirrors hooks/my_payment_webhook.mjs) ───
@@ -877,6 +943,7 @@ async function dispatchEvent(event) {
         return;
       }
       let cachedMethod = null;
+      let activatedPaymentIntents = [];
       try {
         const cache = await readCache();
         cachedMethod = (cache.paymentMethods || []).find((m) => m.paymentInstrumentId === targetId) || null;
@@ -888,9 +955,25 @@ async function dispatchEvent(event) {
         for (const [key, state] of Object.entries(readyState.states)) {
           cache.paymentFlowStates[key] = state;
         }
+        activatedPaymentIntents = markPendingPaymentIntentsInstructionActivated(cache, event, data);
+        for (const intent of activatedPaymentIntents) {
+          if (!intent.resumeDispatchedAt) {
+            cache.pendingPaymentIntents[intent.paymentIntentId] = {
+              ...intent,
+              resumeDispatchedAt: new Date().toISOString(),
+              resumeDispatchSource: 'event_pump',
+            };
+          }
+        }
         await writeCache(cache);
       } catch (err) {
         await logError(`${type} markVicRegistrationReady`, err);
+      }
+
+      for (const intent of activatedPaymentIntents) {
+        if (!intent.resumeDispatchedAt) {
+          spawnPaymentIntentResume(intent.paymentIntentId);
+        }
       }
 
       const notifyDestination = getNotifyDestination(await readCache());

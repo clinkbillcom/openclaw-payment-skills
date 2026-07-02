@@ -182,6 +182,9 @@ function normalizeCache(cache) {
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {
     normalized.orderCardStates = {};
   }
+  if (!normalized.pendingPaymentIntents || typeof normalized.pendingPaymentIntents !== 'object' || Array.isArray(normalized.pendingPaymentIntents)) {
+    normalized.pendingPaymentIntents = {};
+  }
   if (
     normalized.notifyDestination &&
     typeof normalized.notifyDestination === 'object' &&
@@ -918,6 +921,170 @@ async function savePendingMerchantConfirmation(merchantIntegration, sessionId, n
   await writePaymentMethodsCache(cache);
 }
 
+function normalizeMerchantIntegrationForIntent(value = {}) {
+  return {
+    server: firstNonBlank(value.server),
+    confirmTool: firstNonBlank(value.confirmTool, value.confirm_tool, value.tool),
+    confirmArgs: isPlainObject(value.confirmArgs)
+      ? cloneJsonValue(value.confirmArgs)
+      : isPlainObject(value.confirm_args)
+        ? cloneJsonValue(value.confirm_args)
+        : isPlainObject(value.args)
+          ? cloneJsonValue(value.args)
+          : {},
+  };
+}
+
+function extractInstructionIdFromPrepareResult(result) {
+  const text = String(result || '');
+  const match = /Instruction ID:\s*([^\s\n]+)/i.exec(text);
+  return match?.[1]?.trim() || '';
+}
+
+function createPaymentIntentId() {
+  return `payint_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function buildPendingPaymentIntentArgs(args = {}, requestedMandates = []) {
+  const preserved = {
+    sessionId: args.sessionId,
+    merchant_id: args.merchant_id,
+    amount: args.amount,
+    currency: args.currency,
+    paymentMethodType: args.paymentMethodType ?? args.payment_method_type,
+    title: args.title,
+    description: args.description,
+    merchantName: args.merchantName ?? args.merchant_name,
+    merchantCategoryCode: args.merchantCategoryCode ?? args.merchant_category_code,
+    preferredMerchantName: args.preferredMerchantName ?? args.preferred_merchant_name,
+    fulfillmentType: args.fulfillmentType,
+    shippingAddress: args.shippingAddress,
+    shipping_address: args.shipping_address,
+    products: args.products,
+    mandates: requestedMandates,
+    merchant_integration: args.merchant_integration,
+    channel: args.channel,
+    target_id: args.target_id,
+    target_type: args.target_type,
+    locale: args.locale,
+  };
+  return withoutBlankValues(preserved);
+}
+
+async function savePendingPaymentIntentForClinkPay({
+  args = {},
+  paymentInstrumentId,
+  requestedMandates = [],
+  prepareResult = '',
+  merchantIntegration = {},
+} = {}) {
+  if (!isPurchaseInstructionDraftCreateSuccess(prepareResult)) return null;
+  const draftInstructionId = extractInstructionIdFromPrepareResult(prepareResult);
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  if (!cache.pendingPaymentIntents || typeof cache.pendingPaymentIntents !== 'object' || Array.isArray(cache.pendingPaymentIntents)) {
+    cache.pendingPaymentIntents = {};
+  }
+  const requestedIntentId = firstNonBlank(args.paymentIntentId, args.payment_intent_id, args.resumePaymentIntentId, args.resume_payment_intent_id);
+  const paymentIntentId = requestedIntentId || createPaymentIntentId();
+  const existing = cache.pendingPaymentIntents[paymentIntentId] || {};
+  const now = new Date().toISOString();
+  const intent = {
+    ...existing,
+    paymentIntentId,
+    state: 'WAITING_INSTRUCTION_AUTH',
+    mode: args.sessionId ? 'session_pay' : 'direct_pay',
+    paymentInstrumentId,
+    draftInstructionId: draftInstructionId || existing.draftInstructionId || null,
+    args: buildPendingPaymentIntentArgs(args, requestedMandates),
+    merchantIntegration: normalizeMerchantIntegrationForIntent(merchantIntegration || args.merchant_integration || {}),
+    createdAt: existing.createdAt || now,
+    updatedAt: now,
+    resumeLock: null,
+  };
+  cache.pendingPaymentIntents[paymentIntentId] = intent;
+  await writePaymentMethodsCache(cache);
+  return intent;
+}
+
+async function updatePendingPaymentIntent(paymentIntentId, patch = {}) {
+  const normalizedId = firstNonBlank(paymentIntentId);
+  if (!normalizedId) return null;
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  const existing = cache.pendingPaymentIntents[normalizedId];
+  if (!existing) return null;
+  const next = {
+    ...existing,
+    ...cloneJsonValue(patch),
+    paymentIntentId: normalizedId,
+    updatedAt: new Date().toISOString(),
+  };
+  cache.pendingPaymentIntents[normalizedId] = next;
+  await writePaymentMethodsCache(cache);
+  return next;
+}
+
+async function handle_resume_pending_payment_intent(args = {}) {
+  const paymentIntentId = firstNonBlank(args.paymentIntentId, args.payment_intent_id);
+  if (!paymentIntentId) return "ERROR: resume_pending_payment_intent requires 'paymentIntentId'.";
+  const cache = normalizeCache(await readPaymentMethodsCache() || {});
+  const intent = cache.pendingPaymentIntents[paymentIntentId];
+  if (!intent) {
+    return `[VIC_PAY_FSM] state=PAYMENT_INTENT_NOT_FOUND action=STOP reason=missing_payment_intent
+Payment Intent ID: ${paymentIntentId}`;
+  }
+  if (intent.state === 'PAY_SUBMITTED' || intent.state === 'COMPLETED') {
+    return `[VIC_PAY_FSM] state=${intent.state} action=STOP reason=already_resumed
+Payment Intent ID: ${paymentIntentId}`;
+  }
+  if (intent.state === 'WAITING_INSTRUCTION_AUTH' || intent.state === 'INSTRUCTION_WORKFLOW_REQUIRED') {
+    return `[VIC_PAY_FSM] state=${intent.state} action=WAIT_INSTRUCTION_ACTIVATION reason=instruction_not_activated
+Payment Intent ID: ${paymentIntentId}
+Instruction ID: ${intent.draftInstructionId || 'N/A'}
+Do NOT call clink_pay or create another instruction yet. Wait for purchase_instruction.activated correlated to this pending payment intent, then resume_pending_payment_intent will re-run the same payment FSM.`;
+  }
+  if (intent.state === 'RESUMING') {
+    return `[VIC_PAY_FSM] state=RESUMING action=STOP reason=resume_already_in_progress
+Payment Intent ID: ${paymentIntentId}`;
+  }
+  if (intent.state !== 'INSTRUCTION_ACTIVATED' && intent.state !== 'RESUME_FAILED') {
+    return `[VIC_PAY_FSM] state=${intent.state || 'UNKNOWN'} action=STOP reason=invalid_payment_intent_state
+Payment Intent ID: ${paymentIntentId}
+resume_pending_payment_intent only runs after purchase_instruction.activated marks the pending intent INSTRUCTION_ACTIVATED, or after a RESUME_FAILED retry.`;
+  }
+
+  await updatePendingPaymentIntent(paymentIntentId, {
+    state: 'RESUMING',
+    resumeStartedAt: new Date().toISOString(),
+    resumeLock: String(process.pid),
+  });
+
+  const payArgs = {
+    ...(intent.args || {}),
+    paymentInstrumentId: intent.paymentInstrumentId,
+    paymentIntentId,
+    merchant_integration: {
+      server: intent.merchantIntegration?.server,
+      confirm_tool: intent.merchantIntegration?.confirmTool,
+      confirm_args: intent.merchantIntegration?.confirmArgs || {},
+    },
+  };
+  const result = await handle_clink_pay(payArgs);
+  const nextState = /Payment submitted successfully|\[PAYMENT_FSM\]/i.test(String(result))
+    ? 'PAY_SUBMITTED'
+    : /state=INSTRUCTION_WORKFLOW_REQUIRED/i.test(String(result))
+      ? 'WAITING_INSTRUCTION_AUTH'
+      : 'RESUME_FAILED';
+  await updatePendingPaymentIntent(paymentIntentId, {
+    state: nextState,
+    resumeFinishedAt: new Date().toISOString(),
+    resumeLock: null,
+    lastResumeResult: String(result).slice(0, 4000),
+  });
+  return `[VIC_PAY_FSM] state=PAYMENT_INTENT_RESUME_RESULT action=RETURN_RESULT reason=resume_same_fsm
+Payment Intent ID: ${paymentIntentId}
+${result}`;
+}
+
 function buildMerchantPaymentHandoff(orderId, sessionId, notifyDestination, triggerSource) {
   if (!notifyDestination?.channel || !notifyDestination?.target?.type || !notifyDestination?.target?.id) {
     throw new Error('merchant handoff requires notifyDestination.channel, notifyDestination.target.type, and notifyDestination.target.id');
@@ -1425,9 +1592,10 @@ function buildPurchaseInstructionAuthNotification({
 
 function buildVicInstructionRequiredDirective(paymentMethod) {
   return `[SYSTEM DIRECTIVE] Account pre-check PASSED: selected Visa card is VIC-enabled.
-Do NOT call clink_pay for this Visa card yet.
-Continue the VIC purchase instruction flow through prepare_visa_purchase_instruction once the user's spend scope is available. That state machine must list ACTIVE instructions with status=ACTIVE and paymentInstrumentId=${paymentMethod.paymentInstrumentId} before any draft creation. Do NOT manually call create_purchase_instruction before the state machine list step.
-The state machine only reuses ACTIVE instructions whose paymentInstrumentId exactly matches ${paymentMethod.paymentInstrumentId}, then matches by amountLimit, currencyCode, merchant/category/MCC, merchant name/title/description, and expiry. If no matching instruction is returned for this paymentInstrumentId, it creates a draft with the user's supplied spend scope, then waits for the user's Passkey result before sign_purchase_instruction.
+Do NOT call clink_pay for this Visa card until the spend scope is available.
+For scoped direct/session payment, call clink_pay with fulfillmentType and mandate scope; clink_pay itself must list valid ACTIVE instructions with --valid-only and paymentInstrumentId=${paymentMethod.paymentInstrumentId}, choose a matching instruction_id + mandate_id, and inject them into clink-cli pay. If no matching instruction+mandate exists, clink_pay starts the instruction creation workflow and stops before payment.
+For authorization-only preparation, continue through prepare_visa_purchase_instruction once the user's spend scope is available. That state machine must also list valid ACTIVE instructions with --valid-only and paymentInstrumentId=${paymentMethod.paymentInstrumentId} before any draft creation. Do NOT manually call create_purchase_instruction before the state machine list step.
+These state machines only reuse ACTIVE instructions whose paymentInstrumentId exactly matches ${paymentMethod.paymentInstrumentId}, then match by amountLimit, currencyCode, merchant/category/MCC, merchant name/title/description, and expiry. If no matching instruction is returned for this paymentInstrumentId, they create a draft with the user's supplied spend scope, then wait for the user's Passkey result before sign_purchase_instruction.
 Payment Instrument ID: ${paymentMethod.paymentInstrumentId}`;
 }
 
@@ -2006,6 +2174,7 @@ async function handle_clink_pay(args) {
   if (!args || typeof args !== 'object') {
     return "ERROR: clink_pay requires an args object. Missing: merchant_id (or sessionId), amount, currency.";
   }
+  args = normalizeClinkPayFulfillmentArgs(args);
   if (!args.sessionId && !args.merchant_id) {
     return "ERROR: clink_pay requires 'merchant_id' (direct mode) or 'sessionId' (session mode). Received: " + JSON.stringify(args);
   }
@@ -2035,13 +2204,22 @@ async function handle_clink_pay(args) {
     }
   }
 
+  const fulfillmentContext = resolveClinkPayFulfillmentForPay(args);
+  if (!fulfillmentContext.ok) {
+    return fulfillmentContext.response;
+  }
+  args = {
+    ...args,
+    fulfillmentType: fulfillmentContext.fulfillmentType,
+  };
+
   const env = await getPaymentEnv();
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return "Wallet not initialized. Please run initialize_wallet first.";
   }
 
-  let piId = args.paymentInstrumentId;
-  let pmType = args.paymentMethodType || "CARD";
+  let piId = firstNonBlank(args.paymentInstrumentId, args.payment_instrument_id);
+  let pmType = firstNonBlank(args.paymentMethodType, args.payment_method_type) || "CARD";
   let defaultCard = null;
 
   if (!piId) {
@@ -2079,12 +2257,41 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     notifyDestination: requestNotifyDestination,
     context: 'clink_pay',
   });
-  if (vicGate.blocked) {
+  const requiresVicInstruction = vicGate.blocked && vicGate.route === 'vic_instruction_required';
+  if (vicGate.blocked && !requiresVicInstruction) {
     return vicGate.response;
   }
   if (vicGate.paymentMethod) {
     defaultCard = vicGate.paymentMethod;
     pmType = vicGate.paymentMethod.paymentMethodType || vicGate.paymentMethod.paymentInstrumentType || pmType;
+  }
+
+  const explicitInstructionId = firstNonBlank(args.instructionId, args.instruction_id);
+  const legacyPurchaseInstructionId = firstNonBlank(args.purchaseInstructionId, args.purchase_instruction_id);
+  if (explicitInstructionId && legacyPurchaseInstructionId && explicitInstructionId !== legacyPurchaseInstructionId) {
+    return 'ERROR: clink_pay instructionId and purchaseInstructionId must match when both are provided.';
+  }
+  const instructionIdHint = explicitInstructionId || legacyPurchaseInstructionId;
+  const mandateIdHint = firstNonBlank(args.mandateId, args.mandate_id);
+  let resolvedAuthorization = null;
+  if (requiresVicInstruction) {
+    let authorizationResult;
+    try {
+      authorizationResult = await resolveClinkPayAuthorization(args, {
+        paymentInstrumentId: piId,
+        instructionIdHint,
+        mandateIdHint,
+      });
+    } catch (err) {
+      await logError('clink_pay/resolve_authorization', err);
+      return `[VIC_PAY_FSM] state=AUTHORIZATION_RESOLUTION_FAILED action=SURFACE_ERROR reason=instruction_list_failed
+Failed to resolve mandatory instruction_id and mandate_id before VIC clink_pay: ${err.message}
+Do NOT run clink-cli pay until instruction list succeeds and returns a matching ACTIVE instruction+mandate, or the instruction creation workflow activates one.`;
+    }
+    if (!authorizationResult.ok) {
+      return authorizationResult.response;
+    }
+    resolvedAuthorization = authorizationResult.authorization;
   }
 
   const timestamp = Date.now().toString();
@@ -2098,8 +2305,26 @@ Call get_payment_method_setup_link immediately to prompt the user to bind a card
     payArgs.push('--amount', String(args.amount));
     payArgs.push('--currency', args.currency || 'USD');
   }
-  if (args.purchaseInstructionId) {
-    payArgs.push('--purchase-instruction-id', String(args.purchaseInstructionId));
+  const instructionId = resolvedAuthorization?.instructionId || instructionIdHint;
+  if (instructionId) {
+    payArgs.push('--instruction-id', instructionId);
+  }
+  const mandateId = resolvedAuthorization?.mandateId || mandateIdHint;
+  if (mandateId) {
+    payArgs.push('--mandate-id', mandateId);
+  }
+  if (requiresVicInstruction && (!instructionId || !mandateId)) {
+    return '[VIC_PAY_FSM] state=MISSING_AUTHORIZATION action=STOP reason=missing_instruction_or_mandate\ninstruction_id and mandate_id are mandatory before VIC clink_pay. Do NOT run clink-cli pay until instruction list returns a matching ACTIVE instruction+mandate or the instruction creation workflow activates one.';
+  }
+  const payShippingAddressInput = fulfillmentContext.payShippingAddress;
+  if (payShippingAddressInput !== undefined) {
+    const payShippingAddress = normalizeUcpPostalShippingAddress(payShippingAddressInput);
+    if (!payShippingAddress) return 'ERROR: clink_pay shippingAddress must be an object.';
+    payArgs.push('--shipping-address', JSON.stringify(payShippingAddress));
+  }
+  if (args.products !== undefined) {
+    if (!Array.isArray(args.products)) return 'ERROR: clink_pay products must be an array.';
+    payArgs.push('--products', JSON.stringify(args.products));
   }
 
   try {
@@ -2801,8 +3026,8 @@ function normalizeInstructionComparableText(value) {
 
 function parseInstructionTimeMs(value) {
   if (value === undefined || value === null || value === '') return null;
-  // Instruction/mandate effectiveUntilTime is now Unix epoch seconds (string or number). Treat a
-  // bare integer as epoch seconds; values already in millisecond range are passed through as-is.
+  // Current CLI input is UTC datetime (`yyyy-MM-dd HH:mm:ss`). Numeric values are still accepted
+  // defensively here only for comparing legacy cached instruction records.
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) return null;
     return value < 1e12 ? value * 1000 : value;
@@ -2823,6 +3048,222 @@ function parseInstructionTimeMs(value) {
 
 function isPlainObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function firstNonBlank(...values) {
+  for (const value of values) {
+    const normalized = String(value ?? '').trim();
+    if (normalized) return normalized;
+  }
+  return '';
+}
+
+function withoutBlankValues(value) {
+  const result = {};
+  for (const [key, fieldValue] of Object.entries(value || {})) {
+    if (fieldValue === undefined || fieldValue === null) continue;
+    if (typeof fieldValue === 'string' && !fieldValue.trim()) continue;
+    result[key] = fieldValue;
+  }
+  return result;
+}
+
+function splitName(value) {
+  const name = String(value || '').trim();
+  if (!name) return { firstName: '', lastName: '' };
+  const parts = name.split(/\s+/);
+  if (parts.length === 1) return { firstName: parts[0], lastName: '' };
+  return { firstName: parts[0], lastName: parts.slice(1).join(' ') };
+}
+
+function normalizeCwalletInstructionShippingAddress(address) {
+  if (!isPlainObject(address)) return null;
+  const deliveryContactDetails = isPlainObject(address.deliveryContactDetails)
+    ? address.deliveryContactDetails
+    : isPlainObject(address.delivery_contact_details)
+      ? address.delivery_contact_details
+      : {};
+  const name = firstNonBlank(
+    address.name,
+    [address.first_name ?? address.firstName, address.last_name ?? address.lastName]
+      .map((part) => String(part ?? '').trim())
+      .filter(Boolean)
+      .join(' '),
+  );
+  const phoneNumber = firstNonBlank(
+    address.phone_number,
+    address.phoneNumber,
+    deliveryContactDetails.phoneNumber,
+    deliveryContactDetails.phone_number,
+  );
+  const normalizedDeliveryContactDetails = phoneNumber
+    ? { ...deliveryContactDetails, phoneNumber }
+    : deliveryContactDetails;
+  return withoutBlankValues({
+    addressId: firstNonBlank(address.addressId, address.address_id),
+    name,
+    line1: firstNonBlank(address.line1, address.street_address, address.streetAddress),
+    line2: firstNonBlank(address.line2, address.extended_address, address.extendedAddress),
+    line3: firstNonBlank(address.line3),
+    city: firstNonBlank(address.city, address.address_locality, address.addressLocality),
+    state: firstNonBlank(address.state, address.address_region, address.addressRegion),
+    zip: firstNonBlank(address.zip, address.postal_code, address.postalCode),
+    countryCode: firstNonBlank(address.countryCode, address.country_code, address.address_country, address.addressCountry).toUpperCase(),
+    deliveryContactDetails: Object.keys(normalizedDeliveryContactDetails).length > 0
+      ? normalizedDeliveryContactDetails
+      : undefined,
+  });
+}
+
+function normalizeUcpPostalShippingAddress(address) {
+  if (!isPlainObject(address)) return null;
+  const split = splitName(address.name);
+  const deliveryContactDetails = isPlainObject(address.deliveryContactDetails)
+    ? address.deliveryContactDetails
+    : isPlainObject(address.delivery_contact_details)
+      ? address.delivery_contact_details
+      : {};
+  return withoutBlankValues({
+    street_address: firstNonBlank(address.street_address, address.streetAddress, address.line1),
+    extended_address: firstNonBlank(address.extended_address, address.extendedAddress, address.line2),
+    address_locality: firstNonBlank(address.address_locality, address.addressLocality, address.city),
+    address_region: firstNonBlank(address.address_region, address.addressRegion, address.state),
+    address_country: firstNonBlank(address.address_country, address.addressCountry, address.countryCode, address.country_code).toUpperCase(),
+    postal_code: firstNonBlank(address.postal_code, address.postalCode, address.zip),
+    first_name: firstNonBlank(address.first_name, address.firstName, split.firstName),
+    last_name: firstNonBlank(address.last_name, address.lastName, split.lastName),
+    phone_number: firstNonBlank(
+      address.phone_number,
+      address.phoneNumber,
+      deliveryContactDetails.phoneNumber,
+      deliveryContactDetails.phone_number,
+    ),
+  });
+}
+
+function getDefaultNoShippingUsPostalAddress() {
+  return {
+    street_address: '548 Market St',
+    extended_address: 'PMB 00000',
+    address_locality: 'San Francisco',
+    address_region: 'CA',
+    address_country: 'US',
+    postal_code: '94104',
+    first_name: 'Clink',
+    last_name: 'User',
+    phone_number: '+14155550100',
+  };
+}
+
+function inferClinkPayFulfillmentType(args = {}) {
+  const explicit = firstNonBlank(
+    args.fulfillmentType,
+    args.fulfillment_type,
+    args.productFulfillmentType,
+    args.product_fulfillment_type,
+  );
+  if (explicit) return normalizePurchaseInstructionFulfillmentType(explicit);
+
+  const products = Array.isArray(args.products) ? args.products : [];
+  const productTexts = products.map((product) => [
+    product?.fulfillmentType,
+    product?.fulfillment_type,
+    product?.type,
+    product?.productType,
+    product?.product_type,
+    product?.category,
+    product?.productName,
+    product?.product_name,
+    product?.title,
+    product?.description,
+  ].filter(Boolean).join(' '));
+  const combinedText = [
+    args.paymentPurpose,
+    args.payment_purpose,
+    args.purpose,
+    args.title,
+    args.description,
+    args.orderTitle,
+    args.order_title,
+    args.orderDescription,
+    args.order_description,
+    args.merchantName,
+    args.merchant_name,
+    ...productTexts,
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  if (/\b(physical|shipped|shipping|ship|delivery|deliver|merchandise|t-?shirt|apparel|clothing)\b|实物|邮寄|配送|发货|送货/.test(combinedText)) {
+    return 'PHYSICAL_GOODS_REQUIRES_SHIPPING';
+  }
+  if (/\b(no[_ -]?shipping|virtual|digital|credit|credits|top[_ -]?up|topup|recharge|subscription|service|booking|hotel|ticket|reservation)\b|充值|积分|点数|虚拟|数字|订阅|服务|酒店|票|预订|预约/.test(combinedText)) {
+    return 'NO_SHIPPING_REQUIRED';
+  }
+  return '';
+}
+
+function validateUcpPostalShippingAddressObject(address) {
+  const missing = [];
+  const normalized = normalizeUcpPostalShippingAddress(address);
+  if (!normalized) return { ok: false, address: null, missing: ['shippingAddress'] };
+  for (const field of ['street_address', 'address_locality', 'address_region', 'address_country', 'postal_code']) {
+    if (!String(normalized[field] || '').trim()) missing.push(`shippingAddress.${field}`);
+  }
+  const countryCode = String(normalized.address_country || '').trim().toUpperCase();
+  if (countryCode && countryCode !== 'US') missing.push('shippingAddress.address_country must be US');
+  const state = String(normalized.address_region || '').trim();
+  if (state && !/^[A-Z]{2}$/.test(state)) missing.push('shippingAddress.address_region must be a USPS state abbreviation');
+  const postalCode = String(normalized.postal_code || '').trim();
+  if (postalCode && !/^\d{5}(?:-\d{4})?$/.test(postalCode)) missing.push('shippingAddress.postal_code must be a US ZIP or ZIP+4');
+  return { ok: missing.length === 0, address: normalized, missing };
+}
+
+function resolveClinkPayFulfillmentForPay(args = {}) {
+  const fulfillmentType = inferClinkPayFulfillmentType(args);
+  if (!fulfillmentType || fulfillmentType === 'UNKNOWN') {
+    return {
+      ok: false,
+      response: `[CLINK_PAY_FSM] state=MISSING_FULFILLMENT_TYPE action=ASK_USER reason=fulfillment_unknown
+Before old clink-cli pay, determine whether this payment is for shipped physical goods or no-shipping-required virtual/service value.
+Use fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING for shipped physical goods, or NO_SHIPPING_REQUIRED for recharge, credits, top-up, virtual goods, services, subscriptions, hotels, tickets, bookings, and reservations.
+Do NOT run instruction list or clink-cli pay until fulfillment is resolved.`,
+    };
+  }
+  if (!['PHYSICAL_GOODS_REQUIRES_SHIPPING', 'NO_SHIPPING_REQUIRED'].includes(fulfillmentType)) {
+    return {
+      ok: false,
+      response: `[CLINK_PAY_FSM] state=MISSING_FULFILLMENT_TYPE action=ASK_USER reason=invalid_fulfillment_type
+fulfillmentType must be PHYSICAL_GOODS_REQUIRES_SHIPPING, NO_SHIPPING_REQUIRED, or UNKNOWN.
+Do NOT run instruction list or clink-cli pay until fulfillment is resolved.`,
+    };
+  }
+  if (fulfillmentType === 'NO_SHIPPING_REQUIRED') {
+    return {
+      ok: true,
+      fulfillmentType,
+      payShippingAddress: getDefaultNoShippingUsPostalAddress(),
+    };
+  }
+
+  const shippingAddressInput = args.shippingAddress
+    ?? args.shipping_address
+    ?? args.ucpShippingAddress
+    ?? args.ucp_shipping_address;
+  const validation = validateUcpPostalShippingAddressObject(shippingAddressInput);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      response: `[CLINK_PAY_FSM] state=MISSING_SHIPPING_ADDRESS action=ASK_USER reason=physical_goods_requires_us_shipping
+This is a physical goods purchase and requires a standard US shipping address before old clink-cli pay.
+Required ISO-compatible fields: street_address, address_locality, USPS state abbreviation in address_region, address_country=US (ISO 3166-1 alpha-2), and postal_code as US ZIP or ZIP+4.
+Missing/invalid fields: ${validation.missing.join(', ')}
+Do NOT run instruction list or clink-cli pay until the real US shipping address is complete. Do not use the no-shipping default address for physical goods.`,
+    };
+  }
+  return {
+    ok: true,
+    fulfillmentType,
+    payShippingAddress: validation.address,
+  };
 }
 
 function normalizePurchaseInstructionFulfillmentType(value) {
@@ -2851,9 +3292,9 @@ function validatePurchaseInstructionShippingAddress(args = {}) {
   const needsShippingAddress = purchaseInstructionNeedsShippingAddress(args);
   const hasShippingAddress = args.shippingAddress !== undefined && args.shippingAddress !== null;
   if (!needsShippingAddress && !hasShippingAddress) return missing;
-  if (!isPlainObject(args.shippingAddress)) return ['shippingAddress'];
+  const address = normalizeCwalletInstructionShippingAddress(args.shippingAddress);
+  if (!address) return ['shippingAddress'];
 
-  const address = args.shippingAddress;
   for (const field of ['name', 'line1', 'city', 'state', 'zip', 'countryCode']) {
     if (!String(address[field] || '').trim()) missing.push(`shippingAddress.${field}`);
   }
@@ -2874,17 +3315,91 @@ function validatePurchaseInstructionScope(args = {}) {
     const amountLimit = Number(mandate?.amountLimit);
     if (!Number.isFinite(amountLimit) || amountLimit <= 0) missing.push(`${prefix}.amountLimit`);
     if (!String(mandate?.currencyCode || '').trim()) missing.push(`${prefix}.currencyCode`);
-    if (
-      !String(mandate?.merchantCategoryCode || '').trim() &&
-      !String(mandate?.preferredMerchantName || '').trim() &&
-      !String(mandate?.merchantCategory || '').trim()
-    ) {
-      missing.push(`${prefix}.merchantCategoryCode or preferredMerchantName`);
-    }
+    const hasSemanticScope = [
+      mandate?.merchantCategoryCode,
+      mandate?.preferredMerchantName,
+      mandate?.merchantCategory,
+      mandate?.title,
+      mandate?.description,
+    ].some((value) => String(value || '').trim());
+    if (!hasSemanticScope) missing.push(`${prefix}.merchantCategoryCode, preferredMerchantName, title, or description`);
   });
 
   missing.push(...validatePurchaseInstructionShippingAddress(args));
   return missing;
+}
+
+function normalizeClinkPayFulfillmentArgs(args = {}) {
+  const normalized = { ...args };
+  if (normalized.fulfillmentType === undefined && args.fulfillment_type !== undefined) {
+    normalized.fulfillmentType = args.fulfillment_type;
+  }
+  const shippingAddressInput = args.shippingAddress
+    ?? args.shipping_address
+    ?? args.ucpShippingAddress
+    ?? args.ucp_shipping_address
+    ?? args.instructionShippingAddress
+    ?? args.instruction_shipping_address;
+  if (shippingAddressInput !== undefined) {
+    normalized.shippingAddress = normalizeCwalletInstructionShippingAddress(shippingAddressInput) ?? shippingAddressInput;
+    normalized.shipping_address = normalizeUcpPostalShippingAddress(shippingAddressInput) ?? shippingAddressInput;
+  }
+  return normalized;
+}
+
+function getClinkPayRequestedMandates(args = {}) {
+  let mandates = args.mandates ?? args.mandateScope ?? args.mandate_scope;
+  if (typeof mandates === 'string') {
+    try {
+      mandates = JSON.parse(mandates);
+    } catch (error) {
+      throw new Error(`clink_pay 'mandates' must be valid JSON when passed as a string: ${error.message}`);
+    }
+  }
+  if (Array.isArray(mandates) && mandates.length > 0) {
+    return mandates;
+  }
+
+  const amountLimit = Number(args.amount);
+  const currencyCode = firstNonBlank(args.currencyCode, args.currency_code, args.currency) || 'USD';
+  const title = firstNonBlank(
+    args.title,
+    args.instructionTitle,
+    args.instruction_title,
+    args.orderTitle,
+    args.order_title,
+    args.description,
+    args.merchant_name,
+    args.merchantName,
+    args.merchant_id,
+  );
+  const description = firstNonBlank(
+    args.description,
+    args.purchaseDescription,
+    args.purchase_description,
+    args.orderDescription,
+    args.order_description,
+    args.title,
+    args.merchant_name,
+    args.merchantName,
+    args.merchant_id,
+  );
+
+  if (!Number.isFinite(amountLimit) || amountLimit <= 0 || !currencyCode || (!title && !description)) {
+    throw new Error("clink_pay requires a non-empty 'mandates' array for VIC authorization matching, or direct-mode amount/currency plus title/description merchant scope so it can derive one.");
+  }
+
+  const derivedMandate = withoutBlankValues({
+    title,
+    description,
+    amountLimit,
+    currencyCode,
+    merchantCategoryCode: firstNonBlank(args.merchantCategoryCode, args.merchant_category_code, args.mcc),
+    preferredMerchantName: firstNonBlank(args.preferredMerchantName, args.preferred_merchant_name, args.merchantName, args.merchant_name),
+    merchantCategory: firstNonBlank(args.merchantCategory, args.merchant_category),
+    effectiveUntilTime: firstNonBlank(args.effectiveUntilTime, args.effective_until_time),
+  });
+  return [derivedMandate];
 }
 
 function mandateMatchesPurchaseScope(candidateMandate = {}, requestedMandate = {}) {
@@ -2903,15 +3418,20 @@ function mandateMatchesPurchaseScope(candidateMandate = {}, requestedMandate = {
   if (requestedMcc && candidateMcc && candidateMcc !== requestedMcc) return false;
   const categoryMatches = Boolean(requestedMcc && candidateMcc && candidateMcc === requestedMcc);
 
-  const requestedMerchant = normalizeInstructionComparableText(requestedMandate.preferredMerchantName);
+  const requestedMerchant = normalizeInstructionComparableText([
+    requestedMandate.preferredMerchantName,
+    requestedMandate.title,
+    requestedMandate.description,
+    requestedMandate.merchantCategory,
+  ].filter(Boolean).join(' '));
   const candidateMerchantText = normalizeInstructionComparableText([
     candidateMandate.preferredMerchantName,
     candidateMandate.title,
     candidateMandate.description,
     candidateMandate.merchantCategory,
   ].filter(Boolean).join(' '));
-  if (requestedMerchant && !categoryMatches) {
-    if (!candidateMerchantText) return false;
+  if (requestedMerchant) {
+    if (!candidateMerchantText) return categoryMatches;
     if (!candidateMerchantText.includes(requestedMerchant) && !requestedMerchant.includes(candidateMerchantText)) {
       return false;
     }
@@ -3002,10 +3522,10 @@ ${vicGate.response}`;
     const paymentInstrumentId = vicGate.paymentMethod?.paymentInstrumentId || selectedMethod.paymentInstrumentId;
     const activeInstructions = await runClinkCli([
       'instruction', 'list',
-      '--status', 'ACTIVE',
+      '--valid-only',
       '--payment-instrument-id', paymentInstrumentId,
     ]);
-    await logRequest('prepare_visa_purchase_instruction/list_active', { status: 'ACTIVE', paymentInstrumentId }, activeInstructions);
+    await logRequest('prepare_visa_purchase_instruction/list_valid_active', { validOnly: true, paymentInstrumentId }, activeInstructions);
 
     const reusableInstruction = findReusablePurchaseInstruction(activeInstructions, {
       paymentInstrumentId,
@@ -3068,7 +3588,9 @@ async function createPurchaseInstructionDraft(args = {}) {
   if (args.description !== undefined) body.description = args.description;
   if (args.effectiveUntilTime !== undefined) body.effectiveUntilTime = args.effectiveUntilTime;
   if (args.isRecurring !== undefined) body.isRecurring = args.isRecurring;
-  if (args.shippingAddress !== undefined) body.shippingAddress = args.shippingAddress;
+  if (args.shippingAddress !== undefined) {
+    body.shippingAddress = normalizeCwalletInstructionShippingAddress(args.shippingAddress) ?? args.shippingAddress;
+  }
   if (args.extra !== undefined) body.extra = args.extra;
 
   try {
@@ -3155,13 +3677,18 @@ async function createPurchaseInstructionDraft(args = {}) {
 
 async function handle_list_purchase_instructions(args = {}) {
   const listArgs = ['instruction', 'list'];
-  if (args.status) listArgs.push('--status', String(args.status));
+  const validOnly = args.validOnly === true || args.valid_only === true || String(args.validOnly ?? args.valid_only ?? '').toLowerCase() === 'true';
+  if (validOnly) {
+    listArgs.push('--valid-only');
+  } else if (args.status) {
+    listArgs.push('--status', String(args.status));
+  }
   if (args.paymentInstrumentId) listArgs.push('--payment-instrument-id', String(args.paymentInstrumentId));
   try {
     const data = await runClinkCli(listArgs);
     const lines = [`Purchase instructions:\n${JSON.stringify(data, null, 2)}`];
-    if (args.status === 'ACTIVE' && args.paymentInstrumentId && Array.isArray(data) && data.length === 0) {
-      lines.push(`[SYSTEM DIRECTIVE] No matching ACTIVE purchase instruction was returned for paymentInstrumentId=${args.paymentInstrumentId}.
+    if ((validOnly || args.status === 'ACTIVE') && args.paymentInstrumentId && Array.isArray(data) && data.length === 0) {
+      lines.push(`[SYSTEM DIRECTIVE] No matching valid ACTIVE purchase instruction was returned for paymentInstrumentId=${args.paymentInstrumentId}.
 If the current/default card is Visa and the user's purchase/book/order request already includes a complete spend scope, call prepare_visa_purchase_instruction with that scope so the state machine can create the draft.
 Do NOT ask for a payment link, payment URL,代付链接, Session ID, or tell the user to use the merchant app before creating the draft.`);
     }
@@ -3270,6 +3797,107 @@ function findReusableUcpCheckoutAuthorization(instructions, {
   }
 
   return null;
+}
+
+async function resolveClinkPayAuthorization(args = {}, {
+  paymentInstrumentId,
+  instructionIdHint = '',
+  mandateIdHint = '',
+} = {}) {
+  const fulfillmentErrors = [
+    ...validatePurchaseInstructionFulfillmentType(args),
+    ...validatePurchaseInstructionShippingAddress(args),
+  ];
+  if (fulfillmentErrors.length > 0) {
+    return {
+      ok: false,
+      response: `[VIC_PAY_FSM] state=MISSING_SCOPE action=ASK_USER reason=fulfillment_or_shipping_incomplete
+VIC clink_pay cannot resolve instruction_id and mandate_id until fulfillment type and required US shipping are known.
+Missing fields: ${fulfillmentErrors.join(', ')}
+Do NOT run instruction list or clink-cli pay until these fields are resolved.`,
+    };
+  }
+
+  let requestedMandates;
+  try {
+    requestedMandates = getClinkPayRequestedMandates(args);
+  } catch (error) {
+    return {
+      ok: false,
+      response: `[VIC_PAY_FSM] state=MISSING_SCOPE action=ASK_USER reason=missing_mandate_scope
+${error.message}
+instruction_id and mandate_id are mandatory before VIC clink_pay, so the payment branch must have enough mandate scope to list/match an ACTIVE authorization or create one.
+Do NOT run instruction list or clink-cli pay until the mandate scope is complete.`,
+    };
+  }
+
+  const scopeErrors = validatePurchaseInstructionScope({
+    ...args,
+    mandates: requestedMandates,
+  });
+  if (scopeErrors.length > 0) {
+    return {
+      ok: false,
+      response: `[VIC_PAY_FSM] state=MISSING_SCOPE action=ASK_USER reason=invalid_mandate_scope
+The VIC payment mandate scope is incomplete. Ask the caller/user only for the missing fields needed to match or create an authorization.
+Missing fields: ${scopeErrors.join(', ')}
+Do NOT run instruction list or clink-cli pay until the mandate scope is complete.`,
+    };
+  }
+
+  const instructionList = await runClinkCli([
+    'instruction', 'list',
+    '--valid-only',
+    '--payment-instrument-id', paymentInstrumentId,
+  ]);
+  await logRequest('clink_pay/list_valid_active_instructions', { validOnly: true, paymentInstrumentId }, instructionList);
+
+  const authorization = findReusableUcpCheckoutAuthorization(instructionList, {
+    paymentInstrumentId,
+    mandates: requestedMandates,
+    instructionIdHint,
+    mandateIdHint,
+  });
+  if (authorization) {
+    return { ok: true, authorization, mandates: requestedMandates };
+  }
+
+  const title = firstNonBlank(
+    args.title,
+    args.instructionTitle,
+    args.instruction_title,
+    args.merchant_name,
+    args.merchantName,
+    args.description,
+    args.merchant_id,
+    'Visa payment authorization',
+  );
+  const prepareResult = await handle_prepare_visa_purchase_instruction({
+    ...args,
+    paymentInstrumentId,
+    title,
+    mandates: requestedMandates,
+  });
+  const pendingIntent = await savePendingPaymentIntentForClinkPay({
+    args,
+    paymentInstrumentId,
+    requestedMandates,
+    prepareResult,
+    merchantIntegration: args.merchant_integration,
+  });
+  const pendingIntentDirective = pendingIntent
+    ? `
+Payment Intent ID: ${pendingIntent.paymentIntentId}
+Instruction ID: ${pendingIntent.draftInstructionId || 'N/A'}
+Do NOT let the merchant skill manually retry clink-cli pay or supply instruction_id/mandate_id. Wait for purchase_instruction.activated, then resume this same payment intent through resume_pending_payment_intent so the FSM re-runs instruction list --valid-only before pay.`
+    : '';
+  return {
+    ok: false,
+    response: `[VIC_PAY_FSM] state=INSTRUCTION_WORKFLOW_REQUIRED action=WAIT_INSTRUCTION_ACTIVATION reason=no_matching_active_instruction_mandate
+No matching valid ACTIVE instruction+mandate was found for this VIC payment after listing instructions with --valid-only and paymentInstrumentId=${paymentInstrumentId}.
+The instruction creation workflow has been invoked. Do NOT run clink-cli pay until a matching instruction+mandate is ACTIVE and this payment flow restarts from instruction list.
+${prepareResult}${pendingIntentDirective}`,
+  };
 }
 
 async function resolveCurrentUcpCheckoutPaymentInstrument(paymentInstrumentId = null) {
@@ -3388,18 +4016,37 @@ function normalizeUcpCheckoutFulfillmentArgs(args = {}) {
   if (normalized.fulfillmentType === undefined && args.fulfillment_type !== undefined) {
     normalized.fulfillmentType = args.fulfillment_type;
   }
-  const shippingAddress = args.shippingAddress ?? args.shipping_address;
-  if (shippingAddress !== undefined) {
-    normalized.shippingAddress = shippingAddress;
-    normalized.shipping_address = shippingAddress;
+  const instructionAddressInput = args.shippingAddress ?? args.instructionShippingAddress ?? args.instruction_shipping_address ?? args.shipping_address;
+  const ucpAddressInput = args.shipping_address ?? args.ucpShippingAddress ?? args.ucp_shipping_address ?? args.shippingAddress;
+  if (instructionAddressInput !== undefined) {
+    normalized.shippingAddress = normalizeCwalletInstructionShippingAddress(instructionAddressInput) ?? instructionAddressInput;
+  }
+  if (ucpAddressInput !== undefined) {
+    normalized.shipping_address = normalizeUcpPostalShippingAddress(ucpAddressInput) ?? ucpAddressInput;
   }
   return normalized;
+}
+
+function validateUcpPostalShippingAddress(args = {}) {
+  const missing = [];
+  const needsShippingAddress = purchaseInstructionNeedsShippingAddress(args);
+  const hasShippingAddress = args.shipping_address !== undefined && args.shipping_address !== null;
+  if (!needsShippingAddress && !hasShippingAddress) return missing;
+  const address = normalizeUcpPostalShippingAddress(args.shipping_address);
+  if (!address) return ['shipping_address'];
+  for (const field of ['street_address', 'address_locality', 'address_region', 'address_country', 'postal_code']) {
+    if (!String(address[field] || '').trim()) missing.push(`shipping_address.${field}`);
+  }
+  const countryCode = String(address.address_country || '').trim().toUpperCase();
+  if (countryCode && countryCode !== 'US') missing.push('shipping_address.address_country must be US');
+  return missing;
 }
 
 function validateUcpCheckoutFulfillmentGate(args = {}) {
   return [
     ...validatePurchaseInstructionFulfillmentType(args),
     ...validatePurchaseInstructionShippingAddress(args),
+    ...validateUcpPostalShippingAddress(args),
   ];
 }
 
@@ -3427,10 +4074,10 @@ Do NOT run instruction list, payment refresh, ucp-checkout create, or ucp-checko
     const requestedMandates = getUcpCheckoutRequestedMandates(checkoutArgs);
     const instructionList = await runClinkCli([
       'instruction', 'list',
-      '--status', 'ACTIVE',
+      '--valid-only',
       '--payment-instrument-id', paymentInstrumentId,
     ]);
-    await logRequest('ucp_checkout/list_active_instructions', { paymentInstrumentId }, instructionList);
+    await logRequest('ucp_checkout/list_valid_active_instructions', { validOnly: true, paymentInstrumentId }, instructionList);
 
     const authorization = findReusableUcpCheckoutAuthorization(instructionList, {
       paymentInstrumentId,
@@ -3448,7 +4095,7 @@ Do NOT run instruction list, payment refresh, ucp-checkout create, or ucp-checko
         mandates: requestedMandates,
       });
       return `[UCP_CHECKOUT_FSM] state=INSTRUCTION_WORKFLOW_REQUIRED action=WAIT_INSTRUCTION_ACTIVATION reason=no_matching_active_instruction_mandate
-No matching ACTIVE instruction+mandate was found for this product order after listing instructions with status=ACTIVE and paymentInstrumentId=${paymentInstrumentId}.
+No matching valid ACTIVE instruction+mandate was found for this product order after listing instructions with --valid-only and paymentInstrumentId=${paymentInstrumentId}.
 The instruction creation workflow has been invoked. Do NOT run ucp-checkout create or complete until a matching instruction+mandate is ACTIVE.
 ${prepareResult}`;
     }
@@ -3898,7 +4545,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "clink_pay",
-      description: "Execute a payment via Clink. Direct mode: merchant_id + amount + currency. Session mode: sessionId from merchant. merchant_integration must include server, confirm_tool, and optional confirm_args.",
+      description: "Execute old clink-cli pay via Clink. Direct mode: merchant_id + amount + currency. Session mode: sessionId from merchant. Before pay, classify fulfillment: NO_SHIPPING_REQUIRED injects a fixed default US shipping address; PHYSICAL_GOODS_REQUIRES_SHIPPING requires a real US shipping address; UNKNOWN stops to ask. For Visa/VIC, also requires mandate scope, lists valid ACTIVE instructions by paymentInstrumentId, injects a matched instruction_id + mandate_id into clink-cli pay, or starts instruction creation and stops when no match exists. merchant_integration must include server, confirm_tool, and optional confirm_args.",
       inputSchema: {
         type: "object",
         properties: {
@@ -3912,12 +4559,44 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
           paymentInstrumentId: { type: "string" },
           paymentMethodType: { type: "string" },
+          title: { type: "string", description: "VIC mandate/instruction title used for semantic matching and draft creation when no match exists." },
+          description: { type: "string", description: "VIC payment description used for semantic instruction+mandate matching." },
+          fulfillmentType: { type: "string", enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"], description: "Required/derived before old pay. NO_SHIPPING_REQUIRED uses the fixed default US shipping address; PHYSICAL_GOODS_REQUIRES_SHIPPING requires a real US shippingAddress; UNKNOWN stops before instruction list or pay." },
+          mandates: { type: "array", description: "Required for Visa/VIC session mode and recommended for direct mode. Requested mandate scope: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }." },
+          merchantCategoryCode: { type: "string", description: "Optional VIC merchant category code used when deriving a mandate scope." },
+          merchantName: { type: "string", description: "Optional VIC merchant display name used when deriving a mandate scope." },
+          preferredMerchantName: { type: "string", description: "Optional VIC merchant semantic hint used when deriving a mandate scope." },
+          instructionId: { type: "string", description: "Optional VIC instruction ID hint. The tool still lists ACTIVE instructions and verifies it before pay." },
+          instruction_id: { type: "string", description: "Optional snake_case alias for instructionId." },
+          purchaseInstructionId: { type: "string", description: "Optional backward-compatible alias for instructionId; must match instructionId if both are supplied." },
+          mandateId: { type: "string", description: "Optional VIC mandate ID hint. The tool still lists ACTIVE instructions and verifies it before pay." },
+          mandate_id: { type: "string", description: "Optional snake_case alias for mandateId." },
+          shippingAddress: {
+            type: "object",
+            description: "Required real US shipping address when fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING. Accepts UCP Postal street_address/postal_code shape or CWallet line1/zip shape. Ignored for NO_SHIPPING_REQUIRED because the tool uses the fixed default US shipping address."
+          },
+          products: {
+            type: "array",
+            description: "Optional product list for VIC credential context. Items use productId, productName, optional productUrl, quantity, unitPrice as a major-unit decimal, currencyCode, and optional extra."
+          },
           channel: { type: "string", description: "Optional notify channel. If provided with target_id and target_type, it refreshes the cached notify destination." },
           target_id: { type: "string", description: "Optional notify target ID used for direct delivery." },
           target_type: { type: "string", description: "Optional notify target type. For Feishu use chat_id or open_id." },
           locale: { type: "string", description: "Optional BCP 47 locale hint for message auto-localization, e.g. zh-CN or en-US." }
         },
         required: ["merchant_integration"]
+      }
+    },
+    {
+      name: "resume_pending_payment_intent",
+      description: "Resume a stored VIC old-pay payment intent after purchase_instruction.activated. The tool re-enters the same clink_pay FSM, re-lists valid ACTIVE instructions, matches instruction_id + mandate_id, and only then pays. Merchant skills must not manually retry pay with their own instruction fields.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          paymentIntentId: { type: "string", description: "Payment Intent ID returned by clink_pay when it started instruction creation." },
+          payment_intent_id: { type: "string", description: "Snake-case alias for paymentIntentId." }
+        },
+        required: ["paymentIntentId"]
       }
     },
     {
@@ -3959,9 +4638,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           paymentInstrumentId: { type: "string", description: "Optional selected payment instrument ID. If omitted, the current/default card is resolved." },
           title: { type: "string", description: "Instruction title" },
           description: { type: "string", description: "Optional instruction description" },
-          effectiveUntilTime: { type: "string", description: "Optional instruction expiry as Unix epoch seconds, e.g. \"1782345600\"." },
+          effectiveUntilTime: { type: "string", description: "Optional instruction expiry as UTC datetime string yyyy-MM-dd HH:mm:ss, e.g. \"2026-12-31 23:59:59\"." },
           isRecurring: { type: "boolean", description: "Optional. Default false unless the user clearly authorizes recurring payments." },
-          mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }. Each mandate effectiveUntilTime is Unix epoch seconds." },
+          mandates: { type: "array", description: "Non-empty array of requested mandate rules: { title?, description, amountLimit, currencyCode, merchantCategoryCode?, preferredMerchantName?, effectiveUntilTime? }. Each mandate effectiveUntilTime uses UTC datetime string yyyy-MM-dd HH:mm:ss." },
           fulfillmentType: {
             type: "string",
             enum: ["PHYSICAL_GOODS_REQUIRES_SHIPPING", "NO_SHIPPING_REQUIRED", "UNKNOWN"],
@@ -3994,11 +4673,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "list_purchase_instructions",
-      description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft.",
+      description: "VIC: list the current customer's purchase instructions, optionally filtered by status/paymentInstrumentId. For a selected Visa card, prefer validOnly=true with that exact paymentInstrumentId before creating a new draft.",
       inputSchema: {
         type: "object",
         properties: {
           status: { type: "string", enum: ["CREATED", "ACTIVE", "PENDING", "CANCELLED", "EXPIRED", "DECLINED"], description: "Optional status filter." },
+          validOnly: { type: "boolean", description: "When true, pass --valid-only so the CLI returns ACTIVE instructions and filters unusable one-time mandates." },
           paymentInstrumentId: { type: "string", description: "Optional selected Visa paymentInstrumentId filter, e.g. pi_123456." }
         }
       }
@@ -4024,7 +4704,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           mandate_id: { type: "string", description: "Optional mandate ID hint. The tool still lists ACTIVE instructions and verifies the hint before checkout." },
           line_items: { type: "array", description: "UCP line_items array. Prices are minor units and must match the product/order truth." },
           buyer: { type: "object", description: "Optional buyer object required by the merchant checkout." },
-          shipping_address: { type: "object", description: "Required when fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING. Must be a standard US shipping address; countryCode must be US." },
+          shipping_address: { type: "object", description: "Required when fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING. Use UCP Postal Address shape for checkout (street_address, address_locality, address_region, address_country=US, postal_code, optional first_name/last_name/phone_number). A CWallet line1/zip address is accepted and normalized." },
+          shippingAddress: { type: "object", description: "Optional camelCase alias. For physical goods, accepts the CWallet instruction address shape (name/line1/city/state/zip/countryCode=US) and the tool normalizes it to UCP Postal Address for checkout create." },
           metadata: { type: "object", description: "Optional metadata object for correlation." },
           paymentInstrumentId: { type: "string", description: "Optional selected payment instrument. If omitted, the refreshed current/default method is used." },
           create_idempotency_key: { type: "string", description: "Optional idempotency key for create, stable for the same cart/order attempt." },
@@ -4090,6 +4771,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "get_payment_method_modify_link":result = await handle_get_payment_method_modify_link(args); break;
       case "pre_check_account":             result = await handle_pre_check_account(); break;
       case "clink_pay":                     result = await handle_clink_pay(args); break;
+      case "resume_pending_payment_intent": result = await handle_resume_pending_payment_intent(args); break;
       case "clink_refund":                  result = await handle_clink_refund(args); break;
       case "get_refund_status":             result = await handle_get_refund_status(args); break;
       case "prepare_visa_purchase_instruction": result = await handle_prepare_visa_purchase_instruction(args); break;

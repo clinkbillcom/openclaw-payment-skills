@@ -25,9 +25,11 @@ tools:
   - name: get_payment_method_modify_link
     description: Generates a URL for the user to manage, switch, or modify existing payment methods. You MUST always provide channel, target_id, and target_type from the current conversation metadata to ensure the link is delivered to the correct surface.
   - name: pre_check_account
-    description: Run before clink_pay to verify account readiness and resolve the current/default card. For purchase/book/order intents, prefer prepare_visa_purchase_instruction; if this pre-check finds a Visa card, it routes the agent back to that state machine instead of normal charge.
+    description: Run before clink_pay to verify account readiness and resolve the current/default card. For purchase/book/order intents, prefer prepare_visa_purchase_instruction when only authorization is needed; if final payment is ready, clink_pay must still resolve Visa instruction_id + mandate_id before pay.
   - name: clink_pay
-    description: Execute a non-Visa payment via Clink. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). Visa cards are gated into the VIC registration / purchase-instruction flow instead of normal charge. merchant_integration must include server, confirm_tool, and optional confirm_args.
+    description: Execute old Clink pay. Supports direct mode (merchant_id + amount + currency) and session mode (sessionId from merchant). Before pay, classify fulfillment: NO_SHIPPING_REQUIRED uses the fixed default US address, PHYSICAL_GOODS_REQUIRES_SHIPPING requires a real US shipping address, and UNKNOWN stops to ask. For Visa/VIC, fulfillmentType and mandate scope are required; the tool lists valid ACTIVE instructions by paymentInstrumentId, injects the matched instruction_id + mandate_id into pay, or starts instruction creation and stops when no match exists. merchant_integration must include server, confirm_tool, and optional confirm_args.
+  - name: resume_pending_payment_intent
+    description: Resume a pending old-pay VIC payment intent after instruction activation. Re-enters clink_pay, re-lists ACTIVE instructions, re-matches instruction_id + mandate_id, and then pays; merchant skills must not branch into their own pay logic.
   - name: clink_refund
     description: Apply for a NEW full refund on an existing Clink order. Requires the ORIGINAL `orderId` (starts with `order_`). Do NOT use this tool for checking the status of an existing refund request.
   - name: get_refund_status
@@ -35,9 +37,9 @@ tools:
   - name: prepare_visa_purchase_instruction
     description: "VIC state machine: primary entrypoint for purchase/book/order intents. Resolves the current/default card; if it is Visa, handles VIC registration or lists ACTIVE instructions filtered by paymentInstrumentId and reuses/creates a draft. Always provide fulfillmentType. Use PHYSICAL_GOODS_REQUIRES_SHIPPING plus a US shippingAddress only for shipped physical goods; use NO_SHIPPING_REQUIRED for hotels, tickets, services, subscriptions, digital goods, bookings, and reservations. Use this instead of manually chaining pre_check_account, list_purchase_instructions, and create_purchase_instruction. After it creates a draft it returns a Passkey authorization URL; the user signs on that page (the skill never calls a backend sign API)."
   - name: list_purchase_instructions
-    description: "VIC: list the current customer's purchase instructions, optionally filtered by status and paymentInstrumentId. For a selected Visa card, pass status=ACTIVE and that exact paymentInstrumentId before creating a new draft."
+    description: "VIC: list the current customer's purchase instructions, optionally filtered by status/paymentInstrumentId. For a selected Visa card, prefer validOnly=true with that exact paymentInstrumentId before creating a new draft."
   - name: ucp_checkout
-    description: "External UCP checkout state machine: after product/price truth, mandate scope, fulfillmentType, and required shipping are known, resolves the refreshed current/default paymentInstrumentId, lists ACTIVE instructions by paymentInstrumentId, matches a valid instruction_id + mandate_id, starts the instruction creation workflow when no match exists, otherwise runs clink-cli ucp-checkout create then complete. Physical shipped goods require a US shipping_address before checkout. Completion is not merchant fulfillment."
+    description: "External UCP checkout state machine: after product/price truth, mandate scope, fulfillmentType, and required shipping are known, resolves the refreshed current/default paymentInstrumentId, lists ACTIVE instructions by paymentInstrumentId, matches a valid instruction_id + mandate_id, starts the instruction creation workflow when no match exists, otherwise runs clink-cli ucp-checkout create then complete. Physical shipped goods require a US address; instruction creation uses CWallet line1/zip shape, checkout uses UCP Postal street_address/postal_code shape. Completion is not merchant fulfillment."
   - name: get_purchase_instruction_manage_link
     description: "VIC: when the user asks to 修改授权 查看授权 取消 instruction 授权, or semantically similar manage/view/edit/cancel authorization requests, return the agent UI origin derived from the configured Clink environment (https://agent.clinkbill.com in production, https://agent.clinkbill.dev in sandbox) as the authorization management link."
   - name: install_system_hooks
@@ -97,14 +99,14 @@ When this rule fires:
 2. Call `prepare_visa_purchase_instruction` as the primary entrypoint once the spend scope is complete enough to express a mandate. Do not manually chain `pre_check_account`, `list_purchase_instructions`, and `create_purchase_instruction` for this primary purchase path.
 3. The state machine resolves the selected/default/current payment method. If it is not Visa, it returns `state=NON_VISA`; use the normal non-Visa payment route when payment inputs are ready.
 4. If the selected/default/current Visa card has `visaRegistrationSucceeded !== true`, the state machine starts VIC registration and waits for the same `paymentInstrumentId` to become VIC-ready.
-5. If the selected/default/current Visa card has `visaRegistrationSucceeded=true`, the state machine lists ACTIVE purchase instructions with `status=ACTIVE` and the selected card's exact `paymentInstrumentId`. It reuses a matching ACTIVE instruction when possible; otherwise it creates an instruction draft. The model must not call `create_purchase_instruction` before this state machine list step.
+5. If the selected/default/current Visa card has `visaRegistrationSucceeded=true`, the state machine lists valid ACTIVE purchase instructions with `--valid-only` and the selected card's exact `paymentInstrumentId`. It reuses a matching ACTIVE/non-reserved instruction+mandate when possible; otherwise it creates an instruction draft. The model must not call `create_purchase_instruction` before this state machine list step.
 6. If the merchant booking plugin is missing, still complete the VIC authorization preparation first. Do NOT ask the user for a payment link, payment URL, 代付链接, Session ID, or tell them to use the merchant app before this VIC routing step.
 7. If the exact spend scope is incomplete, ask only for the missing mandate fields needed to create the instruction draft, such as amount limit, currency, merchant/category, expiry, or purchase constraints. Do not invent mandates, limits, merchant identity, booking details, or prices. If the user already supplied merchant/merchant class, amount limit, currency, and timing constraints, the scope is complete enough to list and then create a draft.
 8. Before calling `prepare_visa_purchase_instruction`, classify fulfillment explicitly with `fulfillmentType`.
-   - Use `PHYSICAL_GOODS_REQUIRES_SHIPPING` only for shipped physical goods. Collect a US shipping address before draft creation and pass `shippingAddress`; `shippingAddress.countryCode` must be `US`.
+   - Use `PHYSICAL_GOODS_REQUIRES_SHIPPING` only for shipped physical goods. Collect a US shipping address before draft creation. Pass CWallet instruction address shape (`shippingAddress.countryCode=US`, `line1`, `zip`) to `prepare_visa_purchase_instruction`; when the same order later uses UCP checkout, pass UCP Postal Address shape (`shipping_address.address_country=US`, `street_address`, `postal_code`) to checkout.
    - Use `NO_SHIPPING_REQUIRED` for services, subscriptions, hotels, tickets, bookings, reservations, and digital goods that do not ship a physical item.
    - If it is unclear whether the purchase ships physical goods, use `UNKNOWN` only long enough to ask the user to clarify. The state machine will not list or create an instruction while fulfillment is unknown.
-9. Do NOT call clink_pay for Visa. Normal `clink_pay` remains only for non-Visa payment methods or explicitly non-VIC routes.
+9. Do NOT call `clink_pay` for Visa until the spend scope is complete. When final direct/session payment is ready, `clink_pay` must list/match ACTIVE instruction+mandate first and must not run pay without resolved `instruction_id` and `mandate_id`.
 
 See Section 3.4 for the full VIC workflow, the instruction matching rule, and payload examples.
 
@@ -115,14 +117,14 @@ If a merchant/product skill has already frozen product identity, price truth, cu
 This route is for external/shadow merchant product checkout. It must be continuous:
 
 1. Classify fulfillment before checkout:
-   - `PHYSICAL_GOODS_REQUIRES_SHIPPING`: shipped physical goods; collect `shipping_address` with `countryCode=US`.
+   - `PHYSICAL_GOODS_REQUIRES_SHIPPING`: shipped physical goods; collect a US shipping address that can be serialized both as CWallet instruction `shippingAddress` (`countryCode=US`, `line1`, `zip`) and UCP Postal `shipping_address` (`address_country=US`, `street_address`, `postal_code`).
    - `NO_SHIPPING_REQUIRED`: services, subscriptions, hotels, tickets, bookings, reservations, and digital goods.
    - `UNKNOWN`: stop and ask; do not run payment refresh, instruction list, or checkout.
 2. Refresh/resolve the current/default paymentInstrumentId inside `ucp_checkout`.
-3. Run `clink-cli instruction list --status ACTIVE --payment-instrument-id <current/default paymentInstrumentId>`.
+3. Run `clink-cli instruction list --valid-only --payment-instrument-id <current/default paymentInstrumentId>`.
 4. Match a valid ACTIVE instruction and ACTIVE/non-reserved mandate for the product/order scope, then take its `instruction_id` and `mandate_id`.
 5. If no matching instruction+mandate exists, enter the instruction creation workflow (`prepare_visa_purchase_instruction`) and stop UCP checkout until that draft is Passkey-authorized and ACTIVE.
-6. If a matching instruction+mandate exists, run `clink-cli ucp-checkout create` with `instruction_id`, `mandate_id`, merchant URL/context, currency, line items, and `shipping_address` only when required.
+6. If a matching instruction+mandate exists, run `clink-cli ucp-checkout create` with `instruction_id`, `mandate_id`, merchant URL/context, currency, line items, and UCP Postal `shipping_address` only when required.
 7. Parse `checkoutId` from the create response (`data.id`, `data.checkout_id`, or `data.checkoutId`).
 8. Immediately run `clink-cli ucp-checkout complete --checkout-id <checkoutId> --payment-instrument-id <current/default paymentInstrumentId>`.
 
@@ -221,7 +223,7 @@ When the event pump receives one of these event types, it must treat the event h
 | `payment_method.updated` / `payment_method.update` | Upsert the payment method in `clink.config.json`; detect Visa registration-ready transition | Cache-only unless it completes Visa readiness, then event pump sends `payment.vic_registration_complete` |
 | `payment_method.default_change` | Set `defaultPaymentMethodId` and mark only that method as default | Event pump sends `payment.method.default_changed_webhook` |
 | `risk_rule.updated` | Replace cached `riskRules` | Event pump sends `risk_rule.updated` |
-| `purchase_instruction.activated` | Mark the target Visa/payment-instrument flow as VIC-ready in `paymentFlowStates` | Event pump sends `payment.vic_registration_complete` |
+| `purchase_instruction.activated` | Mark the target Visa/payment-instrument flow as VIC-ready in `paymentFlowStates`; if a VIC pay pending intent exists, resume only the one whose stored draft instruction matches the activated instruction, with paymentInstrumentId-only matching only for legacy intents that lack a draft instruction | Event pump sends `payment.vic_registration_complete`; correlated pending pay intent resumes through `resume_pending_payment_intent` |
 | `vic_device.binding_succeeded` | Mark the target Visa/payment-instrument flow as VIC-ready in `paymentFlowStates` | Event pump sends `payment.vic_registration_complete` |
 | `agent_order.succeeded` | Use local order-card state to de-duplicate payment success and merchant confirmation | Event pump sends payment success only if needed, then triggers merchant confirmation exactly once |
 | `agent_order.failed` | Clear pending merchant confirmation and record payment-failure send state | Event pump sends the payment-layer failure notification |
@@ -310,12 +312,17 @@ When the user requests a recharge or another skill triggers an auto top-up:
    - If pre-check fails (no card bound, wallet not initialized), follow the prompts to fix the issue before proceeding.
 2. **Route by selected payment method:**
    - Non-Visa payment methods continue through `clink_pay` with fully prepared payment inputs plus `merchant_integration`.
-   - Visa payment methods never use the normal charge path directly.
+   - Visa payment methods never use the normal charge path without an ACTIVE instruction+mandate.
    - If the selected Visa payment method has `visaRegistrationSucceeded !== true`, the payment skill sends a VIC registration link once for that pending state and waits for the same `paymentInstrumentId` to appear with `visaRegistrationSucceeded=true`.
    - The VIC registration link path is `/passkey-auth/{paymentInstrumentId}?type=visa`.
    - The updated payment method list may arrive through agent refresh (`get_binding_link` or a later payment call) or through the mailbox event pump (`payment_method.added` / `payment_method.updated`, or `purchase_instruction.activated` / `vic_device.binding_succeeded` for VIC). Tell the user it is pending and do not block or re-poll.
-   - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow (Section 3.4). Do NOT call `clink_pay` for that Visa card.
-3. **Execute non-Visa payment:** For non-Visa cards, call `clink_pay` directly.
+   - Once the selected Visa payment method has `visaRegistrationSucceeded=true`, continue the VIC purchase instruction flow (Section 3.4) for authorization-only preparation, or call `clink_pay` with complete mandate scope for final direct/session payment.
+3. **Execute payment:** For non-Visa cards, call `clink_pay` directly only after fulfillment is resolved. For Visa cards, call `clink_pay` only with complete `fulfillmentType` + mandate scope; the tool lists `clink-cli instruction list --valid-only --payment-instrument-id <paymentInstrumentId>`, matches a valid `instruction_id` + `mandate_id`, and only then runs pay.
+   - `NO_SHIPPING_REQUIRED`: do not ask the user for an address; `clink_pay` injects the fixed default US address `548 Market St, PMB 00000, San Francisco, CA 94104, US` as the old-pay shipping context placeholder.
+   - `PHYSICAL_GOODS_REQUIRES_SHIPPING`: ask for a real US shipping address before pay; required normalized fields are `street_address`, `address_locality`, USPS `address_region`, `address_country=US`, and ZIP/ZIP+4 `postal_code`.
+   - `UNKNOWN`: ask whether the payment is for shipped physical goods or no-shipping-required value. Do not run instruction list or pay.
+   - Old agent pay always sends `aiAgentInstructionBo.merchantInfo.merchantCategoryCode=5999`; do not ask the user or merchant skill for this MCC.
+   - If no matching instruction+mandate exists, `clink_pay` stores a pending payment intent with the created draft instruction and returns `Payment Intent ID: payint_xxx`; after matching `purchase_instruction.activated`, resume via `resume_pending_payment_intent` so the same FSM re-runs list/match/pay. A different instruction activation on the same card must not resume this intent. The merchant skill must not manually retry `clink-cli pay` or provide its own `instruction_id`/`mandate_id`.
    Direct mode args include `merchant_id`, `amount`, `currency`, and `merchant_integration`. Session mode args include `sessionId` and `merchant_integration`.
 4. **After `clink_pay` returns:** Follow the tool return contract only. Do NOT synthesize extra payment cards.
 5. **Async completion ownership (event pump):** The mailbox event pump owns async payment outcomes; the sync `status=1` success path should already hand off merchant confirmation inside the payment tool:
@@ -329,7 +336,7 @@ When the user requests a recharge or another skill triggers an auto top-up:
 
 ### 3.4 VIC Agentic Authorization (Purchase Instruction)
 
-Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead.
+Use this for every selected Visa card before payment execution. Non-Visa cards use the normal `clink_pay` flow instead; Visa direct/session payment uses the list-first authorization resolver inside `clink_pay`.
 
 1. **Prepare through the state machine:** call `prepare_visa_purchase_instruction` with the user-authorized spend scope. Include fields such as `title`, `fulfillmentType`, `effectiveUntilTime`, and `mandates`. Do not call `list_purchase_instructions` or `create_purchase_instruction` manually on this primary path.
 2. **State machine outcomes:**
@@ -339,13 +346,13 @@ Use this for every selected Visa card before payment execution. Non-Visa cards u
    - `state=REUSED_ACTIVE_INSTRUCTION` means an ACTIVE instruction already matches the exact Visa card and spend scope; keep that `instructionId` in task state.
    - `state=CREATED_DRAFT` means the backend returned a CREATED draft and the tool sent a Passkey authorization card. The authorization URL must be `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}`. The draft is not yet usable until this Passkey authorization completes.
 3. **Authorize (Passkey, page-driven):** the user opens the Passkey URL `/passkey-auth/{paymentInstrumentId}?type=visa&instructionId={instructionId}` that was returned with the CREATED draft; the page completes the Passkey signature and activates the instruction. The skill does NOT call any backend sign API and never fabricates `appInstance`/`authResult`. When the user returns or asks how it is going, the mailbox event pump delivers `purchase_instruction.activated`; the instruction must be `ACTIVE` before any payment.
-4. **Payment execution:** for external/shadow merchant product checkout, call `ucp_checkout` after the product/order inputs and mandate scope are frozen. Do not pass the instruction to `clink_pay` for this product-order path; `ucp_checkout` lists ACTIVE instructions first, matches a valid instruction+mandate, creates the checkout with the matched IDs, captures `checkoutId`, then completes with the refreshed current/default paymentInstrumentId. If no match exists, it starts the instruction creation workflow and stops before UCP checkout.
+4. **Payment execution:** for original direct/session agent payment, call `clink_pay` with the frozen amount/session, resolved `fulfillmentType`, and mandate scope. `clink_pay` applies the old-pay shipping gate first: `NO_SHIPPING_REQUIRED` injects the fixed default US address, `PHYSICAL_GOODS_REQUIRES_SHIPPING` requires a real US shipping address, and `UNKNOWN` stops to ask. Then `clink_pay` lists ACTIVE instructions first, matches a valid instruction+mandate by amount/currency and title/description/merchant semantics, passes `--instruction-id` and `--mandate-id` to `clink-cli pay`, or starts instruction creation, stores a pending payment intent with its draft instruction, and stops before pay when no match exists. After Passkey activation, resume only the payment intent whose draft instruction matches the activation event; do not resume merely because another instruction on the same card activated, and do not branch into merchant-owned pay logic. For external/shadow merchant product checkout, call `ucp_checkout` after the product/order inputs and mandate scope are frozen. Do not use `clink_pay` for this product-order path; `ucp_checkout` lists ACTIVE instructions first, matches a valid instruction+mandate, creates the checkout with the matched IDs, captures `checkoutId`, then completes with the refreshed current/default paymentInstrumentId. If no match exists, it starts the instruction creation workflow and stops before UCP checkout.
 
 **VIC hard rules:** never create a draft without explicit user authorization; never invent mandates; signing happens on the Passkey page (never via a backend API) and the skill never fabricates `appInstance`/`authResult`; modify/cancel authorization happens on the agent management page via `get_purchase_instruction_manage_link`; an instruction must be `ACTIVE` before VIC payment execution; never send `clientReferenceId` / `channelTokenId` / `consumerId` (server-derived); the local instruction authorization reference is not payment proof.
 
 #### Current Visa Card Purchase Matching Rule
 
-For a scoped purchase intent where the selected/default/current payment method is a Visa card, `prepare_visa_purchase_instruction` must be the next tool call after the mandate scope is complete. Inside that state machine, the ACTIVE instruction list call uses `status=ACTIVE` and the selected card's exact `paymentInstrumentId`, for example `clink-cli instruction list --status ACTIVE --payment-instrument-id pi_123456`. Do NOT call `create_purchase_instruction` before the state machine list step, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
+For a scoped purchase intent where the selected/default/current payment method is a Visa card, `prepare_visa_purchase_instruction` must be the next tool call after the mandate scope is complete when only authorization is being prepared. For final direct/session payment, `clink_pay` is allowed only after the same scope is complete; it runs the same valid ACTIVE instruction list first. Inside both state machines, the list call uses `--valid-only` and the selected card's exact `paymentInstrumentId`, for example `clink-cli instruction list --valid-only --payment-instrument-id pi_123456`. Do NOT call `create_purchase_instruction` before the state machine list step, and do not ask the user for extra confirmation merely because a merchant booking plugin is unavailable.
 
 Evaluate existing ACTIVE instructions by semantic match, not exact string equality only. A reusable instruction must satisfy:
 - Same `paymentInstrumentId` as the selected Visa card. If an instruction is for another paymentInstrumentId, or its paymentInstrumentId is missing and cannot be proven to be the selected card, do not reuse it.
@@ -356,7 +363,7 @@ Evaluate existing ACTIVE instructions by semantic match, not exact string equali
 
 If no ACTIVE instruction semantically matches, the state machine creates a draft mandate based on the user-supplied scope.
 
-For physical goods that require delivery, call `prepare_visa_purchase_instruction` with `fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING` and include the user-provided US `shippingAddress`. The address shape is:
+For physical goods that require delivery, call `prepare_visa_purchase_instruction` with `fulfillmentType=PHYSICAL_GOODS_REQUIRES_SHIPPING` and include the user-provided US `shippingAddress` in CWallet instruction shape:
 
 ```json
 {
@@ -376,11 +383,29 @@ For physical goods that require delivery, call `prepare_visa_purchase_instructio
 }
 ```
 
+For `ucp_checkout`, the same physical order's `shipping_address` must be UCP Postal Address shape:
+
+```json
+{
+  "shipping_address": {
+    "street_address": "123 Market St",
+    "extended_address": "Apt 201",
+    "address_locality": "San Francisco",
+    "address_region": "CA",
+    "address_country": "US",
+    "postal_code": "94105",
+    "first_name": "Jim",
+    "last_name": "Example",
+    "phone_number": "+14155550100"
+  }
+}
+```
+
 #### Worked Example
 
 For example, if the current/default card is Visa, this request is already sufficiently scoped and must not ask for a payment link or more mandate data: `帮我下单 全季酒店 明天入住的 离 上海迪士尼最近 交通最方便的，500 元上限 CNY`.
 
-For this exact request, when the current/default card is Visa, call `prepare_visa_purchase_instruction` with the selected scope. The state machine then resolves the card, lists ACTIVE instructions with `status=ACTIVE` and the selected Visa `paymentInstrumentId`, and creates a draft if no semantic match is returned.
+For this exact request, when the current/default card is Visa, call `prepare_visa_purchase_instruction` with the selected scope. The state machine then resolves the card, lists valid ACTIVE instructions with `--valid-only` and the selected Visa `paymentInstrumentId`, and creates a draft if no semantic match is returned.
 
 For that request, after the state machine finds no semantic match, it creates a draft like:
 
@@ -397,7 +422,7 @@ For that request, after the state machine finds no semantic match, it creates a 
       "currencyCode": "CNY",
       "merchantCategoryCode": "7011",
       "preferredMerchantName": "全季酒店",
-      "effectiveUntilTime": "<Unix epoch seconds covering the requested stay window, e.g. 1782345600>"
+      "effectiveUntilTime": "<UTC datetime covering the requested stay window, e.g. 2026-12-31 23:59:59>"
     }
   ]
 }
@@ -414,7 +439,7 @@ Required inputs before calling `ucp_checkout`:
 - `title`, `fulfillmentType`, and `mandates` for instruction matching and for the instruction creation workflow when no match exists.
 - Optional `instruction_id` and `mandate_id` may be passed only as hints; the tool still lists ACTIVE instructions and verifies that both IDs are valid for the current paymentInstrumentId and mandate scope.
 - `buyer` when required by the external merchant.
-- `shipping_address` is required for `PHYSICAL_GOODS_REQUIRES_SHIPPING`; `countryCode` must be `US`. Do not invent a shipping address for `NO_SHIPPING_REQUIRED`.
+- `shipping_address` is required for `PHYSICAL_GOODS_REQUIRES_SHIPPING`; for UCP checkout it must use UCP Postal Address shape (`street_address`, `extended_address`, `address_locality`, `address_region`, `address_country`, `postal_code`, optional `first_name`, `last_name`, `phone_number`) and `address_country` must be `US`. The instruction-creation branch uses the CWallet instruction address shape (`name`, `line1`, `line2`, `line3`, `city`, `state`, `zip`, `countryCode`, `deliveryContactDetails`). Do not invent a shipping address for `NO_SHIPPING_REQUIRED`.
 
 The tool performs the closed-loop handoff:
 
@@ -434,7 +459,7 @@ Shell-equivalent sequence inside the tool:
 
 ```bash
 clink-cli instruction list \
-  --status ACTIVE \
+  --valid-only \
   --payment-instrument-id <current/default paymentInstrumentId> \
   --format json
 
@@ -449,6 +474,7 @@ clink-cli ucp-checkout create \
   --mandate-id <mandate_id> \
   --line-items '<line_items_json>' \
   --buyer '<buyer_json>' \
+  --shipping-address '<ucp_postal_address_json_if_required>' \
   --idempotency-key <stable_create_key> \
   --format json
 
@@ -556,6 +582,8 @@ The merchant confirmation tool will receive a structured `payment_handoff` objec
 3. Call `clink_pay` with the prepared payment inputs plus `merchant_integration`.
    - If the user explicitly specified an amount, use that amount.
    - If triggered automatically (402 / low-balance) and the user did not override the amount in the current turn, use the exact merchant default.
+   - Pass or make inferable `fulfillmentType`. For recharge, credits, top-up, virtual goods, services, subscriptions, hotels, tickets, bookings, and reservations, use `NO_SHIPPING_REQUIRED`; `clink_pay` will add the fixed default US address. For shipped physical goods, collect a real US shipping address first. If fulfillment is `UNKNOWN`, ask and stop before pay.
+   - If the selected/default card is Visa, include `fulfillmentType` and mandate scope (`mandates`, or direct amount/currency plus title/description/merchant semantics). `clink_pay` must resolve `instruction_id` and `mandate_id` itself by listing valid ACTIVE instructions first; if no match exists it starts instruction creation and returns a waiting state without paying.
 4. After `clink_pay` returns, follow the tool return contract only:
    - If the result indicates `DIRECT_SEND`, do NOT send a duplicate payment card.
    - If the result indicates `EXEC_REQUIRED`, execute it exactly once.
