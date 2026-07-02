@@ -5,7 +5,36 @@ import {
   PaymentWorkflowState,
   classifyPaymentError,
   classifyPaymentResponse,
+  formatPaymentFsmMarker,
 } from '../lib/payment-workflow-fsm.mjs';
+import { formatWorkflowMarker } from '../lib/workflow-marker.mjs';
+
+test('exports stable payment workflow enum contracts', () => {
+  assert.deepEqual(Object.values(PaymentWorkflowState), [
+    'PAYMENT_INPUT_MISSING',
+    'ACCOUNT_PRECHECK',
+    'READY_TO_PAY',
+    'PAY_SUBMITTED',
+    'PAY_SYNC_SUCCEEDED',
+    'PAY_SYNC_FAILED',
+    'THREE_DS_REQUIRED',
+    'PAY_UNKNOWN',
+    'WALLET_SETUP_REQUIRED',
+    'CLI_ERROR',
+  ]);
+  assert.deepEqual(Object.values(PaymentWorkflowAction), [
+    'ASK_FOR_INPUT',
+    'RUN_PRECHECK',
+    'RUN_PAY',
+    'WAIT_EVENT_PUMP',
+    'SEND_3DS_AND_WAIT_EVENT',
+    'NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT',
+    'NOTIFY_FAILURE_STOP',
+    'VERIFY_BEFORE_RETRY',
+    'ASK_WALLET_SETUP',
+    'SURFACE_ERROR',
+  ]);
+});
 
 test('classifies 3DS response as waiting for event pump', () => {
   const result = classifyPaymentResponse({
@@ -31,6 +60,14 @@ test('classifies sync success as notify and merchant confirmation', () => {
     terminal: true,
     reason: 'status_1_success',
   });
+  assert.equal(
+    formatPaymentFsmMarker(result),
+    '[PAYMENT_FSM] state=PAY_SYNC_SUCCEEDED action=NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT reason=status_1_success',
+  );
+  assert.equal(
+    formatWorkflowMarker('PAYMENT_FSM', result),
+    '[PAYMENT_FSM] state=PAY_SYNC_SUCCEEDED action=NOTIFY_SUCCESS_AND_CONFIRM_MERCHANT reason=status_1_success',
+  );
 });
 
 test('classifies terminal payment statuses as failure notification', () => {
