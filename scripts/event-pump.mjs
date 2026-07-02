@@ -121,6 +121,10 @@ function normalizeNotifyDestinationValue(value) {
 
 function normalizeCache(cache) {
   const normalized = cache && typeof cache === 'object' ? cache : {};
+  const envCustomerId = typeof process.env.CLINK_CUSTOMER_ID === 'string' ? process.env.CLINK_CUSTOMER_ID.trim() : '';
+  const envCustomerAPIKey = typeof process.env.CLINK_CUSTOMER_API_KEY === 'string' ? process.env.CLINK_CUSTOMER_API_KEY.trim() : '';
+  if (!normalized.customerId && envCustomerId) normalized.customerId = envCustomerId;
+  if (!normalized.customerAPIKey && envCustomerAPIKey) normalized.customerAPIKey = envCustomerAPIKey;
   if (!Array.isArray(normalized.paymentMethods)) normalized.paymentMethods = [];
   if (normalized.defaultPaymentMethodId === undefined) normalized.defaultPaymentMethodId = null;
   if (!normalized.orderCardStates || typeof normalized.orderCardStates !== 'object') {

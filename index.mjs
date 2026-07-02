@@ -377,9 +377,15 @@ async function writePaymentMethodsCache(cache) {
 // ------------------------------------------------------------------
 // EVENT PUMP (single mailbox consumer; replaces webhook + poll fallback)
 // ------------------------------------------------------------------
-function ensureEventPumpRunning() {
+async function ensureEventPumpRunning() {
   try {
+    const env = await getPaymentEnv();
+    const childEnv = { ...process.env };
+    if (env.CLINK_CUSTOMER_ID) childEnv.CLINK_CUSTOMER_ID = env.CLINK_CUSTOMER_ID;
+    if (env.CLINK_CUSTOMER_API_KEY) childEnv.CLINK_CUSTOMER_API_KEY = env.CLINK_CUSTOMER_API_KEY;
+    if (!childEnv.CLINK_BASE_URL && env.CLINK_BASE_URL) childEnv.CLINK_BASE_URL = env.CLINK_BASE_URL;
     const child = spawn(process.execPath, [EVENT_PUMP_SCRIPT], {
+      env: childEnv,
       detached: true,
       stdio: 'ignore',
     });
@@ -387,7 +393,7 @@ function ensureEventPumpRunning() {
   } catch (err) {
     // The pump is a singleton guarded by its own lock; a spawn failure here is
     // non-fatal — the next tool call (or install) retries.
-    logError('ensureEventPumpRunning', err);
+    await logError('ensureEventPumpRunning', err);
   }
 }
 
@@ -1381,6 +1387,7 @@ async function fetchBindingData() {
     customerId: env.CLINK_CUSTOMER_ID,
     hasCustomerApiKey: !!env.CLINK_CUSTOMER_API_KEY,
   };
+  await ensureEventPumpRunning();
   // card binding-link refreshes the cached payment methods. The event pump owns
   // async card-bound delivery, so never let the CLI watch here (--no-watch).
   const data = await runClinkCli(['card', 'binding-link', '--no-watch']);
@@ -1437,6 +1444,7 @@ function buildBareDomainUrl(bindingUrl) {
 // flag. No network request; --no-watch because the mailbox event pump owns async
 // risk_rule.updated delivery.
 async function buildRiskRulesNotification() {
+  await ensureEventPumpRunning();
   const data = await runClinkCli(['risk', 'link', '--no-watch']);
   return createMessageRequest({
     messageKey: 'risk.rules_link',
@@ -1814,7 +1822,7 @@ async function handle_initialize_wallet(args) {
 
     // Start the mailbox event pump (idempotent). It replaces the old webhook
     // receiver + poll fallback as the single async-completion delivery path.
-    ensureEventPumpRunning();
+    await ensureEventPumpRunning();
 
     return `Clink 账户 Bootstrap 成功。
 [SYSTEM DIRECTIVE]
@@ -2217,6 +2225,7 @@ async function handle_clink_pay(args) {
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return "Wallet not initialized. Please run initialize_wallet first.";
   }
+  await ensureEventPumpRunning();
 
   let piId = firstNonBlank(args.paymentInstrumentId, args.payment_instrument_id);
   let pmType = firstNonBlank(args.paymentMethodType, args.payment_method_type) || "CARD";
@@ -2799,6 +2808,7 @@ async function handle_clink_refund(args) {
   if (!env.CLINK_CUSTOMER_API_KEY || !env.CLINK_CUSTOMER_ID) {
     return "Wallet not initialized. Please run initialize_wallet first.";
   }
+  await ensureEventPumpRunning();
 
   const refundBody = { orderId };
 
@@ -3595,7 +3605,7 @@ async function createPurchaseInstructionDraft(args = {}) {
 
   try {
     const createArgs = [
-      'instruction', 'create',
+      'instruction', 'create', '--no-watch',
       '--payment-instrument-id', body.paymentInstrumentId,
       '--title', body.title,
       '--mandates', JSON.stringify(body.mandates),
@@ -3605,6 +3615,7 @@ async function createPurchaseInstructionDraft(args = {}) {
     if (body.extra !== undefined) createArgs.push('--extra', JSON.stringify(body.extra));
     if (body.isRecurring) createArgs.push('--is-recurring');
     if (body.shippingAddress !== undefined) createArgs.push('--shipping-address', JSON.stringify(body.shippingAddress));
+    await ensureEventPumpRunning();
     const data = await runClinkCli(createArgs);
     await logRequest('create_purchase_instruction', body, data);
     if (!data?.instructionId) {
@@ -4252,7 +4263,7 @@ async function handle_install_system_hooks(args) {
 
   // Async completion notifications are delivered by the mailbox event pump.
   // No webhook hook transform or /clink/payment route is installed anymore.
-  ensureEventPumpRunning();
+  await ensureEventPumpRunning();
 
   const statusNotification = createMessageRequest({
     messageKey: 'install.success',
