@@ -20,6 +20,7 @@
 //                                    Visa registration-complete transition; otherwise
 //                                    cache-only, no card — same as webhook)
 //   payment_method.default_change -> payment.method.default_changed_webhook
+//   payment_method.delete/.deleted -> cache-only local payment-method removal
 //   agent_order.succeeded         -> payment.success (+ spawn merchant confirmation)
 //   agent_order.failed            -> payment.failed.charged_manual_review |
 //                                    payment.failed.unexpected
@@ -149,6 +150,15 @@ function normalizeCache(cache) {
     );
   }
   return normalized;
+}
+
+function normalizeRiskRules(riskRules) {
+  const entries = Array.isArray(riskRules)
+    ? riskRules
+    : (riskRules && typeof riskRules === 'object' ? [riskRules] : []);
+  return entries
+    .filter((riskRule) => riskRule && typeof riskRule === 'object' && !Array.isArray(riskRule))
+    .map((riskRule) => ({ ...riskRule }));
 }
 
 function getPendingNotifyDestination(cache) {
@@ -574,6 +584,56 @@ async function upsertCachedPaymentMethod(data, cachedMethod, { markInitialized =
   };
 }
 
+async function deleteCachedPaymentMethod(paymentInstrumentId) {
+  const targetId = typeof paymentInstrumentId === 'string' ? paymentInstrumentId.trim() : '';
+  if (!targetId) return false;
+  const cache = await readCache();
+  const beforeCount = cache.paymentMethods.length;
+  cache.paymentMethods = cache.paymentMethods.filter((method) => method.paymentInstrumentId !== targetId);
+  const clearedDefault = cache.defaultPaymentMethodId === targetId;
+  if (clearedDefault) {
+    cache.defaultPaymentMethodId = cache.paymentMethods.find((method) => method.isDefault)?.paymentInstrumentId || null;
+  }
+  const removedMethod = cache.paymentMethods.length !== beforeCount;
+  if (!removedMethod && !clearedDefault) {
+    return false;
+  }
+  await writeCache(cache);
+  return true;
+}
+
+function resolveRiskRuleCustomerId(data, event, cache) {
+  return (
+    (typeof data.customerId === 'string' && data.customerId.trim())
+    || (typeof data.customer_id === 'string' && data.customer_id.trim())
+    || (typeof event?.resourceId === 'string' && event.resourceId.trim())
+    || (typeof event?.customerId === 'string' && event.customerId.trim())
+    || (typeof cache?.customerId === 'string' && cache.customerId.trim())
+    || null
+  );
+}
+
+function upsertRiskRuleList(riskRules, data, customerId) {
+  const nextRiskRules = normalizeRiskRules(riskRules);
+  const nextRiskRule = { ...data, customerId };
+  const existing = nextRiskRules.findIndex((riskRule) => riskRule.customerId === customerId);
+  if (existing >= 0) {
+    nextRiskRules[existing] = { ...nextRiskRules[existing], ...nextRiskRule };
+  } else {
+    nextRiskRules.push(nextRiskRule);
+  }
+  return nextRiskRules;
+}
+
+async function upsertCachedRiskRule(data, event) {
+  const cache = await readCache();
+  const customerId = resolveRiskRuleCustomerId(data, event, cache);
+  if (!customerId) return false;
+  cache.riskRules = upsertRiskRuleList(cache.riskRules, data, customerId);
+  await writeCache(cache);
+  return true;
+}
+
 async function sendVicRegistrationComplete(cachedMethod, data) {
   const cache = await readCache();
   const notifyDestination = getNotifyDestination(cache);
@@ -689,6 +749,18 @@ async function dispatchEvent(event) {
       // transition; otherwise this is a silent cache update.
       if (isVisaRegistrationComplete) {
         await sendVicRegistrationComplete(cachedMethod, data);
+      }
+      return;
+    }
+
+    // ─── Payment method deleted ───
+    case 'payment_method.delete':
+    case 'payment_method.deleted': {
+      await logRequest(type, data);
+      try {
+        await deleteCachedPaymentMethod(resolveVicTargetId(event));
+      } catch (err) {
+        await logError(`${type} cache update`, err);
       }
       return;
     }
@@ -912,9 +984,7 @@ async function dispatchEvent(event) {
     case 'risk_rule.updated': {
       await logRequest('risk_rule.updated', data);
       try {
-        const cache = await readCache();
-        cache.riskRules = data;
-        await writeCache(cache);
+        await upsertCachedRiskRule(data, event);
       } catch (err) {
         await logError('risk_rule.updated cache update', err);
       }
