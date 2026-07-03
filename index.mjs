@@ -84,17 +84,15 @@ async function updatePaymentEnv(updates) {
   await saveConfig(config);
 }
 
-// clink-cli persists the customer API key to ~/.clink-cli/config.json (per profile) and, as a
+// clink-cli persists the customer API key to ~/.clink-cli/config.json and, as a
 // security hardening, no longer echoes it on `wallet init` stdout. Recover it from that config so
 // the skill can still mirror it into the child-process env that authenticates every clink-cli call.
-async function readClinkCliCustomerApiKey(profile) {
+async function readClinkCliCustomerApiKey() {
   try {
     const clinkConfigPath = path.join(os.homedir(), '.clink-cli', 'config.json');
     const raw = await fs.readFile(clinkConfigPath, 'utf8');
     const parsed = JSON.parse(raw);
-    const profiles = parsed?.profiles || {};
-    const entry = profiles[profile || 'default'] || profiles.default || {};
-    return entry.customerApiKey ?? entry.customerAPIKey ?? null;
+    return parsed?.customerApiKey ?? parsed?.customerAPIKey ?? null;
   } catch (err) {
     await logError('readClinkCliCustomerApiKey', err);
     return null;
@@ -1792,7 +1790,7 @@ async function handle_initialize_wallet(args) {
     // Newer clink-cli omits the API key from `wallet init` stdout (it persists it to
     // ~/.clink-cli/config.json). Recover it from there so the skill env can authenticate later calls.
     if (!customerAPIKey) {
-      customerAPIKey = await readClinkCliCustomerApiKey(data?.profile);
+      customerAPIKey = await readClinkCliCustomerApiKey();
     }
     await logRequest('initialize_wallet/walletInit', { email: args.email }, { customerId, hasKey: !!customerAPIKey });
 
